@@ -332,7 +332,7 @@ fig.update_layout(
         active=0,
         yanchor="bottom", xanchor="left",
         currentvalue={"font": {"size": 16}, "prefix": "Timestep: ", "visible": True, "xanchor": "right"},
-        transition={"duration": 50, "easing": "cubic-in-out"},
+        transition={"duration": 40, "easing": "cubic-in-out"},
         pad={"b": 10, "t": 55},
         len=0.9, x=0.1, y=1.08,
         steps=[dict(

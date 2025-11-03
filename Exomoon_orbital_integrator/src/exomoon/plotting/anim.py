@@ -15,11 +15,18 @@ def build_animation(traj: dict, a_inner_au: float, a_outer_au: float, open_in_br
     frame_stride = max(1, timesteps // 1000)
     frame_indices = list(range(0, timesteps, frame_stride))
 
-    # Ranges
-    all_x = np.concatenate([xyzarr_ms[:, 0], xyzarr_mp[:, 0], xyzarr_mm[:, 0]])
-    all_y = np.concatenate([xyzarr_ms[:, 1], xyzarr_mp[:, 1], xyzarr_mm[:, 1]])
-    x_range = [-1.2 * np.max(np.abs(all_x)), 1.2 * np.max(np.abs(all_x))]
-    y_range = [-1.2 * np.max(np.abs(all_y)), 1.2 * np.max(np.abs(all_y))]
+    # Ranges based on max possible positions of any of the bodies
+    #all_x = np.concatenate([xyzarr_ms[:, 0], xyzarr_mp[:, 0], xyzarr_mm[:, 0]])
+    #all_y = np.concatenate([xyzarr_ms[:, 1], xyzarr_mp[:, 1], xyzarr_mm[:, 1]])
+    #x_range = [-1.2 * np.max(np.abs(all_x)), 1.2 * np.max(np.abs(all_x))]
+    #y_range = [-1.2 * np.max(np.abs(all_y)), 1.2 * np.max(np.abs(all_y))]
+
+    # Ranges based on habitable zone
+    hz_r = float(a_outer_au)
+    pad_frac = 0.05  # 5% padding
+    x_range = [-(1 + pad_frac) * hz_r, (1 + pad_frac) * hz_r]
+    y_range = [-(1 + pad_frac) * hz_r, (1 + pad_frac) * hz_r]
+
 
     # Moon relative to planet (for zoom)
     moon_rel = xyzarr_mm - xyzarr_mp

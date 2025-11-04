@@ -7,9 +7,9 @@ def build_animation(traj: dict, a_inner_au: float, a_outer_au: float, open_in_br
     if open_in_browser:
         pio.renderers.default = "browser"
 
-    xyzarr_ms = traj["xyzarr_ms"]
-    xyzarr_mp = traj["xyzarr_mp"]
-    xyzarr_mm = traj["xyzarr_mm"]
+    xyzarr_ms = traj["xyzarr_ms"].astype(np.float32, copy = False)
+    xyzarr_mp = traj["xyzarr_mp"].astype(np.float32, copy = False)
+    xyzarr_mm = traj["xyzarr_mm"].astype(np.float32, copy = False)
 
     timesteps = len(xyzarr_mp)
     frame_stride = max(1, timesteps // 1000)
@@ -61,17 +61,17 @@ def build_animation(traj: dict, a_inner_au: float, a_outer_au: float, open_in_br
     )
 
     # Trails (left) — hidden before Play
-    fig.add_trace(go.Scatter(x=[], y=[], mode="lines",
+    fig.add_trace(go.Scattergl(x=[], y=[], mode="lines",
                              line=dict(color="yellow", width=1), name="Star Trail", opacity=0.3, visible=False),
                   row=1, col=1)
     star_trail_idx = len(fig.data) - 1
 
-    fig.add_trace(go.Scatter(x=[], y=[], mode="lines",
+    fig.add_trace(go.Scattergl(x=[], y=[], mode="lines",
                              line=dict(color="blue", width=1), name="Planet Trail", opacity=0.3, visible=False),
                   row=1, col=1)
     planet_trail_idx = len(fig.data) - 1
 
-    fig.add_trace(go.Scatter(x=[], y=[], mode="lines",
+    fig.add_trace(go.Scattergl(x=[], y=[], mode="lines",
                              line=dict(color="red", width=1), name="Moon Trail", opacity=0.3, visible=False),
                   row=1, col=1)
     moon_trail_idx = len(fig.data) - 1
@@ -96,7 +96,7 @@ def build_animation(traj: dict, a_inner_au: float, a_outer_au: float, open_in_br
     fig.add_trace(go.Scatter(x=[0], y=[0], mode="markers",
                              marker=dict(color="blue", size=6), name="Planet (zoom)"),
                   row=2, col=2)
-    fig.add_trace(go.Scatter(x=[], y=[], mode="lines",
+    fig.add_trace(go.Scattergl(x=[], y=[], mode="lines",
                              line=dict(color="red", width=1), name="Moon Trail (zoom)", opacity=0.3, visible=False),
                   row=2, col=2)
     moon_zoom_trail_idx = len(fig.data) - 1

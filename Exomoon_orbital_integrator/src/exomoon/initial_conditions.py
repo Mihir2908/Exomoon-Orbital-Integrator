@@ -13,8 +13,10 @@ def initial_state(p: SystemParams):
     mm = p.mm_earth * (merth / msun) * FOUR_PI2
 
     # Hill radius and moon-planet distance (AU)
-    rhill = p.ap_AU * (1 - p.ep) * (mp / (3 * ms)) ** 0.5
+    rhill = p.ap_AU * (1.0 - p.ep) * ((mp / (3 * ms)) ** (1.0 / 3.0))
     am_AU = p.am_hill * rhill
+
+    
 
     # Planet-moon barycenter about system barycenter
     xpm = p.ap_AU * (1 - p.ep) * ms / (ms + mp + mm)
@@ -55,6 +57,7 @@ def initial_state(p: SystemParams):
         rp_km=rp_km, rs_m=rs_m,
         ms=ms, mp=mp, mm=mm,
         am_AU=am_AU,
+        rhill_AU=rhill,
         pos_mp=pos_mp, pos_ms=pos_ms, pos_mm=pos_mm,
         vel_mp=vel_mp, vel_ms=vel_ms, vel_mm=vel_mm
     )

@@ -3,15 +3,8 @@ import requests
 API = "https://exoplanetarchive.ipac.caltech.edu/TAP/sync"
 
 COLS = ",".join([
-    "pl_name",
-    "hostname",
-    "st_teff",
-    "st_rad",
-    "st_mass",
-    "pl_bmasse",
-    "pl_rade",
-    "pl_orbsmax",
-    "pl_orbeccen",
+    "pl_name","hostname","st_teff","st_rad","st_mass",
+    "pl_bmasse","pl_rade","pl_orbsmax","pl_orbeccen",
 ])
 
 HEADERS = {"User-Agent": "ExomoonOrbitalIntegrator/0.1 (contact: your-email@example.com)"}
@@ -29,7 +22,6 @@ def fetch_system_by_planet(pl_name: str) -> dict | None:
     name = pl_name.strip()
     name_lit = name.replace("'", "''")
 
-    # pscomppars already returns a single composite solution per planet
     sql1 = f"SELECT {COLS} FROM pscomppars WHERE pl_name='{name_lit}'"
     try:
         rows = _query_sql(sql1)
@@ -64,6 +56,17 @@ def fetch_system_by_planet(pl_name: str) -> dict | None:
         "ep": row.get("pl_orbeccen"),
     }
 
+def search_planets(query: str, limit: int = 5) -> list[str]:
+    """
+    Return up to 'limit' planet names whose pl_name LIKE %query% (case-insensitive).
+    """
+    if not query:
+        return []
+    q = query.strip().replace("'", "''")
+    sql = f"SELECT TOP {int(limit)} pl_name FROM pscomppars WHERE UPPER(pl_name) LIKE UPPER('%{q}%') ORDER BY pl_name"
+    rows = _query_sql(sql)
+    return [r.get("pl_name") for r in rows if r.get("pl_name")]
+    
 def estimate_density_gcc(mp_earth: float | None, pr_earth: float | None) -> float | None:
     if mp_earth is None or pr_earth is None or pr_earth <= 0:
         return None

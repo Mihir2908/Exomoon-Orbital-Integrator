@@ -1,5 +1,6 @@
+import urllib.parse as _url
 import os, sys
-from dash import Dash, dcc, html, Input, Output, State
+from dash import Dash, dcc, html, Input, Output, State, ctx
 import plotly.graph_objects as go
 
 # Ensure src/ is importable regardless of current working dir
@@ -77,6 +78,8 @@ def _initial_figure():
     return fig
 
 app.layout = html.Div([
+    dcc.Location(id="url", refresh=False),
+    dcc.Store(id="kick", data=""),
     html.Div(controls, style={"width": "380px", "padding": "12px", "borderRight": "1px solid #ddd"}),
     html.Div([
         dcc.Loading(
@@ -105,34 +108,83 @@ def _fnum(v, default):
         Output("ep", "value"),
         Output("dp_cgs", "value"),
     ],
-    Input("fetch-btn", "n_clicks"),
+    [Input("url", "search"), Input("fetch-btn", "n_clicks")],
     State("pl_name", "value"),
-    prevent_initial_call=True,
+    prevent_initial_call=False,  # allow URL-driven populate on first load
 )
-def fetch_from_nasa(n_clicks, pl_name):
+
+def populate_from_url_or_nasa(url_search, n_clicks, pl_name):
     d = SystemParams()
-    if not pl_name or not str(pl_name).strip():
-        return ("Enter a planet name (e.g., HD 209458 b).", d.Ts, d.rs_solar, d.ms_solar, d.mp_earth, d.ap_AU, d.ep, d.dp_cgs)
-    try:
-        rec = fetch_system_by_planet(pl_name)
-        if not rec:
-            return (f"No results for '{pl_name}'.", d.Ts, d.rs_solar, d.ms_solar, d.mp_earth, d.ap_AU, d.ep, d.dp_cgs)
+    status = ""
+    Ts, rs, ms, mp, ap, ep, dp = d.Ts, d.rs_solar, d.ms_solar, d.mp_earth, d.ap_AU, d.ep, d.dp_cgs
 
-        Ts = rec.get("Ts") or d.Ts
-        rs = rec.get("rs_solar") or d.rs_solar
-        ms = rec.get("ms_solar") or d.ms_solar
-        mp = rec.get("mp_earth") or d.mp_earth
-        ap = rec.get("ap_AU") or d.ap_AU
-        ep = rec.get("ep") or d.ep
+    trig = ctx.triggered_id
 
-        # Density estimate if both mass and radius are available
-        est_rho = estimate_density_gcc(rec.get("mp_earth"), rec.get("pl_rade"))
-        dp = est_rho or d.dp_cgs
+    # Helper: numeric override
+    def _f(val, cur):
+        try:
+            return float(val) if val is not None else cur
+        except Exception:
+            return cur
 
-        status = f"Loaded: {rec.get('pl_name')} (host: {rec.get('hostname')})"
+    # Case A: URL query (on first load or when URL changes)
+    if trig == "url" and url_search:
+        q = {k: v[0] for k, v in _url.parse_qs(url_search.lstrip("?")).items()}
+
+        # If ?pl=... provided, fetch from NASA
+        if "pl" in q and q["pl"].strip():
+            try:
+                rec = fetch_system_by_planet(q["pl"])
+                if rec:
+                    status = f"Loaded: {rec.get('pl_name')} (host: {rec.get('hostname')})"
+                    Ts = rec.get("Ts") or Ts
+                    rs = rec.get("rs_solar") or rs
+                    ms = rec.get("ms_solar") or ms
+                    mp = rec.get("mp_earth") or mp
+                    ap = rec.get("ap_AU") or ap
+                    ep = rec.get("ep") or ep
+                    est_rho = estimate_density_gcc(rec.get("mp_earth"), rec.get("pl_rade"))
+                    dp = est_rho or dp
+                else:
+                    status = f"No results for '{q['pl']}'."
+            except Exception as e:
+                status = f"Error fetching '{q['pl']}': {e}"
+
+        # Apply any numeric overrides in the URL if present
+        Ts = _f(q.get("Ts"), Ts)
+        rs = _f(q.get("rs_solar"), rs)
+        ms = _f(q.get("ms_solar"), ms)
+        mp = _f(q.get("mp_earth"), mp)
+        ap = _f(q.get("ap_AU"), ap)
+        ep = _f(q.get("ep"), ep)
+        dp = _f(q.get("dp_cgs"), dp)
+
         return (status, Ts, rs, ms, mp, ap, ep, dp)
-    except Exception as e:
-        return (f"Error fetching '{pl_name}': {e}", d.Ts, d.rs_solar, d.ms_solar, d.mp_earth, d.ap_AU, d.ep, d.dp_cgs)
+
+    # Case B: Button click with text input
+    if trig == "fetch-btn":
+        name = (pl_name or "").strip()
+        if not name:
+            return ("Enter a planet name (e.g., HD 209458 b).", Ts, rs, ms, mp, ap, ep, dp)
+        try:
+            rec = fetch_system_by_planet(name)
+            if not rec:
+                return (f"No results for '{name}'.", Ts, rs, ms, mp, ap, ep, dp)
+            Ts = rec.get("Ts") or Ts
+            rs = rec.get("rs_solar") or rs
+            ms = rec.get("ms_solar") or ms
+            mp = rec.get("mp_earth") or mp
+            ap = rec.get("ap_AU") or ap
+            ep = rec.get("ep") or ep
+            est_rho = estimate_density_gcc(rec.get("mp_earth"), rec.get("pl_rade"))
+            dp = est_rho or dp
+            status = f"Loaded: {rec.get('pl_name')} (host: {rec.get('hostname')})"
+            return (status, Ts, rs, ms, mp, ap, ep, dp)
+        except Exception as e:
+            return (f"Error fetching '{name}': {e}", Ts, rs, ms, mp, ap, ep, dp)
+
+    # Default: first load with no URL params → return defaults unchanged
+    return (status, Ts, rs, ms, mp, ap, ep, dp)
 
 # Run simulation (values can be NASA-filled or user-tweaked)
 @app.callback(
@@ -142,7 +194,7 @@ def fetch_from_nasa(n_clicks, pl_name):
     State("mp_earth", "value"), State("dp_cgs", "value"),
     State("ap_AU", "value"), State("ep", "value"),
     State("mm_earth", "value"), State("am_hill", "value"), State("em", "value"),
-    prevent_initial_call=True,  # do not block initial render
+    prevent_initial_call=False,  # do not block initial render
 )
 def run_cb(n_clicks, Ts, rs_solar, ms_solar, mp_earth, dp_cgs, ap_AU, ep, mm_earth, am_hill, em):
     if not n_clicks:

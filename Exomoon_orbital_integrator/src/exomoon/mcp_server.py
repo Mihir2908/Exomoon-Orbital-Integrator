@@ -1,7 +1,7 @@
 from pathlib import Path
 from typing import Dict, Any
 from urllib.parse import urlencode
-import sys, traceback
+import sys, traceback, re, json
 
 from fastmcp import FastMCP
 
@@ -23,6 +23,61 @@ def _params_from_dict(d: Dict[str, Any]) -> SystemParams:
         ap_AU=f("ap_AU", base.ap_AU), ep=f("ep", base.ep),
         mm_earth=f("mm_earth", base.mm_earth), am_hill=f("am_hill", base.am_hill), em=f("em", base.em),
     )
+
+def _num(val):
+    if val is None:
+        return None
+    if isinstance(val, (int, float)):
+        return float(val)
+    if isinstance(val, str):
+        m = re.search(r'[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?', val.strip())
+        if m:
+            try:
+                return float(m.group(0))
+            except Exception:
+                return None
+    return None
+
+def _normalize_param_keys(d: Dict[str, Any]) -> Dict[str, Any]:
+    if not d:
+        return {}
+    out = {}
+    # canonical keys
+    mapping = {
+        "Ts": ["Ts", "ts", "star_temp", "stellar_temp"],
+        "rs_solar": ["rs_solar", "R_sun", "star_radius"],
+        "ms_solar": ["ms_solar", "M_sun", "star_mass"],
+        "mp_earth": ["mp_earth", "planet_mass", "M_earth_p", "mp"],
+        "dp_cgs": ["dp_cgs", "planet_density", "rho_p"],
+        "ap_AU": ["ap_AU", "a_planet", "semi_major_axis"],
+        "ep": ["ep", "e_planet", "ecc_p"],
+        # moon
+        "mm_earth": ["mm_earth", "moon_mass", "M_earth_m", "mm"],
+        "am_hill": ["am_hill", "a_moon_hill", "a_moon_frac", "am"],
+        "em": ["em", "e_moon", "ecc_m"],
+    }
+    inv = {alias: key for key, aliases in mapping.items() for alias in aliases}
+    for k, v in d.items():
+        key = inv.get(k, k)
+        if key in ("Ts","rs_solar","ms_solar","mp_earth","dp_cgs","ap_AU","ep","mm_earth","am_hill","em"):
+            num = _num(v)
+            if num is not None:
+                out[key] = num
+    return out
+
+def _coerce_params_to_dict(params: Any) -> Dict[str, Any]:
+    # Accept dict or JSON string
+    if params is None:
+        return {}
+    if isinstance(params, dict):
+        return params
+    if isinstance(params, str):
+        try:
+            data = json.loads(params)
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+    return {}
 
 @mcp.tool()
 def env_info() -> Dict[str, Any]:
@@ -116,15 +171,30 @@ def assess_moon_stability(params: Dict[str, Any], years: float, escape_factor: f
         return {"ok": False, "message": str(e)}
 
 @mcp.tool()
-def dash_url(params: Dict[str, Any] | None = None, planet: str | None = None, autorun: bool = False) -> Dict[str, str]:
-    q = {}
-    if planet: q["pl"] = planet
-    if params:
-        for k, v in params.items():
-            if v is not None: q[k] = v
-    if autorun: q["run"] = 1
+def dash_url(params: Dict[str, Any] | str | None = None, planet: str | None = None, autorun: bool = False) -> Dict[str, str]:
+    # Coerce params into a dict (Claude often sends a JSON string)
+    raw = _coerce_params_to_dict(params)
+    q: Dict[str, Any] = {}
+
+    # Allow planet name via either dedicated arg or params aliases
+    planet_name = planet or raw.get("pl") or raw.get("pl_name") or raw.get("planet") or raw.get("name")
+    if planet_name:
+        q["pl"] = str(planet_name)
+
+    # Normalize numeric params (includes mm_earth, am_hill, em)
+    norm = _normalize_param_keys(raw)
+    q.update(norm)
+
+    if autorun:
+        q["run"] = 1
+
     url = f"http://127.0.0.1:8050/?{urlencode(q)}" if q else "http://127.0.0.1:8050/"
-    return {"url": url}
+    # Small debug echo so you can see what got through
+    return {
+        "url": url,
+        "accepted_keys": ",".join(sorted(norm.keys())),
+        "has_planet": "yes" if "pl" in q else "no"
+    }
 
 if __name__ == "__main__":
     mcp.run()

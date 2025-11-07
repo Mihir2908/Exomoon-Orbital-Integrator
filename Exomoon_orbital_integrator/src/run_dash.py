@@ -1,3 +1,4 @@
+import re
 import urllib.parse as _url
 import os, sys
 from dash import Dash, dcc, html, Input, Output, State, ctx
@@ -96,6 +97,21 @@ def _fnum(v, default):
     except Exception:
         return default
 
+def _parse_floatish(val, cur):
+    # Accept numbers or strings with units (e.g., "2.54 M_earth", "0.4 R_hill")
+    if val is None:
+        return cur
+    if isinstance(val, (int, float)):
+        return float(val)
+    if isinstance(val, str):
+        m = re.search(r'[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?', val.strip())
+        if m:
+            try:
+                return float(m.group(0))
+            except Exception:
+                return cur
+    return cur
+
 # Fetch from NASA and fill sliders
 @app.callback(
     [
@@ -107,69 +123,84 @@ def _fnum(v, default):
         Output("ap_AU", "value"),
         Output("ep", "value"),
         Output("dp_cgs", "value"),
+        Output("mm_earth", "value"),
+        Output("am_hill", "value"),
+        Output("em", "value"),
     ],
     [Input("url", "search"), Input("fetch-btn", "n_clicks")],
     State("pl_name", "value"),
-    prevent_initial_call=False,  # allow URL-driven populate on first load
+    State("mm_earth", "value"), State("am_hill", "value"), State("em", "value"),
+    prevent_initial_call=False,
 )
-
-def populate_from_url_or_nasa(url_search, n_clicks, pl_name):
+def populate_from_url_or_nasa(url_search, n_clicks, pl_name, mm_val, ah_val, em_val):
     d = SystemParams()
     status = ""
-    Ts, rs, ms, mp, ap, ep, dp = d.Ts, d.rs_solar, d.ms_solar, d.mp_earth, d.ap_AU, d.ep, d.dp_cgs
 
-    trig = ctx.triggered_id
-
-    # Helper: numeric override
-    def _f(val, cur):
+    # Start with current (or defaults on first load)
+    def _fv(v, default):
         try:
-            return float(val) if val is not None else cur
+            return default if v is None or (isinstance(v, str) and v.strip() == "") else float(v)
+        except Exception:
+            return default
+
+    Ts, rs, ms, mp, ap, ep, dp = d.Ts, d.rs_solar, d.ms_solar, d.mp_earth, d.ap_AU, d.ep, d.dp_cgs
+    mm, ah, em = _fv(mm_val, d.mm_earth), _fv(ah_val, d.am_hill), _fv(em_val, d.em)
+
+    def _fo(val, cur):
+        try:
+            return cur if val is None else float(val)
         except Exception:
             return cur
 
-    # Case A: URL query (on first load or when URL changes)
-    if trig == "url" and url_search:
-        q = {k: v[0] for k, v in _url.parse_qs(url_search.lstrip("?")).items()}
+    # A) URL path (on load or when URL changes)
+    try:
+        if url_search:
+            q = {k: v[0] for k, v in _url.parse_qs(url_search.lstrip("?")).items()}
 
-        # If ?pl=... provided, fetch from NASA
-        if "pl" in q and q["pl"].strip():
-            try:
-                rec = fetch_system_by_planet(q["pl"])
-                if rec:
-                    status = f"Loaded: {rec.get('pl_name')} (host: {rec.get('hostname')})"
-                    Ts = rec.get("Ts") or Ts
-                    rs = rec.get("rs_solar") or rs
-                    ms = rec.get("ms_solar") or ms
-                    mp = rec.get("mp_earth") or mp
-                    ap = rec.get("ap_AU") or ap
-                    ep = rec.get("ep") or ep
-                    est_rho = estimate_density_gcc(rec.get("mp_earth"), rec.get("pl_rade"))
-                    dp = est_rho or dp
-                else:
-                    status = f"No results for '{q['pl']}'."
-            except Exception as e:
-                status = f"Error fetching '{q['pl']}': {e}"
+            # Fetch from NASA if ?pl=...
+            pl = q.get("pl")
+            if pl and pl.strip():
+                try:
+                    rec = fetch_system_by_planet(pl)
+                    if rec:
+                        status = f"Loaded: {rec.get('pl_name')} (host: {rec.get('hostname')})"
+                        Ts = rec.get("Ts") or Ts
+                        rs = rec.get("rs_solar") or rs
+                        ms = rec.get("ms_solar") or ms
+                        mp = rec.get("mp_earth") or mp
+                        ap = rec.get("ap_AU") or ap
+                        ep = rec.get("ep") or ep
+                        est_rho = estimate_density_gcc(rec.get("mp_earth"), rec.get("pl_rade"))
+                        dp = est_rho or dp
+                    else:
+                        status = f"No results for '{pl}'."
+                except Exception as e:
+                    status = f"Error fetching '{pl}': {e}"
 
-        # Apply any numeric overrides in the URL if present
-        Ts = _f(q.get("Ts"), Ts)
-        rs = _f(q.get("rs_solar"), rs)
-        ms = _f(q.get("ms_solar"), ms)
-        mp = _f(q.get("mp_earth"), mp)
-        ap = _f(q.get("ap_AU"), ap)
-        ep = _f(q.get("ep"), ep)
-        dp = _f(q.get("dp_cgs"), dp)
+            # Apply numeric overrides (including moon params)
+            Ts = _parse_floatish(q.get("Ts"), Ts);  rs = _parse_floatish(q.get("rs_solar"), rs);  ms = _parse_floatish(q.get("ms_solar"), ms)
+            mp = _parse_floatish(q.get("mp_earth"), mp);  ap = _parse_floatish(q.get("ap_AU"), ap);  ep = _parse_floatish(q.get("ep"), ep)
+            dp = _parse_floatish(q.get("dp_cgs"), dp)
 
-        return (status, Ts, rs, ms, mp, ap, ep, dp)
+            mm = _parse_floatish(q.get("mm_earth"), mm);  ah = _parse_floatish(q.get("am_hill"), ah);  em = _parse_floatish(q.get("em"), em)
+            ah = _parse_floatish(q.get("am_hill"), ah)
+            em = _parse_floatish(q.get("em"), em)
 
-    # Case B: Button click with text input
-    if trig == "fetch-btn":
+            return (status, Ts, rs, ms, mp, ap, ep, dp, mm, ah, em)
+            
+    except Exception:
+        # Ignore bad/malformed query strings; fall through to other flows
+        pass
+
+    # B) Button click flow (don’t change moon sliders)
+    if (n_clicks or 0) > 0:
         name = (pl_name or "").strip()
         if not name:
-            return ("Enter a planet name (e.g., HD 209458 b).", Ts, rs, ms, mp, ap, ep, dp)
+            return ("Enter a planet name (e.g., HD 209458 b).", Ts, rs, ms, mp, ap, ep, dp, mm, ah, em)
         try:
             rec = fetch_system_by_planet(name)
             if not rec:
-                return (f"No results for '{name}'.", Ts, rs, ms, mp, ap, ep, dp)
+                return (f"No results for '{name}'.", Ts, rs, ms, mp, ap, ep, dp, mm, ah, em)
             Ts = rec.get("Ts") or Ts
             rs = rec.get("rs_solar") or rs
             ms = rec.get("ms_solar") or ms
@@ -179,12 +210,11 @@ def populate_from_url_or_nasa(url_search, n_clicks, pl_name):
             est_rho = estimate_density_gcc(rec.get("mp_earth"), rec.get("pl_rade"))
             dp = est_rho or dp
             status = f"Loaded: {rec.get('pl_name')} (host: {rec.get('hostname')})"
-            return (status, Ts, rs, ms, mp, ap, ep, dp)
         except Exception as e:
-            return (f"Error fetching '{name}': {e}", Ts, rs, ms, mp, ap, ep, dp)
-
-    # Default: first load with no URL params → return defaults unchanged
-    return (status, Ts, rs, ms, mp, ap, ep, dp)
+            status = f"Error fetching '{name}': {e}"
+    
+    # C) Default/first load fallback (must return all 11 outputs)
+    return (status, Ts, rs, ms, mp, ap, ep, dp, mm, ah, em)
 
 # Run simulation (values can be NASA-filled or user-tweaked)
 @app.callback(

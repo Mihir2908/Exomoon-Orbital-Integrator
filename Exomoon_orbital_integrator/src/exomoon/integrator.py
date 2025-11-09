@@ -16,10 +16,9 @@ def leapfrog_integrate(state: dict, t_end: float, dt: float):
 
     xyzlist_mp, xyzlist_ms, xyzlist_mm = [], [], []
 
-    t = 0.0
-    while t < t_end:
-        t += dt
-
+    # Fixed number of steps to avoid drift
+    n_steps = max(1, int(np.ceil(float(t_end) / float(dt))))
+    for _ in range(n_steps):
         # Planet
         pos2_mp = pos_mp + vel_mp * (dt / 2)
         a_mp = _accel(pos2_mp, pos_ms, ms) + _accel(pos2_mp, pos_mm, mm)

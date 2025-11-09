@@ -36,7 +36,7 @@ def initial_state(p: SystemParams):
     xp = xpm + xp
     vxp = vzp = 0.0
     vyp = -mm / ((1 - p.em) * (mp + mm) * am_AU) ** 0.5
-    vyp = vypm + vyp
+    
 
     # Moon relative to PM barycenter, then to system barycenter
     ym = zm = 0.0
@@ -44,7 +44,16 @@ def initial_state(p: SystemParams):
     xm = xpm + xm
     vxm = vzm = 0.0
     vym = mp / ((1 - p.em) * (mp + mm) * am_AU) ** 0.5
+    
+    dir_sign = -1.0 if getattr(p, "moon_retrograde", False) else 1.0
+    vyp *= dir_sign
+    vym *= dir_sign
+
+    vyp = vypm + vyp
     vym = vypm + vym
+
+    
+    #vel_mm = vel_mm * dir_sign
 
     pos_mp = np.array([xp, yp, zp], dtype=float)
     pos_ms = np.array([xs, ys, zs], dtype=float)

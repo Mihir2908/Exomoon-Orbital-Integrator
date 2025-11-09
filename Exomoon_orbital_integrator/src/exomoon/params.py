@@ -3,17 +3,16 @@ from dataclasses import dataclass
 @dataclass
 class SystemParams:
     # Stellar
-    Ts: float = 5772 #3784.0      # K
-    rs_solar: float =  1 #0.51 
-    ms_solar: float = 1 # 0.54
-
+    Ts: float = 5772
+    rs_solar: float = 1.0
+    ms_solar: float = 1.0
     # Planet
-    mp_earth: float = 1 #2.54
+    mp_earth: float = 1.0
     dp_cgs: float = 5.5
-    ap_AU: float = 1 #0.3006
+    ap_AU: float = 1.0
     ep: float = 0.0
-
     # Moon
-    mm_earth: float = 0.01 #2.54
-    am_hill: float =  0.25 # 0.45
+    mm_earth: float = 0.01
+    am_hill: float = 0.25
     em: float = 0.0
+    moon_retrograde: bool = False  # NEW

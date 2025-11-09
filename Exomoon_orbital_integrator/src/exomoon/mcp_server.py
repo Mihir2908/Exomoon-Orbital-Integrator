@@ -10,18 +10,27 @@ from exomoon.simulation import run_simulation, run_simulation_for_years
 from exomoon.plotting.anim import build_animation
 from exomoon.exoplanet_archive import fetch_system_by_planet, search_planets
 from exomoon.moon_stability import assess_moon_stability as _assess_moon_stability  # import the function symbol
+from exomoon.moon_stability import analyze_moon_escape as _analyze_moon_escape
 
 mcp = FastMCP("exomoon")
 
 def _params_from_dict(d: Dict[str, Any]) -> SystemParams:
     base = SystemParams()
-    def f(k, cur): 
+    def f(k, cur):
         return cur if d.get(k) is None or d.get(k) == "" else float(d[k])
+    def b(key):
+        v = d.get(key)
+        if v is None: return False
+        if isinstance(v, bool): return v
+        if isinstance(v, (int,float)): return bool(v)
+        v = str(v).lower().strip()
+        return v in ("retro","retrograde","true","1","yes")
     return SystemParams(
         Ts=f("Ts", base.Ts), rs_solar=f("rs_solar", base.rs_solar), ms_solar=f("ms_solar", base.ms_solar),
         mp_earth=f("mp_earth", base.mp_earth), dp_cgs=f("dp_cgs", base.dp_cgs),
         ap_AU=f("ap_AU", base.ap_AU), ep=f("ep", base.ep),
         mm_earth=f("mm_earth", base.mm_earth), am_hill=f("am_hill", base.am_hill), em=f("em", base.em),
+        moon_retrograde=b("moon_retrograde") or b("moon_dir"),
     )
 
 def _num(val):
@@ -55,11 +64,19 @@ def _normalize_param_keys(d: Dict[str, Any]) -> Dict[str, Any]:
         "mm_earth": ["mm_earth", "moon_mass", "M_earth_m", "mm"],
         "am_hill": ["am_hill", "a_moon_hill", "a_moon_frac", "am"],
         "em": ["em", "e_moon", "ecc_m"],
+        "moon_retrograde": ["moon_retrograde","moon_dir","retrograde","orbit_dir"],
+        # simulation duration
+        "years": ["years","t_years","duration","sim_years"]
     }
     inv = {alias: key for key, aliases in mapping.items() for alias in aliases}
     for k, v in d.items():
         key = inv.get(k, k)
-        if key in ("Ts","rs_solar","ms_solar","mp_earth","dp_cgs","ap_AU","ep","mm_earth","am_hill","em"):
+        if key == "moon_retrograde":
+            val = str(v).lower().strip()
+            out[key] = val in ("retro","retrograde","true","1","yes")
+            continue
+
+        if key in ("Ts","rs_solar","ms_solar","mp_earth","dp_cgs","ap_AU","ep","mm_earth","am_hill","em","years"):
             num = _num(v)
             if num is not None:
                 out[key] = num
@@ -112,7 +129,7 @@ def run_sim(params: Dict[str, Any]) -> Dict[str, Any]:
     try:
         p = _params_from_dict(params or {})
         sim = run_simulation(p)
-        fig = build_animation(sim["traj"], sim["a_inner_au"], sim["a_outer_au"], open_in_browser=False)
+        fig = build_animation(sim["traj"], sim["a_inner_au"], sim["a_outer_au"], open_in_browser=False, dt=sim["dt"], t_end=sim["t_end"])
         outdir = Path("outputs"); outdir.mkdir(exist_ok=True)
         outfile = outdir / "exomoon_sim.html"
         fig.write_html(str(outfile), include_plotlyjs="cdn")
@@ -126,7 +143,7 @@ def run_sim_years(params: Dict[str, Any], years: float) -> Dict[str, Any]:
     try:
         p = _params_from_dict(params or {})
         sim = run_simulation_for_years(p, float(years))
-        fig = build_animation(sim["traj"], sim["a_inner_au"], sim["a_outer_au"], open_in_browser=False)
+        fig = build_animation(sim["traj"], sim["a_inner_au"], sim["a_outer_au"], open_in_browser=False, dt=sim["dt"], t_end=sim["t_end"])
         outdir = Path("outputs"); outdir.mkdir(exist_ok=True)
         outfile = outdir / f"exomoon_sim_{int(years)}y.html"
         fig.write_html(str(outfile), include_plotlyjs="cdn")
@@ -169,27 +186,50 @@ def assess_moon_stability(params: Dict[str, Any], years: float, escape_factor: f
     except Exception as e:
         print("[exomoon] assess_moon_stability tool error:\n", traceback.format_exc(), file=sys.stderr, flush=True)
         return {"ok": False, "message": str(e)}
+    
+@mcp.tool()
+def moon_escape_info(params: Dict[str, Any], years: float, escape_factor: float = 1.0) -> Dict[str, Any]:
+    """
+    Return first escape time (years) if moon exits escape_factor * Hill radius.
+    Fields: stable, escape_time (or null), escape_index, threshold, rhill_AU, max_r_rel, dt, t_end.
+    """
+    try:
+        p = _params_from_dict(params or {})
+        res = _analyze_moon_escape(p, float(years), float(escape_factor))
+        res["ok"] = True
+        return res
+    except Exception as e:
+        print("[exomoon] moon_escape_info error:\n", traceback.format_exc(), file=sys.stderr, flush=True)
+        return {"ok": False, "message": str(e)}
 
+# Update dash_url to include years in query string if provided:
 @mcp.tool()
 def dash_url(params: Dict[str, Any] | str | None = None, planet: str | None = None, autorun: bool = False) -> Dict[str, str]:
-    # Coerce params into a dict (Claude often sends a JSON string)
     raw = _coerce_params_to_dict(params)
     q: Dict[str, Any] = {}
-
-    # Allow planet name via either dedicated arg or params aliases
     planet_name = planet or raw.get("pl") or raw.get("pl_name") or raw.get("planet") or raw.get("name")
     if planet_name:
         q["pl"] = str(planet_name)
 
-    # Normalize numeric params (includes mm_earth, am_hill, em)
     norm = _normalize_param_keys(raw)
-    q.update(norm)
+
+    # Moon retrograde flag
+    if "moon_retrograde" in norm:
+        q["moon_dir"] = "retro" if norm["moon_retrograde"] else "pro"
+
+    # Numeric params
+    for k, v in norm.items():
+        if k == "moon_retrograde" or isinstance(v, bool):
+            continue
+        if k == "years":
+            q["years"] = v  # simulation duration
+        else:
+            q[k] = v
 
     if autorun:
         q["run"] = 1
 
-    url = f"http://127.0.0.1:8050/?{urlencode(q)}" if q else "http://127.0.0.1:8050/"
-    # Small debug echo so you can see what got through
+    url = f"http://127.0.0.1:8050/?{urlencode(q)}"
     return {
         "url": url,
         "accepted_keys": ",".join(sorted(norm.keys())),

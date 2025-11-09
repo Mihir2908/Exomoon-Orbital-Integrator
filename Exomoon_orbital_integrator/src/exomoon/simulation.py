@@ -35,8 +35,18 @@ def run_simulation_for_years(p: SystemParams, years: float):
     orbprd_mm_ms = 2.0 * np.pi * p.ap_AU**1.5 / (st["mp"] + st["ms"]) ** 0.5
     orbprd_mm_mp = 2.0 * np.pi * st["am_AU"]**1.5 / (st["mp"] + st["mm"]) ** 0.5
 
-    dt = max(orbprd_mm_mp / 1_000.0, float(years) / 50_000.0)
-    t_end = float(years)
+    # Resolution targets
+    dt_moon = orbprd_mm_mp / 100.0          # ~1000 steps per moon orbit
+    steps_per_year = 20000.0                 # ~20k steps per simulation year
+    dt_year = 1.0 / steps_per_year           # years are the time unit
+
+    # Choose the smaller dt for better resolution
+    dt = min(dt_moon, dt_year)
+
+    # Snap dt so we hit t_end exactly with integer steps
+    t_end = max(1e-9, years)
+    n_steps = max(1, int(np.ceil(t_end / dt)))
+    dt = t_end / n_steps
 
     #dt = orbprd_mm_mp / 1_000.0
     #t_end = orbprd_mm_ms

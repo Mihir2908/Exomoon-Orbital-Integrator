@@ -18,20 +18,21 @@ dash_url: Generate a browser-accessible Dash UI session for real-time visualizat
 
 ## Input Parameters
 
-| Name            | Description                              | Units        |
-| --------------- | -----------------------------------------| ------------ |
-| Ts              | Star effective temperature               | K            |
-| rs_solar        | Star radius (solar)                      | R⊙R_\\odotR⊙ |
-| ms_solar        | Star mass (solar)                        | M⊙M_\\odotM⊙ |
-| mp_earth        | Planet mass (earth)                      | M⊕M_\\oplusM⊕ |
-| dp_cgs          | Planet mean density                      | g/cm³        |
-| ap_AU           | Semi-major axis (planet-star)            | AU           |
-| ep              | Eccentricity (planet-star)               | —            |
-| mm_earth        | Moon mass (earth)                        | M⊕M_\\oplusM⊕ |
-| am_hill         | Moon Semi-major axis (frac. Hill radius) | —            |
-| em              | Eccentricity (planet-moon)               | —            |
-| moon_retrograde | Moon retrograde flag                     | Boolean      |
-| years           | Simulation duration (optional)           | years        |
+| Parameter       | Description                        | Default | Units        |
+|-----------------|----------------------------------|---------|--------------|
+| Ts              | Star effective temperature       | 5772    | K            |
+| rs_solar        | Star radius                      | 1.0     | \( R_{\odot} \) (solar radii) |
+| ms_solar        | Star mass                        | 1.0     | \( M_{\odot} \) (solar masses) |
+| mp_earth        | Planet mass                     | 1.0     | \( M_{\oplus} \) (Earth masses) |
+| dp_cgs          | Planet mean density              | 5.5     | g/cm³        |
+| ap_AU           | Planet semi-major axis           | 1.0     | AU           |
+| ep              | Planet eccentricity              | 0.0     | — (dimensionless) |
+| mm_earth        | Moon mass                       | 0.01    | \( M_{\oplus} \) (Earth masses) |
+| am_hill         | Moon orbit as fraction of Hill radius | 0.25    | — (dimensionless) |
+| em              | Moon eccentricity                | 0.0     | — (dimensionless) |
+| moon_retrograde | Moon retrograde orbit flag       | False   | Boolean      |
+| years           | Simulation duration (optional)   | —       | years        |
+
 
 ## Constraining Exomoon Habitability and Orbital Stability
 

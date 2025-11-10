@@ -15,4 +15,4 @@ class SystemParams:
     mm_earth: float = 0.01
     am_hill: float = 0.25
     em: float = 0.0
-    moon_retrograde: bool = False  # NEW
+    moon_retrograde: bool = False  

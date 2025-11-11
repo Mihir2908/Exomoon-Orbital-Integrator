@@ -50,10 +50,10 @@ $$
 a_\mathrm{outer} = \sqrt{\frac{L_*}{4 \pi F_\mathrm{outer}}}
 $$
 
-with
+with,
 
 $$
-L_* = 4 \pi R_*^2 \sigma T_*^4
+L_* = 4π R_*² σ T_*⁴
 $$
 
 

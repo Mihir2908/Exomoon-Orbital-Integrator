@@ -6,7 +6,7 @@ Simulation Framework hosting codebase for a Leapfrog Algorithm-based Python inte
 
 The MCP server provides tool endpoints to Claude (or another LLM agent) for:
 
-fetch_exoplanet: Lookup and import system properties from the NASA Exoplanet Archive by planet name.
+** fetch_exoplanet: ** Lookup and import system properties from the NASA Exoplanet Archive by planet name.
 
 run_sim & run_sim_years: Run a simulation for the specified or default duration; outputs a Plotly HTML animation.
 

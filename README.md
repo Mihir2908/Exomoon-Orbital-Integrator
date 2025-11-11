@@ -1,7 +1,5 @@
 # Exomoon Orbital Integrator
 
-This repository hosts the codebase for the exomoon MCP server, which interfaces between Claude (as the "client") and the simulation backend. The server exposes a suite of tools to launch integrations, generate visualizations, perform habitability zone analysis, and diagnose system behavior—all configurable with user or AI input.
-
 Simulation Framework hosting codebase for a Leapfrog Algorithm-based Python integrator to numerically simulate the orbital evolution of any characterized 3 body (Star-Planet-Moon) system, analyzed and orbitally animated via a Dash Plotly UI. Supports automated parameterization from the NASA Exoplanet Archive and tools accessible to Claude (LLM), via an MCP Server. 
 
 ## Key Functions supported by Claude

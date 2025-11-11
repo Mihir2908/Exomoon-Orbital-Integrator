@@ -94,7 +94,7 @@ for each interacting pair
    - MacOS: 'code ~/Library/Application\ Support/Claude/claude_desktop_config.json'
   
 2. Setup the MCP Server Configuration
-   ```
+   ```json
    {
     "mcpServers": {
     "exomoon": {

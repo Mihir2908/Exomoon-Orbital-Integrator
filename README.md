@@ -94,6 +94,7 @@ for each interacting pair
    - MacOS: 'code ~/Library/Application\ Support/Claude/claude_desktop_config.json'
   
 2. Setup the MCP Server Configuration
+   
    ```json
    {
     "mcpServers": {
@@ -106,13 +107,11 @@ for each interacting pair
         }
     }
    }
-```
+   ```
 
-
+## Output
 HTML/Plotly animation of the system’s evolution
 
 Numerical summary of stability, escape times, and orbital diagnostics
 
 Option to analyze or download output via Claude or from storage
-
-

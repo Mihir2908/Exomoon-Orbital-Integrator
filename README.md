@@ -108,13 +108,6 @@ for each interacting pair
 }
 ```
 
-Start the MCP server:
-python mcp_server.py
-
-Use Claude or compatible LLM/agent to invoke MCP tools with input parameters.
-
-Visualize the system or override settings via the provided Dash UI (/outputs/exomoon_sim.html).
-
 ## Output
 HTML/Plotly animation of the system’s evolution
 

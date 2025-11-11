@@ -56,6 +56,7 @@ L_* = 4 \pi R_*^2 \sigma T_*^4
 $$
 
 
+
 ## Numerical Integration (Leapfrog Algorithm)
 
 For every object, the code integrates orbits using the velocity Verlet (leapfrog) scheme:

@@ -105,10 +105,10 @@ for each interacting pair
             }
         }
     }
-}
+   }
 ```
 
-## Output
+
 HTML/Plotly animation of the system’s evolution
 
 Numerical summary of stability, escape times, and orbital diagnostics

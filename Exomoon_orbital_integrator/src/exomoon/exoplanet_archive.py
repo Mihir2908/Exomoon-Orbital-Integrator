@@ -1,4 +1,5 @@
 import requests
+import re
 
 API = "https://exoplanetarchive.ipac.caltech.edu/TAP/sync"
 
@@ -56,14 +57,38 @@ def fetch_system_by_planet(pl_name: str) -> dict | None:
         "ep": row.get("pl_orbeccen"),
     }
 
-def search_planets(query: str, limit: int = 5) -> list[str]:
+def search_planets(query: str, limit: int = 25) -> list[str]:
     """
-    Return up to 'limit' planet names whose pl_name LIKE %query% (case-insensitive).
+    Return up to 'limit' planet names matching query, ranked so:
+      1) Names starting with the typed text (prefix) first
+      2) If a numeric chunk is present (e.g., '147'), names containing ' 147' next
+      3) Then other substring matches
     """
     if not query:
         return []
-    q = query.strip().replace("'", "''")
-    sql = f"SELECT TOP {int(limit)} pl_name FROM pscomppars WHERE UPPER(pl_name) LIKE UPPER('%{q}%') ORDER BY pl_name"
+    # Normalize spacing and escape
+    q = " ".join(query.split())
+    q_esc = q.replace("'", "''")
+
+    # Build ordering that prioritizes prefix and then numeric chunk (if any)
+    m = re.search(r"\d+", q)
+    if m:
+        num = m.group(0).replace("'", "''")
+        order = (
+            f"CASE "
+            f"WHEN UPPER(pl_name) LIKE UPPER('{q_esc}%') THEN 0 "            # starts with typed text
+            f"WHEN UPPER(pl_name) LIKE UPPER('% {num}%') THEN 1 "             # contains number token
+            f"ELSE 2 END, pl_name"
+        )
+    else:
+        order = (
+            f"CASE "
+            f"WHEN UPPER(pl_name) LIKE UPPER('{q_esc}%') THEN 0 "
+            f"ELSE 1 END, pl_name"
+        )
+
+    cond = f"UPPER(pl_name) LIKE UPPER('%{q_esc}%')"
+    sql = f"SELECT TOP {int(limit)} pl_name FROM pscomppars WHERE {cond} ORDER BY {order}"
     rows = _query_sql(sql)
     return [r.get("pl_name") for r in rows if r.get("pl_name")]
     

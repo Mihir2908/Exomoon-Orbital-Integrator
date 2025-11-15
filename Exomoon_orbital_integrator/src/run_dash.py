@@ -1,7 +1,7 @@
 import re
 import urllib.parse as _url
 import os, sys
-from dash import Dash, dcc, html, Input, Output, State, ctx
+from dash import Dash, dcc, html, Input, Output, State, ctx, no_update
 import plotly.graph_objects as go
 
 # Ensure src/ is importable regardless of current working dir
@@ -12,7 +12,7 @@ if SRC_DIR not in sys.path:
 from exomoon.params import SystemParams
 from exomoon.simulation import run_simulation
 from exomoon.plotting.anim import build_animation
-from exomoon.exoplanet_archive import fetch_system_by_planet, estimate_density_gcc
+from exomoon.exoplanet_archive import fetch_system_by_planet, estimate_density_gcc, search_planets
 
 app = Dash(__name__)
 app.title = "Exomoon Orbital Integrator (Interactive)"
@@ -22,11 +22,18 @@ _defaults = SystemParams()
 controls = html.Div([
     html.H4("NASA Exoplanet Archive"),
     html.Div([
-        dcc.Input(id="pl_name", type="text", placeholder="Planet name, e.g., HD 209458 b", style={"width": "100%"}),
+        dcc.Dropdown(
+            id="pl_picker",
+            options=[],
+            placeholder="Type 3+ characters to search…",
+            clearable=True,
+            searchable=True,
+            style={"width": "100%"}
+        ),
         html.Button("Fetch from NASA", id="fetch-btn", n_clicks=0, style={"width": "100%", "marginTop": "6px"}),
         html.Div(id="fetch-status", style={"fontSize": "12px", "color": "#666", "marginTop": "4px"}),
-    ], style={"display": "flex", "flexDirection": "column", "gap": "4px", "marginBottom": "12px"}),
-
+    ], style={"display": "flex", "flexDirection": "column", "gap": "4px", "marginBottom": "12px"}),    
+    
     html.H4("Inputs"),
     html.Label("Stellar temperature Ts (K)"),
     dcc.Input(id="Ts", type="number", value=_defaults.Ts, min=2000, max=20000, step="any", style={"width": "100%"}),
@@ -126,10 +133,42 @@ def _parse_floatish(val, cur):
                 return cur
     return cur
 
+# NEW: populate suggestions when typing in the textbox
+@app.callback(
+    Output("pl_picker", "options"),
+    Input("pl_picker", "search_value"),
+    State("pl_picker", "value"),
+    prevent_initial_call=False,
+)
+def planet_typeahead(search_value, current_value):
+    q = (search_value or "").strip()
+    # If user cleared the search box or fewer than 3 chars: keep current selection visible
+    if len(q) < 3:
+        if current_value:
+            return [{"label": current_value, "value": current_value}]
+        return []
+    try:
+        names = search_planets(q, limit=50)
+        # Ensure current selection stays in list
+        if current_value and current_value not in names:
+            names = [current_value] + names
+        # Deduplicate while preserving order
+        seen = set()
+        ordered = []
+        for n in names:
+            if n not in seen:
+                seen.add(n)
+                ordered.append(n)
+        return [{"label": n, "value": n} for n in ordered[:25]]
+    except Exception:
+        return [{"label": current_value, "value": current_value}] if current_value else []
+
+
 # Fetch from NASA and fill sliders
 @app.callback(
     [
         Output("fetch-status", "children"),
+        Output("pl_picker", "value"),            # NEW: keep dropdown selection in sync (URL, fetch)
         Output("Ts", "value"),
         Output("rs_solar", "value"),
         Output("ms_solar", "value"),
@@ -140,19 +179,17 @@ def _parse_floatish(val, cur):
         Output("mm_earth", "value"),
         Output("am_hill", "value"),
         Output("em", "value"),
-        Output("moon_dir", "value"),  # ensure radio reflects URL or stays as-is
-        Output("sim_years", "value"),            # (for simulation runtime)
-        Output("kick", "data"),                   # (for autorun)
-    
+        Output("moon_dir", "value"),
+        Output("sim_years", "value"),
+        Output("kick", "data"),
     ],
-    [Input("url", "search"), Input("fetch-btn", "n_clicks")],
-    State("pl_name", "value"),
+    [Input("url", "search"), Input("fetch-btn", "n_clicks"), Input("pl_picker", "value")],
     State("mm_earth", "value"), State("am_hill", "value"), State("em", "value"),
     State("moon_dir", "value"),
     State("sim_years", "value"),
     prevent_initial_call=False,
 )
-def populate_from_url_or_nasa(url_search, n_clicks, pl_name, mm_val, ah_val, em_val, dir_val, years_val):
+def populate_from_url_or_nasa(url_search, n_clicks, pl_value, mm_val, ah_val, em_val, dir_val, years_val):
     d = SystemParams()
     status = ""
 
@@ -166,25 +203,20 @@ def populate_from_url_or_nasa(url_search, n_clicks, pl_name, mm_val, ah_val, em_
     Ts, rs, ms, mp, ap, ep, dp = d.Ts, d.rs_solar, d.ms_solar, d.mp_earth, d.ap_AU, d.ep, d.dp_cgs
     mm, ah, em = _fv(mm_val, d.mm_earth), _fv(ah_val, d.am_hill), _fv(em_val, d.em)
     sim_years = _fv(years_val, 0.0)
-    kick = ""  # empty means no autorun
-    def _fo(val, cur):
-        try:
-            return cur if val is None else float(val)
-        except Exception:
-            return cur
-
+    kick = ""
     moon_dir = dir_val or "pro"
-    # A) URL path (on load or when URL changes)
+
+    # URL path
     if url_search:
         try:
             q = {k: v[0] for k, v in _url.parse_qs(url_search.lstrip("?")).items()}
-            # Fetch NASA if planet given
             pl = q.get("pl")
             if pl and pl.strip():
                 try:
                     rec = fetch_system_by_planet(pl)
                     if rec:
                         status = f"Loaded: {rec.get('pl_name')} (host: {rec.get('hostname')})"
+                        pl_value = rec.get("pl_name") or pl
                         Ts = rec.get("Ts") or Ts
                         rs = rec.get("rs_solar") or rs
                         ms = rec.get("ms_solar") or ms
@@ -197,7 +229,6 @@ def populate_from_url_or_nasa(url_search, n_clicks, pl_name, mm_val, ah_val, em_
                         status = f"No results for '{pl}'."
                 except Exception as e:
                     status = f"Error fetching '{pl}': {e}"
-            # Numeric overrides
             Ts  = _parse_floatish(q.get("Ts"), Ts);  rs  = _parse_floatish(q.get("rs_solar"), rs)
             ms  = _parse_floatish(q.get("ms_solar"), ms); mp  = _parse_floatish(q.get("mp_earth"), mp)
             ap  = _parse_floatish(q.get("ap_AU"), ap);   ep  = _parse_floatish(q.get("ep"), ep)
@@ -205,28 +236,50 @@ def populate_from_url_or_nasa(url_search, n_clicks, pl_name, mm_val, ah_val, em_
             mm  = _parse_floatish(q.get("mm_earth"), mm); ah  = _parse_floatish(q.get("am_hill"), ah)
             em  = _parse_floatish(q.get("em"), em)
             sim_years = _parse_floatish(q.get("years") or q.get("t_years") or q.get("duration"), sim_years)
-
             md_raw = q.get("moon_dir") or q.get("moon_retrograde")
             if md_raw:
                 md_raw = md_raw.lower()
                 moon_dir = "retro" if md_raw in ("retro","retrograde","r","true","1") else "pro"
-
             if q.get("run") in ("1","true","yes"):
-                kick = "run"  # signal autorun
-
-            return (status, Ts, rs, ms, mp, ap, ep, dp, mm, ah, em, moon_dir, sim_years, kick)
+                kick = "run"
+            return (status, pl_value, Ts, rs, ms, mp, ap, ep, dp, mm, ah, em, moon_dir, sim_years, kick)
         except Exception:
-            pass  # fall through
+            pass
+
+    # Selection fetch (dropdown value chosen)
+    picked = (pl_value or "").strip()
+    if picked and not n_clicks:  # avoid double-fetch if button also clicked
+        try:
+            rec = fetch_system_by_planet(picked)
+            if rec:
+                status = f"Loaded: {rec.get('pl_name')} (host: {rec.get('hostname')})"
+                pl_value = rec.get("pl_name") or picked
+                Ts = rec.get("Ts") or Ts
+                rs = rec.get("rs_solar") or rs
+                ms = rec.get("ms_solar") or ms
+                mp = rec.get("mp_earth") or mp
+                ap = rec.get("ap_AU") or ap
+                ep = rec.get("ep") or ep
+                est_rho = estimate_density_gcc(rec.get("mp_earth"), rec.get("pl_rade"))
+                dp = est_rho or dp
+                return (status, pl_value, Ts, rs, ms, mp, ap, ep, dp, mm, ah, em, moon_dir, sim_years, kick)
+            else:
+                status = f"No results for '{picked}'."
+                return (status, pl_value, Ts, rs, ms, mp, ap, ep, dp, mm, ah, em, moon_dir, sim_years, kick)
+        except Exception as e:
+            status = f"Error fetching '{picked}': {e}"
+            return (status, pl_value, Ts, rs, ms, mp, ap, ep, dp, mm, ah, em, moon_dir, sim_years, kick)
 
     # B) Button click flow (don't change moon sliders)
     if (n_clicks or 0) > 0:
-        name = (pl_name or "").strip()
-        if not name:
-            return ("Enter a planet name (e.g., HD 209458 b).", Ts, rs, ms, mp, ap, ep, dp, mm, ah, em, moon_dir, sim_years, kick)
+        if not picked:
+            return ("Select a planet first (type 3+ chars).", pl_value, Ts, rs, ms, mp, ap, ep, dp, mm, ah, em, moon_dir, sim_years, kick)
         try:
-            rec = fetch_system_by_planet(name)
+            rec = fetch_system_by_planet(picked)
             if not rec:
-                return (f"No results for '{name}'.", Ts, rs, ms, mp, ap, ep, dp, mm, ah, em, moon_dir, sim_years, kick)
+                return (f"No results for '{picked}'.", pl_value, Ts, rs, ms, mp, ap, ep, dp, mm, ah, em, moon_dir, sim_years, kick)
+            status = f"Loaded: {rec.get('pl_name')} (host: {rec.get('hostname')})"
+            pl_value = rec.get("pl_name") or picked
             Ts = rec.get("Ts") or Ts
             rs = rec.get("rs_solar") or rs
             ms = rec.get("ms_solar") or ms
@@ -235,11 +288,10 @@ def populate_from_url_or_nasa(url_search, n_clicks, pl_name, mm_val, ah_val, em_
             ep = rec.get("ep") or ep
             est_rho = estimate_density_gcc(rec.get("mp_earth"), rec.get("pl_rade"))
             dp = est_rho or dp
-            status = f"Loaded: {rec.get('pl_name')} (host: {rec.get('hostname')})"
         except Exception as e:
-            status = f"Error fetching '{name}': {e}"
+            status = f"Error fetching '{picked}': {e}"
     #Default/first load fallback (must return all 14 values)
-    return (status, Ts, rs, ms, mp, ap, ep, dp, mm, ah, em, moon_dir, sim_years, kick)
+    return (status, pl_value, Ts, rs, ms, mp, ap, ep, dp, mm, ah, em, moon_dir, sim_years, kick)
 
 # Simulation callback: add kick + sim_years
 @app.callback(
@@ -290,3 +342,5 @@ def run_cb(n_clicks, kick, Ts, rs_solar, ms_solar, mp_earth, dp_cgs, ap_AU, ep,
 
 if __name__ == "__main__":
     app.run(debug=True)
+    #print(f"Running Dash server on port: {8080}")
+    #app.run(host="0.0.0.0", port=8080, debug=True)

@@ -1,4 +1,5 @@
 from pathlib import Path
+from time import perf_counter
 from typing import Dict, Any
 from urllib.parse import urlencode
 import sys, traceback, re, json
@@ -128,26 +129,62 @@ def fetch_exoplanet(name: str) -> Dict[str, Any]:
 def run_sim(params: Dict[str, Any]) -> Dict[str, Any]:
     try:
         p = _params_from_dict(params or {})
+        t0 = perf_counter()
         sim = run_simulation(p)
-        fig = build_animation(sim["traj"], sim["a_inner_au"], sim["a_outer_au"], open_in_browser=False, dt=sim["dt"], t_end=sim["t_end"])
+        t1 = perf_counter()
+        fig = build_animation(sim["traj"], sim["a_inner_au"], sim["a_outer_au"],
+                              open_in_browser=False, dt=sim["dt"], t_end=sim["t_end"])
         outdir = Path("outputs"); outdir.mkdir(exist_ok=True)
         outfile = outdir / "exomoon_sim.html"
         fig.write_html(str(outfile), include_plotlyjs="cdn")
-        return {"ok": True, "figure_path": str(outfile.resolve()), "t_end": sim["t_end"], "rhill_AU": sim["state"].get("rhill_AU")}
+        return {
+            "ok": True,
+            "figure_path": str(outfile.resolve()),
+            "t_end": sim["t_end"],
+            "rhill_AU": sim["state"].get("rhill_AU"),
+            "dt": sim["dt"],
+            "n_steps": len(sim["traj"]["xyzarr_mp"]),
+            "runtime_s": t1 - t0,
+        }
     except Exception as e:
         print("[exomoon] run_sim error:\n", traceback.format_exc(), file=sys.stderr, flush=True)
         return {"ok": False, "message": str(e)}
 
 @mcp.tool()
-def run_sim_years(params: Dict[str, Any], years: float) -> Dict[str, Any]:
+def run_sim_years(params: Dict[str, Any], years: float | None = None) -> Dict[str, Any]:
+    """
+    Run multi-year simulation.
+    You can pass years either as the separate argument or inside params (e.g. {"years": 10}).
+    Returns: figure_path, t_end, rhill_AU, dt, n_steps, runtime_s, used_years.
+    """
     try:
-        p = _params_from_dict(params or {})
-        sim = run_simulation_for_years(p, float(years))
-        fig = build_animation(sim["traj"], sim["a_inner_au"], sim["a_outer_au"], open_in_browser=False, dt=sim["dt"], t_end=sim["t_end"])
+        raw = params or {}
+        # Extract years if positional not supplied
+        if years is None:
+            norm = _normalize_param_keys(raw)
+            years = norm.get("years")
+        if years is None:
+            return {"ok": False, "message": "Missing years (pass argument or include 'years' in params)."}
+        years_f = float(years)
+        p = _params_from_dict(raw)
+        t0 = perf_counter()
+        sim = run_simulation_for_years(p, years_f)
+        t1 = perf_counter()
+        fig = build_animation(sim["traj"], sim["a_inner_au"], sim["a_outer_au"],
+                              open_in_browser=False, dt=sim["dt"], t_end=sim["t_end"])
         outdir = Path("outputs"); outdir.mkdir(exist_ok=True)
-        outfile = outdir / f"exomoon_sim_{int(years)}y.html"
+        outfile = outdir / f"exomoon_sim_{int(round(years_f))}y.html"
         fig.write_html(str(outfile), include_plotlyjs="cdn")
-        return {"ok": True, "figure_path": str(outfile.resolve()), "t_end": sim["t_end"], "rhill_AU": sim["state"].get("rhill_AU")}
+        return {
+            "ok": True,
+            "figure_path": str(outfile.resolve()),
+            "t_end": sim["t_end"],
+            "rhill_AU": sim["state"].get("rhill_AU"),
+            "dt": sim["dt"],
+            "n_steps": len(sim["traj"]["xyzarr_mp"]),
+            "runtime_s": t1 - t0,
+            "used_years": years_f,
+        }
     except Exception as e:
         print("[exomoon] run_sim_years error:\n", traceback.format_exc(), file=sys.stderr, flush=True)
         return {"ok": False, "message": str(e)}
@@ -204,37 +241,78 @@ def moon_escape_info(params: Dict[str, Any], years: float, escape_factor: float 
 
 # Update dash_url to include years in query string if provided:
 @mcp.tool()
-def dash_url(params: Dict[str, Any] | str | None = None, planet: str | None = None, autorun: bool = False) -> Dict[str, str]:
-    raw = _coerce_params_to_dict(params)
-    q: Dict[str, Any] = {}
-    planet_name = planet or raw.get("pl") or raw.get("pl_name") or raw.get("planet") or raw.get("name")
-    if planet_name:
-        q["pl"] = str(planet_name)
+def dash_url(params: Any = None,
+             planet: str | None = None,
+             autorun: bool = False,
+             base: str = "http://127.0.0.1:8050/") -> Dict[str, str]:
+    """
+    Build a Dash URL with query parameters.
+    Accepts:
+      params: dict or JSON string of simulation/exoplanet keys
+      planet: explicit planet name (overrides params["pl_name"])
+      autorun: add run=1 so Dash auto-starts simulation
+      base: override base URL if running on different host/port
 
-    norm = _normalize_param_keys(raw)
+    Returns: url, query, accepted_keys, has_planet
+    """
+    try:
+        raw = _coerce_params_to_dict(params)
+        # Allow direct planet override
+        planet_name = planet or raw.get("pl") or raw.get("pl_name") or raw.get("planet") or raw.get("name")
+        norm = _normalize_param_keys(raw)
 
-    # Moon retrograde flag
-    if "moon_retrograde" in norm:
-        q["moon_dir"] = "retro" if norm["moon_retrograde"] else "pro"
+        q: Dict[str, Any] = {}
+        if planet_name:
+            q["pl"] = str(planet_name).strip()
 
-    # Numeric params
-    for k, v in norm.items():
-        if k == "moon_retrograde" or isinstance(v, bool):
-            continue
-        if k == "years":
-            q["years"] = v  # simulation duration
+        # Moon retrograde or direction
+        if "moon_retrograde" in norm:
+            q["moon_dir"] = "retro" if norm["moon_retrograde"] else "pro"
         else:
-            q[k] = v
+            # Accept raw moon_dir text
+            md = raw.get("moon_dir")
+            if md is not None:
+                mdv = str(md).lower().strip()
+                q["moon_dir"] = "retro" if mdv in ("retro","retrograde","r","true","1","yes") else "pro"
 
-    if autorun:
-        q["run"] = 1
+        # Numeric params
+        for key in ("Ts","rs_solar","ms_solar","mp_earth","dp_cgs","ap_AU","ep",
+                    "mm_earth","am_hill","em","years"):
+            if key in norm:
+                val = norm[key]
+                if isinstance(val, (int,float)):
+                    # Compact float formatting
+                    if isinstance(val, float):
+                        sval = f"{val:.12g}"
+                    else:
+                        sval = str(val)
+                    if key == "years":
+                        q["years"] = sval
+                    else:
+                        q[key] = sval
 
-    url = f"http://127.0.0.1:8050/?{urlencode(q)}"
-    return {
-        "url": url,
-        "accepted_keys": ",".join(sorted(norm.keys())),
-        "has_planet": "yes" if "pl" in q else "no"
-    }
+        if autorun:
+            q["run"] = "1"
+
+        query = urlencode(q)
+        url = base.rstrip("/") + "/?" + query
+
+        return {
+            "ok": "true",
+            "url": url,
+            "query": query,
+            "accepted_keys": ",".join(sorted(norm.keys())),
+            "has_planet": "yes" if "pl" in q else "no",
+        }
+    except Exception as e:
+        return {
+            "ok": "false",
+            "message": str(e),
+            "query": "",
+            "url": "",
+            "accepted_keys": "",
+            "has_planet": "no",
+        }
 
 if __name__ == "__main__":
     mcp.run()

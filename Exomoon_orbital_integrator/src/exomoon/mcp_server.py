@@ -9,6 +9,9 @@ from fastmcp import FastMCP
 from exomoon.params import SystemParams
 from exomoon.simulation import run_simulation, run_simulation_for_years
 from exomoon.plotting.anim import build_animation
+from exomoon.eda import traj_to_frame, to_csv_bytes, var_info
+import numpy as np
+import plotly.graph_objects as go
 from exomoon.exoplanet_archive import fetch_system_by_planet, search_planets
 from exomoon.moon_stability import assess_moon_stability as _assess_moon_stability  # import the function symbol
 from exomoon.moon_stability import analyze_moon_escape as _analyze_moon_escape
@@ -314,5 +317,164 @@ def dash_url(params: Any = None,
             "has_planet": "no",
         }
 
+def _coerce_var_list(val) -> list[str] | None:
+    if val is None:
+        return None
+    if isinstance(val, (list, tuple)):
+        return [str(x) for x in val if str(x).strip()]
+    if isinstance(val, str):
+        s = val.strip()
+        if not s:
+            return None
+        # JSON array string
+        if s.startswith("[") and s.endswith("]"):
+            try:
+                import json as _json
+                parsed = _json.loads(s)
+                if isinstance(parsed, list):
+                    return [str(x) for x in parsed if str(x).strip()]
+            except Exception:
+                pass
+        # Comma separated
+        if "," in s:
+            return [p.strip() for p in s.split(",") if p.strip()]
+        return [s]
+    return None
+
+def _is_dataframe(obj) -> bool:
+    return hasattr(obj, "columns") and hasattr(obj, "to_csv")
+
+# NEW: CSV export tool (positions + velocities)
+@mcp.tool()
+def export_csv(params: Dict[str, Any],
+               years: float | None = None,
+               columns: Any = None) -> Dict[str, Any]:
+    try:
+        p = _params_from_dict(params or {})
+        sim = run_simulation_for_years(p, float(years)) if (years and float(years) > 0) else run_simulation(p)
+        frame = traj_to_frame(sim)
+
+        requested = (_coerce_var_list(columns) or
+                     _coerce_var_list((params or {}).get("columns")) or
+                     _coerce_var_list((params or {}).get("variables")) or
+                     _coerce_var_list((params or {}).get("vars")))
+        if requested:
+            all_cols = frame.columns.tolist() if _is_dataframe(frame) else list(frame.keys())
+            keep = [c for c in requested if c in all_cols]
+            if keep:
+                if _is_dataframe(frame):
+                    base_cols = ["t_years"] if "t_years" in frame else []
+                    frame = frame[base_cols + keep]
+                else:
+                    newf = {}
+                    if "t_years" in frame:
+                        newf["t_years"] = frame["t_years"]
+                    for c in keep:
+                        newf[c] = frame[c]
+                    frame = newf
+
+        csv_bytes = to_csv_bytes(frame)
+        outdir = Path("outputs"); outdir.mkdir(exist_ok=True)
+        fname = f"exomoon_dataset_{int(years)}y.csv" if (years and years > 0) else "exomoon_dataset_orbit.csv"
+        fpath = outdir / fname
+        with open(fpath, "wb") as f:
+            f.write(csv_bytes)
+
+        if _is_dataframe(frame):
+            rows = int(frame.shape[0])
+        elif isinstance(frame, dict) and "t_years" in frame:
+            rows = len(frame["t_years"])
+        else:
+            rows = None
+
+        return {"ok": True, "csv_path": str(fpath.resolve()), "rows": rows,
+                "filtered_columns": requested or []}
+    except Exception as e:
+        print("[exomoon] export_csv error:\n", traceback.format_exc(), file=sys.stderr, flush=True)
+        return {"ok": False, "message": str(e)}
+
+
+@mcp.tool()
+def eda_plot(params: Dict[str, Any],
+             years: float | None = None,
+             variables: Any = None,
+             plot_type: str = "line",
+             normalize: bool = False) -> Dict[str, Any]:
+    try:
+        p = _params_from_dict(params or {})
+        sim = run_simulation_for_years(p, float(years)) if (years and float(years) > 0) else run_simulation(p)
+        frame = traj_to_frame(sim)
+        cols = frame.columns.tolist() if _is_dataframe(frame) else list(frame.keys())
+
+        var_list = (_coerce_var_list(variables) or
+                    _coerce_var_list((params or {}).get("variables")) or
+                    _coerce_var_list((params or {}).get("vars")) or
+                    _coerce_var_list((params or {}).get("columns")))
+        if not var_list:
+            defaults = [c for c in ("moon_planet_dist", "planet_star_dist", "moon_speed", "planet_speed") if c in cols]
+            var_list = defaults if defaults else [c for c in cols if c != "t_years"][:3]
+        var_list = [v for v in var_list if v in cols]
+        if not var_list:
+            return {"ok": False, "message": "No valid variables.", "available": cols}
+
+        t = frame["t_years"]
+        t_arr = t.to_numpy() if hasattr(t, "to_numpy") else np.asarray(t)
+
+        fig = go.Figure()
+        for v in var_list:
+            y = frame[v]
+            if normalize:
+                import numpy as _np
+                m = float(_np.max(_np.abs(y))) if len(y) else 1.0
+                if m != 0.0:
+                    y = y / m
+            mode = "markers" if plot_type == "scatter" else "lines"
+            label, _unit = var_info(v)
+            fig.add_trace(go.Scatter(x=t_arr, y=y, mode=mode, name=label))
+
+        if len(var_list) == 1:
+            label, unit = var_info(var_list[0])
+            title = f"{label} vs Time"
+        else:
+            names = [var_info(v)[0] for v in var_list[:3]]
+            more = "" if len(var_list) <= 3 else f" +{len(var_list)-3} more"
+            title = f"{', '.join(names)}{more} vs Time"
+
+        if normalize:
+            ytitle = "Normalized Value"
+        else:
+            units = {var_info(v)[1] for v in var_list}
+            units.discard(None)
+            if len(units) == 1:
+                ytitle = f"Value ({list(units)[0]})"
+            elif len(units) == 0:
+                ytitle = "Value"
+            else:
+                ytitle = "Value (mixed units)"
+
+        xmin = float(t_arr[0]) if len(t_arr) else 0.0
+        xmax = float(t_arr[-1]) if len(t_arr) else 1.0
+        fig.update_xaxes(range=[xmin, xmax])
+        fig.update_yaxes(autorange=True)
+        fig.update_layout(
+            title=title,
+            xaxis_title="Time (years)",
+            yaxis_title=ytitle,
+            height=800,
+            margin=dict(l=40, r=20, t=50, b=40),
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+        )
+
+        outdir = Path("outputs"); outdir.mkdir(exist_ok=True)
+        fname = f"exomoon_eda_{int(years)}y.html" if (years and years > 0) else "exomoon_eda_orbit.html"
+        fpath = outdir / fname
+        fig.write_html(str(fpath), include_plotlyjs="cdn")
+
+        return {"ok": True, "figure_path": str(fpath.resolve()), "variables_used": var_list}
+    except Exception as e:
+        print("[exomoon] eda_plot error:\n", traceback.format_exc(), file=sys.stderr, flush=True)
+        return {"ok": False, "message": str(e)}
+
 if __name__ == "__main__":
     mcp.run()
+

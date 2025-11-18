@@ -12,6 +12,8 @@ def run_simulation(p: SystemParams):
     orbprd_mm_ms = 2.0 * np.pi * p.ap_AU**1.5 / (st["mp"] + st["ms"]) ** 0.5
     orbprd_mm_mp = 2.0 * np.pi * st["am_AU"]**1.5 / (st["mp"] + st["mm"]) ** 0.5
 
+    
+    #Overridden time resolutions
     dt = orbprd_mm_mp / 1_000.0
     t_end = orbprd_mm_ms
 

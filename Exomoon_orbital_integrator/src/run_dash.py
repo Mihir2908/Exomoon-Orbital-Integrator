@@ -1,6 +1,7 @@
 import re
 import urllib.parse as _url
 import os, sys
+import numpy as np
 from dash import Dash, dcc, html, Input, Output, State, ctx, no_update
 import plotly.graph_objects as go
 
@@ -13,9 +14,11 @@ from exomoon.params import SystemParams
 from exomoon.simulation import run_simulation
 from exomoon.plotting.anim import build_animation
 from exomoon.exoplanet_archive import fetch_system_by_planet, estimate_density_gcc, search_planets
+from exomoon.eda import pack_sim, unpack_sim, traj_to_frame, to_csv_bytes, var_info
 
-app = Dash(__name__)
-app.title = "Exomoon Orbital Integrator (Interactive)"
+app = Dash(__name__, suppress_callback_exceptions=True,  # allow callbacks for components added later (/eda)
+    title="Exomoon Orbital Integrator (Interactive)"
+)
 
 _defaults = SystemParams()
 
@@ -79,9 +82,11 @@ controls = html.Div([
     ),
     html.Label("Simulation duration (years, 0 = 1 planet orbit)"),
     dcc.Input(id="sim_years", type="number", value=0, min=0, step="any", style={"width": "100%"}),
-
     html.Button("Run Simulation", id="run-btn", n_clicks=0, style={"width": "100%", "marginTop": "10px"}),
-], style={"display": "flex", "flexDirection": "column", "gap": "10px"})
+    html.Button("Export CSV", id="export-btn", n_clicks=0, style={"width": "100%", "marginTop": "6px"}),
+    dcc.Link("Open EDA Plots →", href="/eda", style={"marginTop": "8px", "textDecoration": "none", "color": "#0074D9"}),
+], style={"display": "flex", "flexDirection": "column", "gap": "10px"}),
+
 
 def _initial_figure():
     fig = go.Figure()
@@ -99,18 +104,61 @@ def _initial_figure():
     )
     return fig
 
-app.layout = html.Div([
-    dcc.Location(id="url", refresh=False),
-    dcc.Store(id="kick", data=""),
-    html.Div(controls, style={"width": "380px", "padding": "12px", "borderRight": "1px solid #ddd"}),
-    html.Div([
+# NEW: main vs EDA page containers
+def _main_page():
+    return html.Div([
         dcc.Loading(
             id="loading",
             type="default",
             children=dcc.Graph(id="orbit-graph", figure=_initial_figure(), style={"height": "90vh"})
         )
-    ], style={"flex": "1", "padding": "12px"})
+    ])
+
+def _eda_page():
+    return html.Div([
+        html.H3("Simulation EDA"),
+        html.Div([
+            html.Button("Back to Simulation", id="back-btn", n_clicks=0, style={"marginRight": "12px"}),
+            html.Div(id="eda-status", style={"display": "inline-block", "color": "#444"})
+        ], style={"marginBottom": "12px"}),
+        html.Div([
+            html.Label("Variables (Y-axis, multi-select)"),
+            dcc.Dropdown(id="eda-vars", options=[], multi=True, placeholder="Select variables"),
+            html.Label("Plot type"),
+            dcc.RadioItems(
+                id="eda-plot-type",
+                options=[{"label": "Line", "value": "line"}, {"label": "Scatter", "value": "scatter"}],
+                value="line", inline=True, style={"marginTop": "6px", "marginBottom": "12px"}
+            ),
+            html.Label("Normalize variables (divide by max)"),
+            dcc.Checklist(id="eda-normalize", options=[{"label": "Normalize", "value": "norm"}], value=[]),
+        ], style={"width": "340px", "float": "left", "marginRight": "24px"}),
+        html.Div([
+            dcc.Graph(id="eda-graph", style={"height": "80vh"})
+        ], style={"overflow": "hidden"}),
+        # Hidden orbit graph so run_cb Output is always valid
+        dcc.Graph(id="orbit-graph", figure=_initial_figure(), style={"display": "none"})
+    ])
+
+
+app.layout = html.Div([
+    dcc.Location(id="url", refresh=False),
+    dcc.Store(id="kick", data=""),
+    dcc.Store(id="simdata", data=""),
+    dcc.Download(id="download-csv"),
+    html.Div(controls, style={"width": "380px", "padding": "12px", "borderRight": "1px solid #ddd"}),
+    html.Div(id="page-content", children=_main_page(), style={"flex": "1", "padding": "12px"})
 ], style={"display": "flex", "height": "100vh", "fontFamily": "Segoe UI, Arial"})
+
+# NEW: router
+@app.callback(
+    Output("page-content", "children"),
+    Input("url", "pathname")
+)
+def route(pathname):
+    if pathname == "/eda":
+        return _eda_page()
+    return _main_page()
 
 def _fnum(v, default):
     try:
@@ -293,9 +341,9 @@ def populate_from_url_or_nasa(url_search, n_clicks, pl_value, mm_val, ah_val, em
     #Default/first load fallback (must return all 14 values)
     return (status, pl_value, Ts, rs, ms, mp, ap, ep, dp, mm, ah, em, moon_dir, sim_years, kick)
 
-# Simulation callback: add kick + sim_years
+# UPDATED: Simulation callback now also packs sim for export/EDA
 @app.callback(
-    Output("orbit-graph", "figure"),
+    [Output("orbit-graph", "figure"), Output("simdata", "data")],
     [Input("run-btn", "n_clicks"), Input("kick", "data")],   # kick triggers autorun
     State("Ts", "value"), State("rs_solar", "value"), State("ms_solar", "value"),
     State("mp_earth", "value"), State("dp_cgs", "value"),
@@ -306,10 +354,8 @@ def populate_from_url_or_nasa(url_search, n_clicks, pl_value, mm_val, ah_val, em
 )
 def run_cb(n_clicks, kick, Ts, rs_solar, ms_solar, mp_earth, dp_cgs, ap_AU, ep,
            mm_earth, am_hill, em, moon_dir, sim_years):
-    # Only run if button clicked or autorun kick set
     if not (n_clicks or (kick == "run")):
-        return _initial_figure()
-
+        return _initial_figure(), ""
     d = SystemParams()
     p = SystemParams(
         Ts=_fnum(Ts, d.Ts), rs_solar=_fnum(rs_solar, d.rs_solar), ms_solar=_fnum(ms_solar, d.ms_solar),
@@ -318,17 +364,18 @@ def run_cb(n_clicks, kick, Ts, rs_solar, ms_solar, mp_earth, dp_cgs, ap_AU, ep,
         mm_earth=_fnum(mm_earth, d.mm_earth), am_hill=_fnum(am_hill, d.am_hill), em=_fnum(em, d.em),
         moon_retrograde=(moon_dir == "retro"),
     )
-
     yrs = _fnum(sim_years, 0.0)
     if yrs > 0:
         from exomoon.simulation import run_simulation_for_years
         sim = run_simulation_for_years(p, yrs)
         duration_label = f"{yrs:.3f} years"
     else:
+        from exomoon.simulation import run_simulation
         sim = run_simulation(p)
         duration_label = "1 planet orbit"
 
-    fig = build_animation(sim["traj"], sim["a_inner_au"], sim["a_outer_au"], open_in_browser=False, dt=sim["dt"], t_end=sim["t_end"])
+    fig = build_animation(sim["traj"], sim["a_inner_au"], sim["a_outer_au"],
+                          open_in_browser=False, dt=sim["dt"], t_end=sim["t_end"])
     st = sim.get("state", {})
     rhill = st.get("rhill_AU")
     if isinstance(rhill, (int, float)):
@@ -338,7 +385,133 @@ def run_cb(n_clicks, kick, Ts, rs_solar, ms_solar, mp_earth, dp_cgs, ap_AU, ep,
             xref="paper", yref="paper", x=0.01, y=1.06,
             showarrow=False, align="left", font=dict(size=12)
         )
+    packed = pack_sim(sim)
+    return fig, packed
+
+# NEW: CSV export button
+@app.callback(
+    Output("download-csv", "data"),
+    Input("export-btn", "n_clicks"),
+    State("simdata", "data"),
+    prevent_initial_call=True,
+)
+def export_csv(n_clicks, packed):
+    if not packed:
+        return no_update
+    sim = unpack_sim(packed)
+    frame = traj_to_frame(sim)
+    csv_bytes = to_csv_bytes(frame)
+    return dcc.send_bytes(csv_bytes, "exomoon_simulation.csv")
+
+# NEW: Populate EDA var list when we have data
+@app.callback(
+    [Output("eda-vars", "options"), Output("eda-status", "children")],
+    [Input("simdata", "data"), Input("url", "pathname")],  # also trigger on navigation to /eda
+    prevent_initial_call=False,
+)
+def load_variables(packed, pathname):
+    if not packed:
+        return [], "No simulation data yet. Run a simulation first."
+    sim = unpack_sim(packed)
+    frame = traj_to_frame(sim)
+    cols = frame.columns.tolist() if hasattr(frame, "columns") else list(frame.keys())
+    opts = [{"label": c, "value": c} for c in cols if c != "t_years"]
+    return opts, f"Loaded {len(cols)-1} variables."
+
+# NEW: EDA plot builder
+@app.callback(
+    Output("eda-graph", "figure"),
+    [Input("eda-vars", "value"), Input("eda-plot-type", "value"), Input("eda-normalize", "value")],
+    State("simdata", "data"),
+    prevent_initial_call=True,
+)
+
+def eda_plot(vars_selected, ptype, norm_opts, packed):
+    import plotly.graph_objects as go
+    if not packed or not vars_selected:
+        return go.Figure()
+    sim = unpack_sim(packed)
+    frame = traj_to_frame(sim)
+    t = frame["t_years"]
+    # Use positional array to avoid pandas label indexing for -1
+    t_arr = t.to_numpy() if hasattr(t, "to_numpy") else np.asarray(t)
+
+    vars_selected = vars_selected or []
+    normalize = "norm" in (norm_opts or [])
+
+    fig = go.Figure()
+    for v in vars_selected:
+        if v not in frame:
+            continue
+        y = frame[v]
+        if normalize:
+            m = float(np.max(np.abs(y))) if len(y) else 1.0
+            y = y / (m if m != 0 else 1.0)
+        mode = "markers" if ptype == "scatter" else "lines"
+        label, _unit = var_info(v)
+        fig.add_trace(go.Scatter(x=t_arr, y=y, mode=mode, name=label))
+
+    # Dynamic title
+    if len(vars_selected) == 1:
+        label, unit = var_info(vars_selected[0])
+        title = f"{label} vs Time"
+    else:
+        names = [var_info(v)[0] for v in vars_selected[:3]]
+        more = "" if len(vars_selected) <= 3 else f" +{len(vars_selected)-3} more"
+        title = f"{', '.join(names)}{more} vs Time"
+
+    # Y-axis label with units (if all same and not normalized)
+    if normalize:
+        ytitle = "Normalized Value"
+    else:
+        units = {var_info(v)[1] for v in vars_selected if v in frame}
+        units.discard(None)
+        if len(units) == 1:
+            ytitle = f"Value ({list(units)[0]})"
+        elif len(units) == 0:
+            ytitle = "Value"
+        else:
+            ytitle = "Value (mixed units)"
+
+    # Axes ranges: always show full time
+    xmin = float(t_arr[0]) if len(t_arr) else 0.0
+    xmax = float(t_arr[-1]) if len(t_arr) else 1.0
+    fig.update_xaxes(range=[xmin, xmax])
+
+    if len(vars_selected) == 1 and vars_selected[0] in frame:
+        y0 = frame[vars_selected[0]]
+        ymin, ymax = float(np.min(y0)), float(np.max(y0))
+        if ymin == ymax:
+            pad = 1.0 if ymax == 0.0 else 0.05 * abs(ymax)
+            ymin -= pad; ymax += pad
+        else:
+            span = ymax - ymin
+            pad = 0.05 * span
+            ymin -= pad; ymax += pad
+        fig.update_yaxes(range=[ymin, ymax])
+    else:
+        fig.update_yaxes(autorange=True)
+
+    fig.update_layout(
+        title=title,
+        xaxis_title="Time (years)",
+        yaxis_title=ytitle,
+        height=800,
+        margin=dict(l=40, r=20, t=50, b=40),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+    )
     return fig
+
+# NEW: Back button to navigate to main page
+@app.callback(
+    Output("url", "pathname"),
+    Input("back-btn", "n_clicks"),
+    prevent_initial_call=True
+)
+def go_back(n):
+    if n:
+        return "/"
+    return no_update
 
 if __name__ == "__main__":
     app.run(debug=True)

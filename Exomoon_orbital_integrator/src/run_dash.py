@@ -513,7 +513,16 @@ def go_back(n):
         return "/"
     return no_update
 
+
 if __name__ == "__main__":
-    app.run(debug=True)
+    host = os.getenv("HOST", "0.0.0.0")
+    port = int(os.getenv("PORT", "8050"))
+    debug = os.getenv("DEBUG", "1") == "1"
+    app.run(host=host, port=port, debug=debug)
+
+#if __name__ == "__main__":
+#    app.run(debug=True)
+    
+    
     #print(f"Running Dash server on port: {8080}")
     #app.run(host="0.0.0.0", port=8080, debug=True)

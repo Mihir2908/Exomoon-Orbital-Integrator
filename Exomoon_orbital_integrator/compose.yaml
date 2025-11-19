@@ -1,0 +1,11 @@
+services:
+  server:
+    build: .
+    image: exomoon-dash:latest
+    ports:
+      - "8050:8050"
+    environment:
+      - HOST=0.0.0.0
+      - PORT=8050
+      - DEBUG=1
+    command: ["python","src/run_dash.py"]

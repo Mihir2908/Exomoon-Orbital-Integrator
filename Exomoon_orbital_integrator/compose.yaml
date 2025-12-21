@@ -1,11 +1,16 @@
 services:
   server:
     build: .
-    image: exomoon-dash:latest
+    image: dash-mcp:UI
     ports:
       - "8050:8050"
     environment:
       - HOST=0.0.0.0
       - PORT=8050
       - DEBUG=1
+      - AWS_SHARED_CREDENTIALS_FILE=/root/.aws/credentials
+
+    volumes:
+      - C:\Users\mihir\.aws\credentials:/root/.aws/credentials:ro  
+
     command: ["python","src/run_dash.py"]

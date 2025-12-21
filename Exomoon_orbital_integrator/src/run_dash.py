@@ -1,11 +1,40 @@
-import re
+from datetime import datetime
+import os, sys, uuid, json, re, io
 import urllib.parse as _url
-import os, sys
 import numpy as np
-from dash import Dash, dcc, html, Input, Output, State, ctx, no_update
+import pandas as pd
+import boto3
+import botocore
 import plotly.graph_objects as go
+from dash import Dash, dcc, html, Input, Output, State, ctx, no_update
 
-# Ensure src/ is importable regardless of current working dir
+from exomoon.habitable_zone import hz_bounds_au
+from exomoon.constants import rsun
+
+print(f"[ENV DEBUG] AWS_ENABLED={os.getenv('AWS_ENABLED')}", flush=True)
+print(f"[ENV DEBUG] EXOMOON_BUCKET={os.getenv('EXOMOON_BUCKET')}", flush=True)
+print(f"[ENV DEBUG] STATE_MACHINE_ARN={os.getenv('STATE_MACHINE_ARN')}", flush=True)
+print(f"[ENV DEBUG] All set: {bool(os.getenv('AWS_ENABLED') == '1' and os.getenv('EXOMOON_BUCKET') and os.getenv('STATE_MACHINE_ARN'))}", flush=True)
+
+AWS_ENABLED = os.getenv("AWS_ENABLED", "0") == "1"
+BUCKET = os.getenv("EXOMOON_BUCKET")
+STATE_MACHINE_ARN = os.getenv("STATE_MACHINE_ARN")
+AWS_REGION = os.getenv("AWS_REGION", "eu-west-2")
+
+print(f"[ENV] AWS_ENABLED={AWS_ENABLED}, BUCKET={BUCKET}, REGION={AWS_REGION}", flush=True)
+
+if AWS_ENABLED and BUCKET and STATE_MACHINE_ARN:
+    s3 = boto3.client('s3', region_name=AWS_REGION)
+    sf = boto3.client('stepfunctions', region_name=AWS_REGION)
+    try:
+        s3.head_bucket(Bucket=BUCKET)
+        print(f"[SUCCESS] S3 + credentials working", flush=True)
+    except Exception as e:
+        print(f"[FAIL] S3 test: {e}", flush=True)
+        s3 = sf = None
+else:
+    s3 = sf = None
+
 SRC_DIR = os.path.dirname(__file__)
 if SRC_DIR not in sys.path:
     sys.path.insert(0, SRC_DIR)
@@ -16,9 +45,12 @@ from exomoon.plotting.anim import build_animation
 from exomoon.exoplanet_archive import fetch_system_by_planet, estimate_density_gcc, search_planets
 from exomoon.eda import pack_sim, unpack_sim, traj_to_frame, to_csv_bytes, var_info
 
-app = Dash(__name__, suppress_callback_exceptions=True,  # allow callbacks for components added later (/eda)
+app = Dash(__name__, suppress_callback_exceptions=True,
     title="Exomoon Orbital Integrator (Interactive)"
 )
+
+# Allow duplicate outputs to fire on initial render safely
+app.config["prevent_initial_callbacks"] = "initial_duplicate"
 
 _defaults = SystemParams()
 
@@ -35,8 +67,8 @@ controls = html.Div([
         ),
         html.Button("Fetch from NASA", id="fetch-btn", n_clicks=0, style={"width": "100%", "marginTop": "6px"}),
         html.Div(id="fetch-status", style={"fontSize": "12px", "color": "#666", "marginTop": "4px"}),
-    ], style={"display": "flex", "flexDirection": "column", "gap": "4px", "marginBottom": "12px"}),    
-    
+    ], style={"display": "flex", "flexDirection": "column", "gap": "4px", "marginBottom": "12px"}),
+
     html.H4("Inputs"),
     html.Label("Stellar temperature Ts (K)"),
     dcc.Input(id="Ts", type="number", value=_defaults.Ts, min=2000, max=20000, step="any", style={"width": "100%"}),
@@ -47,7 +79,6 @@ controls = html.Div([
     html.Label("Star mass (M☉)"),
     dcc.Slider(id="ms_solar", min=0.05, max=50.0, step=0.01, value=_defaults.ms_solar, tooltip={"placement": "bottom"}),
 
-    # IMPORTANT: make wide-range sliders continuous (no discrete stepping)
     html.Label("Planet mass (M⊕)"),
     dcc.Slider(id="mp_earth", min=0.01, max=10.0, step=None, value=_defaults.mp_earth, tooltip={"placement": "bottom"}),
 
@@ -85,8 +116,7 @@ controls = html.Div([
     html.Button("Run Simulation", id="run-btn", n_clicks=0, style={"width": "100%", "marginTop": "10px"}),
     html.Button("Export CSV", id="export-btn", n_clicks=0, style={"width": "100%", "marginTop": "6px"}),
     dcc.Link("Open EDA Plots →", href="/eda", style={"marginTop": "8px", "textDecoration": "none", "color": "#0074D9"}),
-], style={"display": "flex", "flexDirection": "column", "gap": "10px"}),
-
+], style={"display": "flex", "flexDirection": "column", "gap": "10px"})
 
 def _initial_figure():
     fig = go.Figure()
@@ -104,13 +134,17 @@ def _initial_figure():
     )
     return fig
 
-# NEW: main vs EDA page containers
 def _main_page():
     return html.Div([
         dcc.Loading(
             id="loading",
             type="default",
-            children=dcc.Graph(id="orbit-graph", figure=_initial_figure(), style={"height": "90vh"})
+            children=dcc.Graph(
+                id="orbit-graph",
+                figure=_initial_figure(),
+                style={"height": "90vh"},
+                config={"scrollZoom": True, "displayModeBar": True, "responsive": True}
+            )
         )
     ])
 
@@ -121,36 +155,45 @@ def _eda_page():
             html.Button("Back to Simulation", id="back-btn", n_clicks=0, style={"marginRight": "12px"}),
             html.Div(id="eda-status", style={"display": "inline-block", "color": "#444"})
         ], style={"marginBottom": "12px"}),
-        html.Div([
-            html.Label("Variables (Y-axis, multi-select)"),
-            dcc.Dropdown(id="eda-vars", options=[], multi=True, placeholder="Select variables"),
-            html.Label("Plot type"),
-            dcc.RadioItems(
-                id="eda-plot-type",
-                options=[{"label": "Line", "value": "line"}, {"label": "Scatter", "value": "scatter"}],
-                value="line", inline=True, style={"marginTop": "6px", "marginBottom": "12px"}
-            ),
-            html.Label("Normalize variables (divide by max)"),
-            dcc.Checklist(id="eda-normalize", options=[{"label": "Normalize", "value": "norm"}], value=[]),
-        ], style={"width": "340px", "float": "left", "marginRight": "24px"}),
-        html.Div([
-            dcc.Graph(id="eda-graph", style={"height": "80vh"})
-        ], style={"overflow": "hidden"}),
-        # Hidden orbit graph so run_cb Output is always valid
-        dcc.Graph(id="orbit-graph", figure=_initial_figure(), style={"display": "none"})
-    ])
 
+        # Wrap controls + graph in a flex row (prevents compression)
+        html.Div([
+            html.Div([
+                html.Label("Variables (Y-axis, multi-select)"),
+                dcc.Dropdown(id="eda-vars", options=[], multi=True, placeholder="Select variables",
+                             persistence=True, persisted_props=["value"]),
+                html.Label("Plot type"),
+                dcc.RadioItems(
+                    id="eda-plot-type",
+                    options=[{"label": "Line", "value": "line"}, {"label": "Scatter", "value": "scatter"}],
+                    value="line", inline=True, style={"marginTop": "6px", "marginBottom": "12px"}
+                ),
+                html.Label("Normalize variables (divide by max)"),
+                dcc.Checklist(id="eda-normalize", options=[{"label": "Normalize", "value": "norm"}], value=[]),
+            ], style={"width": "340px", "flex": "0 0 340px"}),
+
+            html.Div([
+                dcc.Graph(
+                    id="eda-graph",
+                    style={"height": "80vh", "backgroundColor": "white"},
+                    config={"scrollZoom": True, "displayModeBar": True, "responsive": True}
+                )
+            ], style={"flex": "1 1 auto", "minWidth": "0"})
+        ], style={"display": "flex", "gap": "16px"})
+    ])
 
 app.layout = html.Div([
     dcc.Location(id="url", refresh=False),
     dcc.Store(id="kick", data=""),
     dcc.Store(id="simdata", data=""),
+    dcc.Store(id="job-info", data=None),
+    dcc.Interval(id="status-interval", interval=5000, n_intervals=0, disabled=True),
     dcc.Download(id="download-csv"),
     html.Div(controls, style={"width": "380px", "padding": "12px", "borderRight": "1px solid #ddd"}),
+    html.Div(id="status-display", style={"marginTop": "8px"}),
     html.Div(id="page-content", children=_main_page(), style={"flex": "1", "padding": "12px"})
 ], style={"display": "flex", "height": "100vh", "fontFamily": "Segoe UI, Arial"})
 
-# NEW: router
 @app.callback(
     Output("page-content", "children"),
     Input("url", "pathname")
@@ -167,7 +210,6 @@ def _fnum(v, default):
         return default
 
 def _parse_floatish(val, cur):
-    # Accept numbers or strings with units (e.g., "2.54 M_earth", "0.4 R_hill")
     if val is None:
         return cur
     if isinstance(val, (int, float)):
@@ -181,7 +223,6 @@ def _parse_floatish(val, cur):
                 return cur
     return cur
 
-# NEW: populate suggestions when typing in the textbox
 @app.callback(
     Output("pl_picker", "options"),
     Input("pl_picker", "search_value"),
@@ -190,33 +231,26 @@ def _parse_floatish(val, cur):
 )
 def planet_typeahead(search_value, current_value):
     q = (search_value or "").strip()
-    # If user cleared the search box or fewer than 3 chars: keep current selection visible
     if len(q) < 3:
         if current_value:
             return [{"label": current_value, "value": current_value}]
         return []
     try:
         names = search_planets(q, limit=50)
-        # Ensure current selection stays in list
         if current_value and current_value not in names:
             names = [current_value] + names
-        # Deduplicate while preserving order
-        seen = set()
-        ordered = []
+        seen = set(); ordered = []
         for n in names:
             if n not in seen:
-                seen.add(n)
-                ordered.append(n)
+                seen.add(n); ordered.append(n)
         return [{"label": n, "value": n} for n in ordered[:25]]
     except Exception:
         return [{"label": current_value, "value": current_value}] if current_value else []
 
-
-# Fetch from NASA and fill sliders
 @app.callback(
     [
         Output("fetch-status", "children"),
-        Output("pl_picker", "value"),            # NEW: keep dropdown selection in sync (URL, fetch)
+        Output("pl_picker", "value"),
         Output("Ts", "value"),
         Output("rs_solar", "value"),
         Output("ms_solar", "value"),
@@ -235,13 +269,12 @@ def planet_typeahead(search_value, current_value):
     State("mm_earth", "value"), State("am_hill", "value"), State("em", "value"),
     State("moon_dir", "value"),
     State("sim_years", "value"),
+    State("simdata", "data"),  # Check if we already have a sim
     prevent_initial_call=False,
 )
-def populate_from_url_or_nasa(url_search, n_clicks, pl_value, mm_val, ah_val, em_val, dir_val, years_val):
+def populate_from_url_or_nasa(url_search, n_clicks, pl_value, mm_val, ah_val, em_val, dir_val, years_val, packed):
     d = SystemParams()
     status = ""
-
-    # Start with current (or defaults on first load)
     def _fv(v, default):
         try:
             return default if v is None or (isinstance(v, str) and v.strip() == "") else float(v)
@@ -254,7 +287,6 @@ def populate_from_url_or_nasa(url_search, n_clicks, pl_value, mm_val, ah_val, em
     kick = ""
     moon_dir = dir_val or "pro"
 
-    # URL path
     if url_search:
         try:
             q = {k: v[0] for k, v in _url.parse_qs(url_search.lstrip("?")).items()}
@@ -273,8 +305,6 @@ def populate_from_url_or_nasa(url_search, n_clicks, pl_value, mm_val, ah_val, em
                         ep = rec.get("ep") or ep
                         est_rho = estimate_density_gcc(rec.get("mp_earth"), rec.get("pl_rade"))
                         dp = est_rho or dp
-                    else:
-                        status = f"No results for '{pl}'."
                 except Exception as e:
                     status = f"Error fetching '{pl}': {e}"
             Ts  = _parse_floatish(q.get("Ts"), Ts);  rs  = _parse_floatish(q.get("rs_solar"), rs)
@@ -289,14 +319,13 @@ def populate_from_url_or_nasa(url_search, n_clicks, pl_value, mm_val, ah_val, em
                 md_raw = md_raw.lower()
                 moon_dir = "retro" if md_raw in ("retro","retrograde","r","true","1") else "pro"
             if q.get("run") in ("1","true","yes"):
-                kick = "run"
+                kick = "run" if not packed else ""  # only autorun if no simdata yet
             return (status, pl_value, Ts, rs, ms, mp, ap, ep, dp, mm, ah, em, moon_dir, sim_years, kick)
         except Exception:
             pass
 
-    # Selection fetch (dropdown value chosen)
     picked = (pl_value or "").strip()
-    if picked and not n_clicks:  # avoid double-fetch if button also clicked
+    if picked and not n_clicks:
         try:
             rec = fetch_system_by_planet(picked)
             if rec:
@@ -318,7 +347,6 @@ def populate_from_url_or_nasa(url_search, n_clicks, pl_value, mm_val, ah_val, em
             status = f"Error fetching '{picked}': {e}"
             return (status, pl_value, Ts, rs, ms, mp, ap, ep, dp, mm, ah, em, moon_dir, sim_years, kick)
 
-    # B) Button click flow (don't change moon sliders)
     if (n_clicks or 0) > 0:
         if not picked:
             return ("Select a planet first (type 3+ chars).", pl_value, Ts, rs, ms, mp, ap, ep, dp, mm, ah, em, moon_dir, sim_years, kick)
@@ -338,13 +366,16 @@ def populate_from_url_or_nasa(url_search, n_clicks, pl_value, mm_val, ah_val, em
             dp = est_rho or dp
         except Exception as e:
             status = f"Error fetching '{picked}': {e}"
-    #Default/first load fallback (must return all 14 values)
     return (status, pl_value, Ts, rs, ms, mp, ap, ep, dp, mm, ah, em, moon_dir, sim_years, kick)
 
-# UPDATED: Simulation callback now also packs sim for export/EDA
 @app.callback(
-    [Output("orbit-graph", "figure"), Output("simdata", "data")],
-    [Input("run-btn", "n_clicks"), Input("kick", "data")],   # kick triggers autorun
+    [Output("orbit-graph", "figure", allow_duplicate=True),
+     Output("simdata", "data"),
+     Output("job-info", "data"),
+     Output("kick", "data", allow_duplicate=True),
+     Output("status-interval", "disabled", allow_duplicate=True),
+     Output("url", "search", allow_duplicate=True)],
+    [Input("run-btn", "n_clicks"), Input("kick", "data")],
     State("Ts", "value"), State("rs_solar", "value"), State("ms_solar", "value"),
     State("mp_earth", "value"), State("dp_cgs", "value"),
     State("ap_AU", "value"), State("ep", "value"),
@@ -354,8 +385,16 @@ def populate_from_url_or_nasa(url_search, n_clicks, pl_value, mm_val, ah_val, em
 )
 def run_cb(n_clicks, kick, Ts, rs_solar, ms_solar, mp_earth, dp_cgs, ap_AU, ep,
            mm_earth, am_hill, em, moon_dir, sim_years):
+    
+    # Only proceed if the Run button was clicked, or we explicitly set kick="run"
+    trigger = getattr(ctx, "triggered_id", None)
+    if trigger == "kick" and kick != "run":
+        return no_update, no_update, no_update, no_update, no_update, no_update
+    if trigger == "run-btn" and ((n_clicks or 0) < 1):
+        return no_update, no_update, no_update, no_update, no_update, no_update
+    
     if not (n_clicks or (kick == "run")):
-        return _initial_figure(), ""
+        return _initial_figure(), "", None, "", True, ""
     d = SystemParams()
     p = SystemParams(
         Ts=_fnum(Ts, d.Ts), rs_solar=_fnum(rs_solar, d.rs_solar), ms_solar=_fnum(ms_solar, d.ms_solar),
@@ -365,15 +404,71 @@ def run_cb(n_clicks, kick, Ts, rs_solar, ms_solar, mp_earth, dp_cgs, ap_AU, ep,
         moon_retrograde=(moon_dir == "retro"),
     )
     yrs = _fnum(sim_years, 0.0)
+
+    if s3 and sf:
+        try:
+            job_id = f"job-{datetime.utcnow().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}"
+            input_prefix = f"exomoon_orbital_integrator/inputs/{job_id}/"
+            params_dict = {
+                "Ts": p.Ts, "rs_solar": p.rs_solar, "ms_solar": p.ms_solar,
+                "mp_earth": p.mp_earth, "dp_cgs": p.dp_cgs, "ap_AU": p.ap_AU, "ep": p.ep,
+                "mm_earth": p.mm_earth, "am_hill": p.am_hill, "em": p.em,
+                "moon_retrograde": p.moon_retrograde, "years": yrs
+            }
+            print(f"[DEBUG] AWS job_id={job_id}, bucket={BUCKET}")
+            s3.put_object(Bucket=BUCKET, Key=f"{input_prefix}params.json", Body=json.dumps(params_dict))
+            output_prefix = f"exomoon_orbital_integrator/outputs/{job_id}/"
+            resp = sf.start_execution(
+                stateMachineArn=STATE_MACHINE_ARN,
+                name=job_id,
+                input=json.dumps({
+                    "inputS3Prefix": f"s3://{BUCKET}/{input_prefix}",
+                    "outputS3Prefix": f"s3://{BUCKET}/{output_prefix}"
+                })
+            )
+
+            hz_inner, hz_outer = hz_bounds_au(p.Ts, p.rs_solar * rsun)
+            if hz_inner > hz_outer:
+                hz_inner, hz_outer = hz_outer, hz_inner
+
+            job_info = {
+                "job_id": job_id,
+                "execution_arn": resp["executionArn"],
+                "output_prefix": output_prefix,
+                "bucket": BUCKET,
+                "status": "RUNNING",
+                "a_inner_au": float(hz_inner),
+                "a_outer_au": float(hz_outer),
+                "Ts": float(p.Ts),
+                "rs_solar": float(p.rs_solar),
+            }
+
+            fig = _initial_figure()
+            fig.update_layout(annotations=[dict(
+                text=f"🚀 AWS Job {job_id} launched!<br>Execution: {resp.get('executionArn')}",
+                x=0.5, y=0.5, xref="paper", yref="paper",
+                showarrow=False, font=dict(size=14)
+            )])
+            # Clear kick, enable poller, clear URL query
+            return fig, "", job_info, "", False, ""
+        except Exception as e:
+            print(f"[DEBUG] AWS failed: {e}")
+            fig = _initial_figure()
+            fig.update_layout(annotations=[dict(
+                text=f"AWS Error: {str(e)[:100]}",
+                x=0.5, y=0.5, xref="paper", yref="paper",
+                showarrow=False, font=dict(size=14)
+            )])
+            return fig, "", None, "", True, ""
+
+    # Local fallback
     if yrs > 0:
         from exomoon.simulation import run_simulation_for_years
         sim = run_simulation_for_years(p, yrs)
         duration_label = f"{yrs:.3f} years"
     else:
-        from exomoon.simulation import run_simulation
         sim = run_simulation(p)
         duration_label = "1 planet orbit"
-
     fig = build_animation(sim["traj"], sim["a_inner_au"], sim["a_outer_au"],
                           open_in_browser=False, dt=sim["dt"], t_end=sim["t_end"])
     st = sim.get("state", {})
@@ -386,9 +481,8 @@ def run_cb(n_clicks, kick, Ts, rs_solar, ms_solar, mp_earth, dp_cgs, ap_AU, ep,
             showarrow=False, align="left", font=dict(size=12)
         )
     packed = pack_sim(sim)
-    return fig, packed
+    return fig, packed, None, "", True, ""
 
-# NEW: CSV export button
 @app.callback(
     Output("download-csv", "data"),
     Input("export-btn", "n_clicks"),
@@ -403,13 +497,12 @@ def export_csv(n_clicks, packed):
     csv_bytes = to_csv_bytes(frame)
     return dcc.send_bytes(csv_bytes, "exomoon_simulation.csv")
 
-# NEW: Populate EDA var list when we have data
 @app.callback(
     [Output("eda-vars", "options"), Output("eda-status", "children")],
-    [Input("simdata", "data"), Input("url", "pathname")],  # also trigger on navigation to /eda
+    Input("simdata", "data"),
     prevent_initial_call=False,
 )
-def load_variables(packed, pathname):
+def load_variables(packed):
     if not packed:
         return [], "No simulation data yet. Run a simulation first."
     sim = unpack_sim(packed)
@@ -418,22 +511,34 @@ def load_variables(packed, pathname):
     opts = [{"label": c, "value": c} for c in cols if c != "t_years"]
     return opts, f"Loaded {len(cols)-1} variables."
 
-# NEW: EDA plot builder
+@app.callback(
+    Output("eda-vars", "value"),
+    Input("eda-vars", "options"),
+    State("simdata", "data"),
+    prevent_initial_call=True,
+)
+def pick_default_eda_vars(options, packed):
+    if not options or not packed:
+        return no_update
+    present = [opt["value"] for opt in options]
+    defaults = [v for v in ("moon_planet_dist", "planet_star_dist", "moon_speed") if v in present]
+    if not defaults:
+        defaults = present[:3]
+    return defaults
+
 @app.callback(
     Output("eda-graph", "figure"),
     [Input("eda-vars", "value"), Input("eda-plot-type", "value"), Input("eda-normalize", "value")],
     State("simdata", "data"),
     prevent_initial_call=True,
 )
-
 def eda_plot(vars_selected, ptype, norm_opts, packed):
-    import plotly.graph_objects as go
     if not packed or not vars_selected:
-        return go.Figure()
+        return go.Figure(layout=dict(template="plotly_white"))
     sim = unpack_sim(packed)
     frame = traj_to_frame(sim)
+
     t = frame["t_years"]
-    # Use positional array to avoid pandas label indexing for -1
     t_arr = t.to_numpy() if hasattr(t, "to_numpy") else np.asarray(t)
 
     vars_selected = vars_selected or []
@@ -444,14 +549,14 @@ def eda_plot(vars_selected, ptype, norm_opts, packed):
         if v not in frame:
             continue
         y = frame[v]
+        y = y.to_numpy() if hasattr(y, "to_numpy") else np.asarray(y)  # robust
         if normalize:
-            m = float(np.max(np.abs(y))) if len(y) else 1.0
+            m = float(np.max(np.abs(y))) if y.size else 1.0
             y = y / (m if m != 0 else 1.0)
         mode = "markers" if ptype == "scatter" else "lines"
         label, _unit = var_info(v)
         fig.add_trace(go.Scatter(x=t_arr, y=y, mode=mode, name=label))
 
-    # Dynamic title
     if len(vars_selected) == 1:
         label, unit = var_info(vars_selected[0])
         title = f"{label} vs Time"
@@ -460,11 +565,10 @@ def eda_plot(vars_selected, ptype, norm_opts, packed):
         more = "" if len(vars_selected) <= 3 else f" +{len(vars_selected)-3} more"
         title = f"{', '.join(names)}{more} vs Time"
 
-    # Y-axis label with units (if all same and not normalized)
     if normalize:
         ytitle = "Normalized Value"
     else:
-        units = {var_info(v)[1] for v in vars_selected if v in frame}
+        units = {var_info(v)[1] for v in vars_selected}
         units.discard(None)
         if len(units) == 1:
             ytitle = f"Value ({list(units)[0]})"
@@ -473,26 +577,13 @@ def eda_plot(vars_selected, ptype, norm_opts, packed):
         else:
             ytitle = "Value (mixed units)"
 
-    # Axes ranges: always show full time
     xmin = float(t_arr[0]) if len(t_arr) else 0.0
     xmax = float(t_arr[-1]) if len(t_arr) else 1.0
     fig.update_xaxes(range=[xmin, xmax])
-
-    if len(vars_selected) == 1 and vars_selected[0] in frame:
-        y0 = frame[vars_selected[0]]
-        ymin, ymax = float(np.min(y0)), float(np.max(y0))
-        if ymin == ymax:
-            pad = 1.0 if ymax == 0.0 else 0.05 * abs(ymax)
-            ymin -= pad; ymax += pad
-        else:
-            span = ymax - ymin
-            pad = 0.05 * span
-            ymin -= pad; ymax += pad
-        fig.update_yaxes(range=[ymin, ymax])
-    else:
-        fig.update_yaxes(autorange=True)
-
+    fig.update_yaxes(autorange=True)
     fig.update_layout(
+        template="plotly_white",
+        uirevision="eda",
         title=title,
         xaxis_title="Time (years)",
         yaxis_title=ytitle,
@@ -502,7 +593,6 @@ def eda_plot(vars_selected, ptype, norm_opts, packed):
     )
     return fig
 
-# NEW: Back button to navigate to main page
 @app.callback(
     Output("url", "pathname"),
     Input("back-btn", "n_clicks"),
@@ -513,16 +603,191 @@ def go_back(n):
         return "/"
     return no_update
 
+@app.callback(
+    [Output("job-info", "data", allow_duplicate=True),
+     Output("status-interval", "disabled", allow_duplicate=True)],
+    Input("status-interval", "n_intervals"),
+    State("job-info", "data"),
+    prevent_initial_call=True,
+)
+def poll_job_status(n_intervals, job_info):
+    if isinstance(job_info, list):
+        job_info = job_info[0] if job_info else None
+
+    if not job_info:
+        return job_info, True
+    if job_info.get("status") == "SUCCEEDED":
+        return job_info, True
+
+    try:
+        prefix = job_info["output_prefix"]; bucket = job_info["bucket"]
+        for name in ("traj.csv", "trak.csv"):
+            key = f"{prefix}{name}"
+            s3.head_object(Bucket=bucket, Key=key)
+            job_info["status"] = "SUCCEEDED"
+            print(f"[POLL] S3 ready: {key}", flush=True)
+            return job_info, True
+    except botocore.exceptions.ClientError as ce:
+        code = ce.response.get("Error", {}).get("Code")
+        if code in ("404", "NoSuchKey", "NotFound"):
+            pass
+        else:
+            print(f"[POLL] S3 head_object error: {code}: {ce}", flush=True)
+    except Exception as e:
+        print(f"[POLL] S3 check error: {e}", flush=True)
+
+    try:
+        resp = sf.describe_execution(executionArn=job_info["execution_arn"])
+        status = resp.get("status", job_info.get("status", "RUNNING"))
+        job_info["status"] = status
+        return job_info, (status in ("SUCCEEDED", "FAILED", "TIMED_OUT"))
+    except Exception as e:
+        print(f"[POLL] StepFunctions describe failed: {e}", flush=True)
+        return job_info, False
+
+@app.callback(
+    [Output("orbit-graph", "figure", allow_duplicate=True),
+     Output("simdata", "data", allow_duplicate=True)],
+    Input("job-info", "data"),
+    State("job-info", "data"),
+    prevent_initial_call=True,
+)
+def load_s3_results(job_info_trigger, job_info):
+    if isinstance(job_info, list):
+        job_info = job_info[0] if job_info else None
+
+    print(f"[LOAD DEBUG] Triggered: status={job_info.get('status') if job_info else None}")
+    if not job_info or job_info.get("status") != "SUCCEEDED":
+        return no_update, no_update
+
+    try:
+        key_csv = f"{job_info['output_prefix']}traj.csv"
+        csv_obj = s3.get_object(Bucket=job_info["bucket"], Key=key_csv)
+        df = pd.read_csv(io.StringIO(csv_obj["Body"].read().decode("utf-8")))
+        cols = list(df.columns)
+
+        a_inner_au = job_info.get("a_inner_au")
+        a_outer_au = job_info.get("a_outer_au")
+        summary = None
+        try:
+            key_sum = f"{job_info['output_prefix']}summary.json"
+            sum_obj = s3.get_object(Bucket=job_info["bucket"], Key=key_sum)
+            summary = json.loads(sum_obj["Body"].read().decode("utf-8"))
+            a_inner_au = summary.get("a_inner_au") or summary.get("hz_inner_au") or a_inner_au
+            a_outer_au = summary.get("a_outer_au") or summary.get("hz_outer_au") or a_outer_au
+        except Exception:
+            summary = None
+
+        if a_inner_au is None or a_outer_au is None:
+            Ts = job_info.get("Ts"); rs_solar = job_info.get("rs_solar")
+            if Ts is not None and rs_solar is not None:
+                i, o = hz_bounds_au(float(Ts), float(rs_solar) * rsun)
+                a_inner_au = a_inner_au or i
+                a_outer_au = a_outer_au or o
+
+        if a_inner_au is None or a_outer_au is None:
+            a_inner_au, a_outer_au = 0.75, 1.75
+        if a_inner_au > a_outer_au:
+            a_inner_au, a_outer_au = a_outer_au, a_inner_au
+
+        xyz_mp = df[["planet_x", "planet_y", "planet_z"]].values if all(c in cols for c in ["planet_x", "planet_y", "planet_z"]) else np.zeros((1000, 3))
+        xyz_ms = df[["star_x", "star_y", "star_z"]].values   if all(c in cols for c in ["star_x", "star_y", "star_z"]) else np.zeros((1000, 3))
+        xyz_mm = df[["moon_x", "moon_y", "moon_z"]].values   if all(c in cols for c in ["moon_x", "moon_y", "moon_z"]) else np.zeros((1000, 3))
+
+        vel_mp = df[["planet_vx", "planet_vy", "planet_vz"]].values if all(c in cols for c in ["planet_vx", "planet_vy", "planet_vz"]) else None
+        vel_ms = df[["star_vx", "star_vy", "star_vz"]].values   if all(c in cols for c in ["star_vx", "star_vy", "star_vz"]) else None
+        vel_mm = df[["moon_vx", "moon_vy", "moon_vz"]].values   if all(c in cols for c in ["moon_vx", "moon_vy", "moon_vz"]) else None
+
+        dt = float(np.diff(df["t_years"][:2])[0]) if "t_years" in df and len(df) >= 2 else 0.001
+        t_end = float(df["t_years"].max() if "t_years" in df else 1.0)
+
+        sim = {
+            "traj": {
+                "xyzarr_mp": xyz_mp,
+                "xyzarr_ms": xyz_ms,
+                "xyzarr_mm": xyz_mm,
+                "velarr_mp": vel_mp,
+                "velarr_ms": vel_ms,
+                "velarr_mm": vel_mm,
+            },
+            "a_inner_au": float(a_inner_au),
+            "a_outer_au": float(a_outer_au),
+            "dt": dt,
+            "t_end": t_end,
+            "state": {"rhill_AU": (summary or {}).get("rhill_AU")},
+        }
+
+        fig = build_animation(sim["traj"], sim["a_inner_au"], sim["a_outer_au"],
+                              open_in_browser=False, dt=sim["dt"], t_end=sim["t_end"])
+        packed = pack_sim(sim)
+        return fig, packed
+
+    except Exception as e:
+        print(f"[RESULTS] Failed to load {job_info.get('job_id')}: {e}", flush=True)
+        return _initial_figure(), ""
+
+@app.callback(
+    Output("status-display", "children"),
+    Input("job-info", "data"),
+    prevent_initial_call=True,
+)
+def update_status_display(job_info):
+    if isinstance(job_info, list):
+        job_info = job_info[0] if job_info else None
+    if not job_info:
+        return ""
+    status = job_info.get("status", "UNKNOWN")
+    job_id = job_info.get("job_id", "unknown")
+    if status == "SUCCEEDED":
+        return html.Div([
+            html.Span(f"✅ Job {job_id} completed! ", style={"color": "green"}),
+            html.A("View S3 outputs", href=f"https://{BUCKET}.s3.amazonaws.com/{job_info['output_prefix']}", target="_blank")
+        ])
+    elif status in ["FAILED", "TIMED_OUT"]:
+        return html.Span(f"❌ Job {job_id} {status}", style={"color": "red"})
+    else:
+        return html.Span(f"⏳ Job {job_id}: {status}", style={"color": "orange"})
+
+@app.callback(
+    Output("url", "search", allow_duplicate=True),
+    Input("url", "pathname"),
+    prevent_initial_call=False,
+)
+def clear_query_on_route(pathname):
+    # Remove ?run=1 or any other query when changing pages
+    return ""
+
+@app.callback(
+    Output("kick", "data", allow_duplicate=True),
+    Input("url", "pathname"),
+    prevent_initial_call=False,
+)
+def clear_kick_on_route(pathname):
+    if pathname == "/eda":
+        return ""
+    return no_update
+
+@app.callback(
+    Output("orbit-graph", "figure", allow_duplicate=True),
+    [Input("url", "pathname"), Input("simdata", "data")],
+    prevent_initial_call=False,   # restore immediately on return to "/"
+)
+def restore_main_figure(pathname, packed):
+    if pathname != "/":
+        return no_update
+    if not packed:
+        return no_update
+    sim = unpack_sim(packed)
+    a_in = sim.get("a_inner_au") or 0.75
+    a_out = sim.get("a_outer_au") or 1.75
+    if a_in > a_out:
+        a_in, a_out = a_out, a_in
+    fig = build_animation(sim["traj"], a_in, a_out, open_in_browser=False, dt=sim["dt"], t_end=sim["t_end"])
+    fig.update_layout(template="plotly_white", uirevision="anim")
+    return fig
 
 if __name__ == "__main__":
     host = os.getenv("HOST", "0.0.0.0")
     port = int(os.getenv("PORT", "8050"))
     debug = os.getenv("DEBUG", "1") == "1"
     app.run(host=host, port=port, debug=debug)
-
-#if __name__ == "__main__":
-#    app.run(debug=True)
-    
-    
-    #print(f"Running Dash server on port: {8080}")
-    #app.run(host="0.0.0.0", port=8080, debug=True)

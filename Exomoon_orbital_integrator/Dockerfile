@@ -19,4 +19,5 @@ RUN pip install --no-cache-dir -r requirements_docker_1.txt
 COPY ./src ./src
 
 EXPOSE 8050
-CMD ["python", "src/run_dash.py"]
+CMD ["sh", "-c", "python src/mcp_server.py & python src/run_dash.py"]
+#CMD ["python", "src/run_dash.py"]

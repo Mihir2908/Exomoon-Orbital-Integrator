@@ -105,6 +105,8 @@ def pack_sim(sim: dict) -> str:
     payload = {
         "dt": sim["dt"],
         "t_end": sim["t_end"],
+        "a_inner_au": sim.get("a_inner_au"),    # carry HZ
+        "a_outer_au": sim.get("a_outer_au"),    # carry HZ
         "xyz_mp": traj["xyzarr_mp"].tolist(),
         "xyz_ms": traj["xyzarr_ms"].tolist(),
         "xyz_mm": traj["xyzarr_mm"].tolist(),
@@ -126,4 +128,5 @@ def unpack_sim(packed: str) -> dict:
         "velarr_ms": np.array(payload["vel_ms"], dtype=float) if payload.get("vel_ms") is not None else None,
         "velarr_mm": np.array(payload["vel_mm"], dtype=float) if payload.get("vel_mm") is not None else None,
     }
-    return {"dt": payload["dt"], "t_end": payload["t_end"], "traj": traj}
+    return {"dt": payload["dt"], "t_end": payload["t_end"], "a_inner_au": payload.get("a_inner_au"),
+        "a_outer_au": payload.get("a_outer_au"), "traj": traj}

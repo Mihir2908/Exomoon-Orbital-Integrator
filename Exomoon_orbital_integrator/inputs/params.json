@@ -1,0 +1,14 @@
+{
+  "Ts": 5772,
+  "rs_solar": 1.0,
+  "ms_solar": 1.0,
+  "mp_earth": 1.5,
+  "dp_cgs": 5.5,
+  "ap_AU": 1.2,
+  "ep": 0.05,
+  "mm_earth": 0.02,
+  "am_hill": 0.30,
+  "em": 0.01,
+  "moon_retrograde": false,
+  "years": 3.0
+}

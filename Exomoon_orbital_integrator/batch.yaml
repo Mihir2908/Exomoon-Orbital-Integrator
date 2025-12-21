@@ -1,0 +1,21 @@
+services:
+  server:
+    build: .
+    image: exomoon:batch
+    ports:
+      - "8050:8050"
+    environment:
+      #- HOST=0.0.0.0
+      #- PORT=8050
+      - DEBUG=1
+      - INPUT_S3=s3://nbody-time-series-storage/Exomoon_orbital_integrator/inputs/job_id_30_11_2025
+      - OUTPUT_S3=s3://nbody-time-series-storage/Exomoon_orbital_integrator/outputs/job_id_30_11_2025
+      - AWS_REGION=eu-west-2
+      - AWS_PROFILE=default
+      
+      - AWS_SHARED_CREDENTIALS_FILE=/root/.aws/credentials
+    
+    volumes:
+      - C:\Users\mihir\.aws\credentials:/root/.aws/credentials:ro
+    
+    command: ["python","src/run_job.py"]

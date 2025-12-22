@@ -1,3 +1,9 @@
+# ------ Overview ------
+
+# This module is executed inside the AWS job container (e.g., by Step Functions / App Runner task). 
+# It reads the parameters JSON from S3, runs the simulation, prepares outputs, uploads them to S3, 
+# and prints presigned URLs to logs for convenience.
+
 import os, json, pathlib
 import boto3
 
@@ -6,6 +12,8 @@ from exomoon.simulation import run_simulation, run_simulation_for_years
 from exomoon.eda import traj_to_frame, to_csv_bytes
 from exomoon.plotting.anim import build_animation
 
+# Reads params.json and builds a SystemParams dataclass.
+# Extracts years to decide local orbit vs. multi-year simulation.
 def _load_params(path: str) -> tuple[SystemParams, float]:
     with open(path, "r") as f:
         d = json.load(f)
@@ -25,12 +33,26 @@ def _load_params(path: str) -> tuple[SystemParams, float]:
     years = float(d.get("years", 0.0))
     return p, years
 
+# split_s3(uri) -> (bucket, key_prefix):
+# Splits s3://bucket/key/prefix URIs into components. 
+# Used for both input and output prefixes.
 def _split_s3(uri: str) -> tuple[str, str]:
     assert uri.startswith("s3://"), f"bad S3 URI: {uri}"
     rest = uri[5:]
     bucket, key = (rest.split("/", 1) + [""])[:2]
     return bucket, key
 
+
+# 1. Reads INPUTS_S3 and OUTPUT_S3 from env (set by the Step Functions job runner).
+# 2. Downloads params.json from input prefix to a local /work directory.
+# 3. Loads parameters via _load_params; chooses run_simulation_for_years if years > 0 
+# or run_simulation otherwise.
+# 4. Builds trajectory frame via traj_to_frame and writes traj.csv locally.
+# 5. Writes summary.json with timing and basic stats (t_end, dt, rhill_AU, n_steps, years_requested).
+# 6. Builds the animation figure with build_animation and writes animation.html.
+# 7. Uploads traj.csv, summary.json, and animation.html to S3 under the output prefix.
+# 8. Generates presigned URLs for each uploaded artifact (valid for 24h), prints them, 
+# and writes links.json, also uploaded to S3.
 def main():
     in_prefix = os.environ["INPUT_S3"].rstrip("/")
     out_prefix = os.environ["OUTPUT_S3"].rstrip("/")

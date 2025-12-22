@@ -1,3 +1,9 @@
+# ------ Overview ------
+
+# run_dash.py hosts the Dash web UI. It renders controls, 
+# launches simulations either locally or via AWS Step Functions, 
+# persists results in Dash Stores, and draws animations and EDA plots.
+
 from datetime import datetime
 import os, sys, uuid, json, re, io
 import urllib.parse as _url
@@ -49,7 +55,7 @@ app = Dash(__name__, suppress_callback_exceptions=True,
     title="Exomoon Orbital Integrator (Interactive)"
 )
 
-# Allow duplicate outputs to fire on initial render safely
+# Allow duplicate outputs/callbacks to fire on initial render safely
 app.config["prevent_initial_callbacks"] = "initial_duplicate"
 
 _defaults = SystemParams()
@@ -118,6 +124,8 @@ controls = html.Div([
     dcc.Link("Open EDA Plots →", href="/eda", style={"marginTop": "8px", "textDecoration": "none", "color": "#0074D9"}),
 ], style={"display": "flex", "flexDirection": "column", "gap": "10px"})
 
+
+# A placeholder figure shown before any run. Used to keep the graph non-empty.
 def _initial_figure():
     fig = go.Figure()
     fig.update_layout(
@@ -134,6 +142,8 @@ def _initial_figure():
     )
     return fig
 
+
+# Wraps the orbit-graph figure in a Loading indicator.
 def _main_page():
     return html.Div([
         dcc.Loading(
@@ -148,6 +158,9 @@ def _main_page():
         )
     ])
 
+
+# Two-column view (controls + plot) designed to be stable in hosted environments (flex-based). 
+# EDA plots render from simdata without requiring an active animation.
 def _eda_page():
     return html.Div([
         html.H3("Simulation EDA"),
@@ -184,8 +197,8 @@ def _eda_page():
 
 app.layout = html.Div([
     dcc.Location(id="url", refresh=False),
-    dcc.Store(id="kick", data=""),
-    dcc.Store(id="simdata", data=""),
+    dcc.Store(id="kick", data=""), # control to trigger autoruns (="run") or navigation cleanup ("")    
+    dcc.Store(id="simdata", data=""), # packed simulation data (arrays + timestep (dt) + simulation time (t_end), Habitable Zone)
     dcc.Store(id="job-info", data=None),
     dcc.Interval(id="status-interval", interval=5000, n_intervals=0, disabled=True),
     dcc.Download(id="download-csv"),
@@ -194,6 +207,8 @@ app.layout = html.Div([
     html.Div(id="page-content", children=_main_page(), style={"flex": "1", "padding": "12px"})
 ], style={"display": "flex", "height": "100vh", "fontFamily": "Segoe UI, Arial"})
 
+
+# Returns the appropriate page (main vs. EDA) based on dcc.Location pathname.
 @app.callback(
     Output("page-content", "children"),
     Input("url", "pathname")
@@ -203,12 +218,14 @@ def route(pathname):
         return _eda_page()
     return _main_page()
 
+# Safe numeric coercion for parameter inputs.
 def _fnum(v, default):
     try:
         return default if v is None or (isinstance(v, str) and v.strip() == "") else float(v)
     except Exception:
         return default
 
+# Parses a float from a query string or text inputs. Returns the current value if parsing fails.
 def _parse_floatish(val, cur):
     if val is None:
         return cur
@@ -223,6 +240,9 @@ def _parse_floatish(val, cur):
                 return cur
     return cur
 
+
+# Queries the NASA Exoplanet Archive upon from Dash UI search input (textbox)   
+# and returns a ranked list of matching planet names from the dropdown.
 @app.callback(
     Output("pl_picker", "options"),
     Input("pl_picker", "search_value"),
@@ -246,6 +266,13 @@ def planet_typeahead(search_value, current_value):
         return [{"label": n, "value": n} for n in ordered[:25]]
     except Exception:
         return [{"label": current_value, "value": current_value}] if current_value else []
+
+
+# 1. Reads the URL query (?pl=..., numeric params, moon_dir, years, run=1) based on 
+# system selected from the dropdown name options.
+# 2. Fetches planet system data from the archive and fills controls.
+# 3. Sets kick="run" only when run=1 is in the query AND no simdata exists yet (prevents unintended re-runs later).
+# 4. Returns a tuple to populate all control values and kick.
 
 @app.callback(
     [
@@ -368,6 +395,24 @@ def populate_from_url_or_nasa(url_search, n_clicks, pl_value, mm_val, ah_val, em
             status = f"Error fetching '{picked}': {e}"
     return (status, pl_value, Ts, rs, ms, mp, ap, ep, dp, mm, ah, em, moon_dir, sim_years, kick)
 
+# Launches a simulation either locally or via AWS Step Functions based on the Run button click or kick="run".
+
+# Guards: Uses ctx.triggered_id to ignore navigation/cleanup changes to kick and to 
+# ignore run-button remounts with n_clicks=0. 
+# Only proceeds on an actual Run click or explicit autorun.
+
+# ------- AWS Path (AWS_ENABLED = 1) ------ 
+# 1. Writes params.json to S3 under inputs/job_id prefix.
+# 2. Starts Step Functions execution with input/output S3 prefixes.
+# 3. Computes HZ bounds and stores them in job-info.
+# 4. Returns a placeholder figure, clears kick, enables the status poller, 
+# and clears the URL query so navigation won’t re-trigger jobs.
+
+# ------- Local Path (AWS_ENABLED = 0) ------
+# Runs either run_simulation_for_years or run_simulation, 
+# builds the animation figure, annotates with Hill radius and moon semi-major axis, 
+# packs sim into simdata, and returns the figure with simdata set, poller disabled.
+
 @app.callback(
     [Output("orbit-graph", "figure", allow_duplicate=True),
      Output("simdata", "data"),
@@ -483,6 +528,7 @@ def run_cb(n_clicks, kick, Ts, rs_solar, ms_solar, mp_earth, dp_cgs, ap_AU, ep,
     packed = pack_sim(sim)
     return fig, packed, None, "", True, ""
 
+# Unpacks packed simdata string and converts the trajectory dataframe to CSV, returning a Dash download.
 @app.callback(
     Output("download-csv", "data"),
     Input("export-btn", "n_clicks"),
@@ -497,6 +543,8 @@ def export_csv(n_clicks, packed):
     csv_bytes = to_csv_bytes(frame)
     return dcc.send_bytes(csv_bytes, "exomoon_simulation.csv")
 
+
+# Extracts variables from unpacked simdata and populates the EDA variables dropdown.
 @app.callback(
     [Output("eda-vars", "options"), Output("eda-status", "children")],
     Input("simdata", "data"),
@@ -511,6 +559,8 @@ def load_variables(packed):
     opts = [{"label": c, "value": c} for c in cols if c != "t_years"]
     return opts, f"Loaded {len(cols)-1} variables."
 
+
+# Auto-selects sensible default variables once options are ready.
 @app.callback(
     Output("eda-vars", "value"),
     Input("eda-vars", "options"),
@@ -526,6 +576,8 @@ def pick_default_eda_vars(options, packed):
         defaults = present[:3]
     return defaults
 
+
+# Generates the time series plot for selected variables. 
 @app.callback(
     Output("eda-graph", "figure"),
     [Input("eda-vars", "value"), Input("eda-plot-type", "value"), Input("eda-normalize", "value")],
@@ -542,7 +594,7 @@ def eda_plot(vars_selected, ptype, norm_opts, packed):
     t_arr = t.to_numpy() if hasattr(t, "to_numpy") else np.asarray(t)
 
     vars_selected = vars_selected or []
-    normalize = "norm" in (norm_opts or [])
+    normalize = "norm" in (norm_opts or [])  # Normalization divides by max magnitude.
 
     fig = go.Figure()
     for v in vars_selected:
@@ -581,6 +633,9 @@ def eda_plot(vars_selected, ptype, norm_opts, packed):
     xmax = float(t_arr[-1]) if len(t_arr) else 1.0
     fig.update_xaxes(range=[xmin, xmax])
     fig.update_yaxes(autorange=True)
+
+    # Uses plotly_white and uirevision="eda" to keep interactions and 
+    # avoid background artifacts.
     fig.update_layout(
         template="plotly_white",
         uirevision="eda",
@@ -593,6 +648,7 @@ def eda_plot(vars_selected, ptype, norm_opts, packed):
     )
     return fig
 
+# Sets pathname to “/” when the “Back to Simulation” button is clicked.
 @app.callback(
     Output("url", "pathname"),
     Input("back-btn", "n_clicks"),
@@ -603,6 +659,9 @@ def go_back(n):
         return "/"
     return no_update
 
+# Stops when job-info is missing or already SUCCEEDED.
+# Checks S3 for output files (traj.csv or trak.csv). If found, marks SUCCEEDED.
+# Otherwise calls StepFunctions describe_execution; disables poller when terminal status reached.
 @app.callback(
     [Output("job-info", "data", allow_duplicate=True),
      Output("status-interval", "disabled", allow_duplicate=True)],
@@ -645,6 +704,10 @@ def poll_job_status(n_intervals, job_info):
         print(f"[POLL] StepFunctions describe failed: {e}", flush=True)
         return job_info, False
 
+# When job succeeds, reads traj.csv and summary.json from S3.
+# Computes/falls back HZ bounds if missing.
+# Rebuilds the animation figure and packs simdata (Note: Currently, does not retrieve animations.html from backend S3). 
+# Enables main page to render the animation without re-running locally.
 @app.callback(
     [Output("orbit-graph", "figure", allow_duplicate=True),
      Output("simdata", "data", allow_duplicate=True)],
@@ -726,6 +789,8 @@ def load_s3_results(job_info_trigger, job_info):
         print(f"[RESULTS] Failed to load {job_info.get('job_id')}: {e}", flush=True)
         return _initial_figure(), ""
 
+
+# Renders a small status banner with a link to the S3 output prefix when SUCCEEDED.
 @app.callback(
     Output("status-display", "children"),
     Input("job-info", "data"),
@@ -748,6 +813,7 @@ def update_status_display(job_info):
     else:
         return html.Span(f"⏳ Job {job_id}: {status}", style={"color": "orange"})
 
+# Clears the URL query string on any navigation so run=1 doesn’t persist.
 @app.callback(
     Output("url", "search", allow_duplicate=True),
     Input("url", "pathname"),
@@ -757,6 +823,8 @@ def clear_query_on_route(pathname):
     # Remove ?run=1 or any other query when changing pages
     return ""
 
+# Clears the kick store on navigation to the EDA page to avoid unintended re-runs
+# due to stale kicks on route changes.
 @app.callback(
     Output("kick", "data", allow_duplicate=True),
     Input("url", "pathname"),
@@ -767,6 +835,8 @@ def clear_kick_on_route(pathname):
         return ""
     return no_update
 
+# When navigating back to “/”, rebuilds the orbit-graph from simdata to restore main figure. 
+# Uses plotly_white and uirevision="anim" to stabilize visuals and preserve interactions (zoom state etc.).
 @app.callback(
     Output("orbit-graph", "figure", allow_duplicate=True),
     [Input("url", "pathname"), Input("simdata", "data")],
@@ -791,3 +861,10 @@ if __name__ == "__main__":
     port = int(os.getenv("PORT", "8050"))
     debug = os.getenv("DEBUG", "1") == "1"
     app.run(host=host, port=port, debug=debug)
+
+#if __name__ == "__main__":
+#    app.run(debug=True)
+    
+    
+    #print(f"Running Dash server on port: {8080}")
+    #app.run(host="0.0.0.0", port=8080, debug=True)

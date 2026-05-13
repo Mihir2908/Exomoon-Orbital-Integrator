@@ -9,7 +9,7 @@ import boto3
 
 from exomoon.params import SystemParams
 from exomoon.simulation import run_simulation, run_simulation_for_years
-from exomoon.eda import traj_to_frame, to_csv_bytes
+from exomoon.eda import traj_to_frame, to_csv_bytes, pack_sim
 from exomoon.plotting.anim import build_animation
 
 # Reads params.json and builds a SystemParams dataclass.
@@ -92,9 +92,21 @@ def main():
     local_html = str(workdir / "animation.html")
     fig.write_html(local_html, include_plotlyjs="cdn")
 
+    # NEW: Capture and store simdata (packed simulation) for agent service
+    simdata = pack_sim(sim)
+    local_simdata = str(workdir / "traj.pkl")
+    with open(local_simdata, "w") as f:
+        f.write(simdata)
+    print(f"[SIMDATA] Captured simdata: {len(simdata)} chars", flush=True)
+
     s3.upload_file(local_csv, out_bucket, f"{out_key_prefix}/traj.csv")
     s3.upload_file(local_summary, out_bucket, f"{out_key_prefix}/summary.json")
     s3.upload_file(local_html, out_bucket, f"{out_key_prefix}/animation.html")
+    
+    # NEW: Upload simdata and completion marker so agent service can retrieve results
+    s3.upload_file(local_simdata, out_bucket, f"{out_key_prefix}/traj.pkl")
+    s3.put_object(Bucket=out_bucket, Key=f"{out_key_prefix}/COMPLETE", Body=b"")
+    print(f"[COMPLETE] Job complete marker uploaded to s3://{out_bucket}/{out_key_prefix}/COMPLETE", flush=True)
 
     # Create presigned URLs (expire in 24h)
     urls = {}

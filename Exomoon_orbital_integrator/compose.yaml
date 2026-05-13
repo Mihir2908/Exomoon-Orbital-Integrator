@@ -1,16 +1,44 @@
 services:
-  server:
-    build: .
+  agent:
+    build:
+      context: .
+      dockerfile: agent.Dockerfile
+    image: exomoon-agent:latest
+    ports:
+      - "8000:8000"
+    environment:
+      - PYTHONPATH=/app/src
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - ANTHROPIC_MODEL=claude-sonnet-4-20250514
+      - AWS_ENABLED=1
+      - AWS_REGION=eu-west-2
+      - EXOMOON_BUCKET=${EXOMOON_BUCKET}
+      - STATE_MACHINE_ARN=${STATE_MACHINE_ARN}
+      - AWS_SHARED_CREDENTIALS_FILE=/root/.aws/credentials
+    volumes:
+      - ~/.aws/credentials:/root/.aws/credentials:ro
+
+  dash:
+    build:
+      context: .
+      dockerfile: Dockerfile.dash
     image: dash-mcp:UI
     ports:
       - "8050:8050"
     environment:
+      - PYTHONPATH=/app/src
       - HOST=0.0.0.0
       - PORT=8050
       - DEBUG=1
+      - AGENT_SERVICE_URL=http://agent:8000
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - ANTHROPIC_MODEL=claude-sonnet-4-20250514
+      - AWS_ENABLED=1
+      - AWS_REGION=eu-west-2
+      - EXOMOON_BUCKET=${EXOMOON_BUCKET}
+      - STATE_MACHINE_ARN=${STATE_MACHINE_ARN}
       - AWS_SHARED_CREDENTIALS_FILE=/root/.aws/credentials
-
     volumes:
-      - C:\Users\mihir\.aws\credentials:/root/.aws/credentials:ro  
-
-    command: ["python","src/run_dash.py"]
+      - ~/.aws/credentials:/root/.aws/credentials:ro
+    depends_on:
+      - agent

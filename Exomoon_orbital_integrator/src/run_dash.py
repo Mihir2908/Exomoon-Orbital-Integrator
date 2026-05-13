@@ -12,6 +12,7 @@ import pandas as pd
 import boto3
 import botocore
 import plotly.graph_objects as go
+import requests  # NEW: for agent service calls
 from dash import Dash, dcc, html, Input, Output, State, ctx, no_update
 
 from exomoon.habitable_zone import hz_bounds_au
@@ -27,7 +28,11 @@ BUCKET = os.getenv("EXOMOON_BUCKET")
 STATE_MACHINE_ARN = os.getenv("STATE_MACHINE_ARN")
 AWS_REGION = os.getenv("AWS_REGION", "eu-west-2")
 
+# NEW: Agent service URL (internal or external endpoint)
+AGENT_SERVICE_URL = os.getenv("AGENT_SERVICE_URL", "http://exomoon-agent-nlb-451ecd523536521c.elb.eu-west-2.amazonaws.com:8000") # http://127.0.0.1:8000 for local testing, currently replaced by actual URL for AWS 
+
 print(f"[ENV] AWS_ENABLED={AWS_ENABLED}, BUCKET={BUCKET}, REGION={AWS_REGION}", flush=True)
+print(f"[ENV] AGENT_SERVICE_URL={AGENT_SERVICE_URL}", flush=True)
 
 if AWS_ENABLED and BUCKET and STATE_MACHINE_ARN:
     s3 = boto3.client('s3', region_name=AWS_REGION)
@@ -125,6 +130,133 @@ controls = html.Div([
 ], style={"display": "flex", "flexDirection": "column", "gap": "10px"})
 
 
+# NEW: Chat drawer HTML component (Item 6)
+def _chat_drawer():
+    """
+    Right-side collapsible chat drawer for agent service.
+    Contains: toggle button, message history, input field, send button.
+    Uses CSS transition for smooth slide-in/out animation.
+    """
+    return html.Div([
+        # Toggle button (fixed to right edge)
+        html.Button(
+            "💬",
+            id="chat-toggle-btn",
+            style={
+                "position": "fixed",
+                "right": "12px",
+                "bottom": "20px",
+                "width": "50px",
+                "height": "50px",
+                "borderRadius": "50%",
+                "fontSize": "24px",
+                "border": "none",
+                "backgroundColor": "#0074D9",
+                "color": "white",
+                "cursor": "pointer",
+                "zIndex": "999",
+                "boxShadow": "0 2px 8px rgba(0,0,0,0.15)",
+            }
+        ),
+        # Drawer panel (slides in from right)
+        html.Div(
+            id="chat-drawer",
+            children=[
+                html.Div([
+                    html.H4("Exomoon Agent", style={"margin": "0 0 12px 0", "color": "#333"}),
+                    html.Button(
+                        "✕",
+                        id="chat-close-btn",
+                        style={
+                            "position": "absolute",
+                            "top": "12px",
+                            "right": "12px",
+                            "background": "none",
+                            "border": "none",
+                            "fontSize": "20px",
+                            "cursor": "pointer",
+                            "color": "#999",
+                        }
+                    ),
+                ], style={"position": "relative", "marginBottom": "12px", "borderBottom": "1px solid #ddd", "paddingBottom": "12px"}),
+                
+                # Message history
+                html.Div(
+                    id="chat-messages",
+                    children=[
+                        html.Div(
+                            "Ask me about moon stability, exoplanets, or simulations.",
+                            style={
+                                "padding": "8px",
+                                "backgroundColor": "#f0f0f0",
+                                "borderRadius": "6px",
+                                "fontSize": "12px",
+                                "color": "#666",
+                                "marginBottom": "8px",
+                            }
+                        )
+                    ],
+                    style={
+                        "flex": "1",
+                        "overflowY": "auto",
+                        "marginBottom": "12px",
+                        "paddingRight": "4px",
+                        "maxHeight": "400px",
+                    }
+                ),
+                
+                # Input + send
+                html.Div([
+                    dcc.Input(
+                        id="chat-input",
+                        type="text",
+                        placeholder="Ask a question...",
+                        style={
+                            "flex": "1",
+                            "padding": "8px",
+                            "borderRadius": "4px",
+                            "border": "1px solid #ddd",
+                            "fontSize": "12px",
+                        }
+                    ),
+                    html.Button(
+                        "Send",
+                        id="chat-send-btn",
+                        n_clicks=0,
+                        style={
+                            "padding": "8px 12px",
+                            "marginLeft": "6px",
+                            "backgroundColor": "#0074D9",
+                            "color": "white",
+                            "border": "none",
+                            "borderRadius": "4px",
+                            "cursor": "pointer",
+                            "fontSize": "12px",
+                        }
+                    ),
+                ], style={"display": "flex", "gap": "6px"}),
+            ],
+            style={
+                "position": "fixed",
+                "right": "-380px",  # Hidden initially
+                "top": "0",
+                "width": "380px",
+                "height": "100vh",
+                "backgroundColor": "white",
+                "borderLeft": "1px solid #ddd",
+                "boxShadow": "-2px 0 8px rgba(0,0,0,0.1)",
+                "display": "flex",
+                "flexDirection": "column",
+                "padding": "12px",
+                "zIndex": "1000",
+                "transition": "right 0.3s ease-in-out",
+            }
+        ),
+        # Hidden store for chat history (client-side state)
+        dcc.Store(id="chat-history", data=[]),
+    ])
+
+
 # A placeholder figure shown before any run. Used to keep the graph non-empty.
 def _initial_figure():
     fig = go.Figure()
@@ -143,7 +275,7 @@ def _initial_figure():
     return fig
 
 
-# Wraps the orbit-graph figure in a Loading indicator.
+# Wraps the orbit-graph figure in a Loading indicator + chat drawer (UPDATED for Item 6).
 def _main_page():
     return html.Div([
         dcc.Loading(
@@ -155,7 +287,8 @@ def _main_page():
                 style={"height": "90vh"},
                 config={"scrollZoom": True, "displayModeBar": True, "responsive": True}
             )
-        )
+        ),
+        _chat_drawer()  # NEW: Add chat drawer
     ])
 
 
@@ -200,7 +333,9 @@ app.layout = html.Div([
     dcc.Store(id="kick", data=""), # control to trigger autoruns (="run") or navigation cleanup ("")    
     dcc.Store(id="simdata", data=""), # packed simulation data (arrays + timestep (dt) + simulation time (t_end), Habitable Zone)
     dcc.Store(id="job-info", data=None),
+    dcc.Store(id="chat-job-id", data=None),  # Tracks current agent job ID for polling
     dcc.Interval(id="status-interval", interval=5000, n_intervals=0, disabled=True),
+    dcc.Interval(id="chat-job-poller", interval=5000, n_intervals=0, disabled=True),  # Poll agent /job/{job_id}/status
     dcc.Download(id="download-csv"),
     html.Div(controls, style={"width": "380px", "padding": "12px", "borderRight": "1px solid #ddd"}),
     html.Div(id="status-display", style={"marginTop": "8px"}),
@@ -240,6 +375,456 @@ def _parse_floatish(val, cur):
                 return cur
     return cur
 
+
+# NEW: Toggle chat drawer visibility (Item 6)
+@app.callback(
+    Output("chat-drawer", "style"),
+    [Input("chat-toggle-btn", "n_clicks"), Input("chat-close-btn", "n_clicks")],
+    State("chat-drawer", "style"),
+    prevent_initial_call=False,
+)
+def toggle_chat_drawer(toggle_clicks, close_clicks, current_style):
+    """
+    Toggle drawer: open if closed, close if open.
+    Uses CSS transition for smooth slide-in/out animation.
+    """
+    trigger = getattr(ctx, "triggered_id", None)
+    if not current_style:
+        current_style = {}
+    
+    # Parse current right position
+    right = current_style.get("right", "-380px")
+    try:
+        right_val = float(str(right).replace("px", ""))
+    except Exception:
+        right_val = -380
+    
+    is_open = right_val >= 0
+    
+    if trigger in ("chat-toggle-btn", "chat-close-btn"):
+        # Toggle: if open, close; if closed, open
+        new_right = "-380px" if is_open else "0px"
+        current_style["right"] = new_right
+    
+    return current_style
+
+
+# NEW: SSE streaming callback for real-time chat responses (Item 7)
+@app.callback(
+    [Output("chat-messages", "children"), Output("chat-input", "value"), Output("chat-history", "data")],
+    Input("chat-send-btn", "n_clicks"),
+    [State("chat-input", "value"), State("simdata", "data"), State("chat-history", "data"),
+     State("Ts", "value"), State("rs_solar", "value"), State("ms_solar", "value"),
+     State("mp_earth", "value"), State("dp_cgs", "value"), State("ap_AU", "value"),
+     State("ep", "value"), State("mm_earth", "value"), State("am_hill", "value"),
+     State("em", "value"), State("moon_dir", "value"), State("sim_years", "value")],
+    prevent_initial_call=True,
+)
+def send_chat_message(n_clicks, user_input, packed, chat_hist,
+                      Ts, rs_solar, ms_solar, mp_earth, dp_cgs, ap_AU, ep,
+                      mm_earth, am_hill, em, moon_dir, sim_years):
+    """
+    Send user message to agent service via SSE streaming (Item 7).
+    Opens persistent connection to /chat/stream, parses events incrementally.
+    Renders tokens in real-time as they arrive.
+    """
+    if not user_input or not user_input.strip():
+        return no_update, "", no_update
+    
+    # Build current params dict
+    d = SystemParams()
+    params = {
+        "Ts": _fnum(Ts, d.Ts),
+        "rs_solar": _fnum(rs_solar, d.rs_solar),
+        "ms_solar": _fnum(ms_solar, d.ms_solar),
+        "mp_earth": _fnum(mp_earth, d.mp_earth),
+        "dp_cgs": _fnum(dp_cgs, d.dp_cgs),
+        "ap_AU": _fnum(ap_AU, d.ap_AU),
+        "ep": _fnum(ep, d.ep),
+        "mm_earth": _fnum(mm_earth, d.mm_earth),
+        "am_hill": _fnum(am_hill, d.am_hill),
+        "em": _fnum(em, d.em),
+        "moon_retrograde": (moon_dir == "retro"),
+    }
+    
+    years = _fnum(sim_years, 0.0)
+    
+    # Initialize chat history if needed
+    if not chat_hist:
+        chat_hist = []
+    
+    # Add user message to history
+    chat_hist.append({"role": "user", "message": user_input})
+    
+    # Build the SSE request to agent service
+    agent_payload = {
+        "message": user_input,
+        "simdata": packed if packed else None,
+        "params": params,
+        "years": years if years > 0 else None,
+        "escape_factor": 1.0,
+    }
+    
+    agent_message = ""
+    job_id = None
+    mode = "error"
+    
+    try:
+        # Open SSE stream to /chat/stream endpoint
+        response = requests.post(
+            f"{AGENT_SERVICE_URL}/chat/stream",
+            json=agent_payload,
+            timeout=60,
+            stream=True,  # Enable streaming
+        )
+        response.raise_for_status()
+        
+        print(f"[CHAT] SSE stream opened, status={response.status_code}", flush=True)
+        
+        agent_simdata = None  # NEW: Extract simdata from agent response
+        
+        # Parse SSE events line-by-line
+        for line in response.iter_lines():
+            if not line:
+                continue
+            
+            line_str = line.decode('utf-8') if isinstance(line, bytes) else line
+            line_str = line_str.strip()
+            
+            # SSE format: "data: {json}"
+            if line_str.startswith("data:"):
+                data_str = line_str[5:].strip()
+                try:
+                    event = json.loads(data_str)
+                    event_type = event.get("type")
+                    payload = event.get("payload", {})
+                    
+                    if event_type == "meta":
+                        # Metadata: mode, job_id, etc.
+                        mode = payload.get("mode", "unknown")
+                        job_id = payload.get("job_id")
+                        print(f"[CHAT] Meta: mode={mode}, job_id={job_id}", flush=True)
+                    
+                    elif event_type == "token":
+                        # Token: append to message (with space)
+                        token = payload.get("token") or payload if isinstance(payload, dict) else payload
+                        agent_message += str(token)
+                    
+                    elif event_type == "done":
+                        # Final payload: contains full result dict
+                        print(f"[CHAT] Stream done, final payload keys: {payload.keys() if isinstance(payload, dict) else 'N/A'}", flush=True)
+                        # Extract job_id from final payload if not already set
+                        if not job_id:
+                            job_id = payload.get("job_id")
+                        # NEW: Extract simdata from agent response
+                        if isinstance(payload, dict) and "simdata" in payload:
+                            agent_simdata = payload.get("simdata")
+                            print(f"[CHAT] Extracted simdata from agent response ({len(agent_simdata)} chars)", flush=True)
+                        break
+                
+                except json.JSONDecodeError as je:
+                    print(f"[CHAT] JSON parse error on line: {data_str[:100]}", flush=True)
+                    continue
+        
+        print(f"[CHAT] Streaming complete. Message length={len(agent_message)}, has simdata={bool(agent_simdata)}", flush=True)
+        
+    except requests.exceptions.Timeout:
+        agent_message = f"⏱️ Agent request timed out (>60s). Please try again."
+        mode = "error"
+    except requests.exceptions.RequestException as e:
+        agent_message = f"⚠️ Agent error: {str(e)[:100]}"
+        mode = "error"
+    except Exception as e:
+        print(f"[CHAT] Unexpected error: {str(e)}", flush=True)
+        agent_message = f"❌ Error: {str(e)[:100]}"
+        mode = "error"
+    
+    # If message is empty (e.g., connection failed), show error
+    if not agent_message.strip():
+        agent_message = "No response from agent. Check connection and try again."
+    
+    # Format agent response with job ID if applicable
+    if job_id:
+        agent_message = f"📊 {agent_message}\n(Job ID: `{job_id}`)"
+    
+    # Add agent message to history (with job_id metadata if present)
+    agent_msg_entry = {"role": "agent", "message": agent_message}
+    if job_id:
+        agent_msg_entry["job_id"] = job_id  # Store for easy retrieval
+    chat_hist.append(agent_msg_entry)
+    
+    # NEW: Update packed simdata if agent returned new simdata
+    if agent_simdata:
+        packed = agent_simdata
+        print(f"[CHAT] Updated packed simdata from agent response", flush=True)
+    
+    # Render chat history as message bubbles
+    message_elements = []
+    for msg in chat_hist:
+        if msg["role"] == "user":
+            message_elements.append(
+                html.Div(
+                    msg["message"],
+                    style={
+                        "padding": "8px 12px",
+                        "backgroundColor": "#0074D9",
+                        "color": "white",
+                        "borderRadius": "8px",
+                        "marginBottom": "8px",
+                        "marginLeft": "40px",
+                        "marginRight": "0",
+                        "wordWrap": "break-word",
+                        "fontSize": "12px",
+                    }
+                )
+            )
+        else:  # agent
+            message_elements.append(
+                html.Div(
+                    msg["message"],
+                    style={
+                        "padding": "8px 12px",
+                        "backgroundColor": "#f0f0f0",
+                        "color": "#333",
+                        "borderRadius": "8px",
+                        "marginBottom": "8px",
+                        "marginRight": "40px",
+                        "marginLeft": "0",
+                        "wordWrap": "break-word",
+                        "fontSize": "12px",
+                        "whiteSpace": "pre-wrap",
+                    }
+                )
+            )
+    
+    return message_elements, "", chat_hist
+
+# NEW: Allow Enter key to send message (Item 6)
+@app.callback(
+    Output("chat-send-btn", "n_clicks", allow_duplicate=True),
+    Input("chat-input", "n_submit"),
+    State("chat-send-btn", "n_clicks"),
+    prevent_initial_call=True,
+)
+def handle_enter_key(n_submit, n_clicks):
+    """Increment send button clicks when user presses Enter in chat input."""
+    if n_submit:
+        return (n_clicks or 0) + 1
+    return no_update
+
+# Item 8: Chat job status polling (tracks agent-started Step Functions jobs)
+# ============================================================================
+
+# NEW: Extract job_id from agent response and enable polling (Item 8)
+@app.callback(
+    Output("chat-job-id", "data"),
+    Input("chat-messages", "children"),
+    State("chat-history", "data"),
+    prevent_initial_call=True,
+)
+def track_chat_job_id(messages, chat_hist):
+    """
+    Extract job_id from latest agent message in chat history.
+    If found, store it for polling. Otherwise, clear it.
+    """
+    if not chat_hist or len(chat_hist) == 0:
+        return None
+    
+    # Get last agent message
+    last_agent = None
+    for msg in reversed(chat_hist):
+        if msg.get("role") == "agent":
+            last_agent = msg
+            break
+    
+    if not last_agent:
+        return None
+    
+    # Check if job_id is stored as metadata (better approach)
+    if "job_id" in last_agent:
+        return last_agent["job_id"]
+
+    # Extract job_id from message text (format: "Job ID: `agent-abc123`")
+    msg_text = last_agent.get("message", "")
+    import re as _re
+    match = _re.search(r"Job ID:\s*`([^`]+)`", msg_text)
+    
+    if match:
+        job_id = match.group(1)
+        print(f"[CHAT] Found job_id: {job_id}, enabling polling", flush=True)
+        return job_id
+    
+    return None
+
+
+# NEW: Enable/disable job poller based on job_id (Item 8)
+@app.callback(
+    Output("chat-job-poller", "disabled"),
+    Input("chat-job-id", "data"),
+    prevent_initial_call=False,
+)
+def toggle_job_poller(job_id):
+    """
+    Enable poller if job_id exists, disable otherwise.
+    """
+    return job_id is None
+
+
+# NEW: Poll agent job status every 5s (Item 8)
+@app.callback(
+    Output("chat-messages", "children", allow_duplicate=True),
+    Input("chat-job-poller", "n_intervals"),
+    [State("chat-job-id", "data"), State("chat-history", "data"), State("chat-messages", "children")],
+    prevent_initial_call=True,
+)
+def poll_agent_job_status(n_intervals, job_id, chat_hist, current_messages):
+    """
+    Poll agent /job/{job_id}/status endpoint.
+    Update last message with job status (⏳ Running → ✅ Complete → 📥 Results ready).
+    """
+    if not job_id:
+        return no_update
+    
+    if n_intervals == 0:
+        return no_update
+    
+    try:
+        # Call agent job status endpoint
+        status_url = f"{AGENT_SERVICE_URL}/job/{job_id}/status"
+        response = requests.get(status_url, timeout=10)
+        response.raise_for_status()
+        result = response.json()
+        
+        status = result.get("status", "UNKNOWN")
+        print(f"[CHAT-POLL] Job {job_id} status: {status}", flush=True)
+        
+        # Build status message based on result
+        if status == "SUCCEEDED":
+            status_msg = "✅ Job complete! Retrieving results..."
+            # Extract presigned URLs if available
+            urls = result.get("urls", {})
+            if urls:
+                links = "\n".join([f"  📊 {name}: {url}" for name, url in urls.items()])
+                status_msg += f"\n\n**Output files:**\n{links}"
+            
+            # NEW: Call agent to retrieve and cache simdata
+            try:
+                retrieve_url = f"{AGENT_SERVICE_URL}/job/{job_id}/retrieve_simdata"
+                retrieve_resp = requests.get(retrieve_url, timeout=30)
+                retrieve_resp.raise_for_status()
+                retrieve_result = retrieve_resp.json()
+                if retrieve_result.get("simdata_cached"):
+                    print(f"[CHAT-POLL] Simdata cached for {job_id}", flush=True)
+                    status_msg = "✅ Job complete! Results ready for querying.\n\n**Output files:**\n" + links if links else status_msg
+                else:
+                    print(f"[CHAT-POLL] Failed to cache simdata: {retrieve_result.get('message')}", flush=True)
+            except Exception as e:
+                print(f"[CHAT-POLL] Error retrieving simdata: {e}", flush=True)
+                status_msg += "\n⚠️ Note: Simdata retrieval may have failed. Try querying anyway."
+            
+            job_state = "done"
+        elif status == "FAILED":
+            status_msg = f"❌ Job failed: {result.get('error', 'Unknown error')}"
+            job_state = "done"
+        elif status == "TIMED_OUT":
+            status_msg = "⏱️ Job timed out"
+            job_state = "done"
+        else:
+            # Still running
+            elapsed = result.get("elapsed_seconds", 0)
+            status_msg = f"⏳ Job running... ({elapsed}s elapsed)"
+            job_state = "running"
+        
+        # Update chat history and re-render
+        if chat_hist and len(chat_hist) > 0:
+            # Find and update the job status message (usually the last agent message)
+            for i in range(len(chat_hist) - 1, -1, -1):
+                if chat_hist[i].get("role") == "agent" and "Job ID:" in chat_hist[i].get("message", ""):
+                    # Update message with status
+                    old_msg = chat_hist[i]["message"]
+                    # Keep the job ID line, append status
+                    job_id_line = old_msg.split("\n")[0]  # "📊 Starting... (Job ID: ...)"
+                    chat_hist[i]["message"] = f"{job_id_line}\n{status_msg}"
+                    break
+        
+        # Re-render all messages
+        message_elements = []
+        for msg in chat_hist or []:
+            if msg.get("role") == "user":
+                message_elements.append(
+                    html.Div(
+                        msg["message"],
+                        style={
+                            "padding": "8px 12px",
+                            "backgroundColor": "#0074D9",
+                            "color": "white",
+                            "borderRadius": "8px",
+                            "marginBottom": "8px",
+                            "marginLeft": "40px",
+                            "marginRight": "0",
+                            "wordWrap": "break-word",
+                            "fontSize": "12px",
+                        }
+                    )
+                )
+            else:  # agent
+                message_elements.append(
+                    html.Div(
+                        msg["message"],
+                        style={
+                            "padding": "8px 12px",
+                            "backgroundColor": "#f0f0f0",
+                            "color": "#333",
+                            "borderRadius": "8px",
+                            "marginBottom": "8px",
+                            "marginRight": "40px",
+                            "marginLeft": "0",
+                            "wordWrap": "break-word",
+                            "fontSize": "12px",
+                            "whiteSpace": "pre-wrap",
+                        }
+                    )
+                )
+        
+        # If job is done, disable poller
+        if job_state == "done":
+            print(f"[CHAT-POLL] Job {job_id} terminal state reached, polling will stop", flush=True)
+        
+        return message_elements
+    
+    except requests.exceptions.RequestException as e:
+        print(f"[CHAT-POLL] Error polling job {job_id}: {str(e)}", flush=True)
+        return no_update
+    except Exception as e:
+        print(f"[CHAT-POLL] Unexpected error: {str(e)}", flush=True)
+        return no_update
+
+
+# NEW: Stop polling when job reaches terminal state (Item 8)
+@app.callback(
+    Output("chat-job-poller", "disabled", allow_duplicate=True),
+    Input("chat-messages", "children"),
+    State("chat-job-id", "data"),
+    prevent_initial_call=True,
+)
+def stop_polling_on_completion(messages, job_id):
+    """
+    Stop polling if last agent message shows ✅ or ❌.
+    """
+    if not job_id or not messages:
+        return True
+    
+    # Check if latest message has completion status
+    if isinstance(messages, list) and len(messages) > 0:
+        last_msg = messages[-1]
+        if hasattr(last_msg, "children"):
+            msg_text = str(last_msg.children) if hasattr(last_msg.children, "__str__") else ""
+            if "✅" in msg_text or "❌" in msg_text or "⏱️" in msg_text:
+                if "running" not in msg_text.lower():
+                    print(f"[CHAT-POLL] Terminal state detected, disabling poller", flush=True)
+                    return True
+    
+    return False
 
 # Queries the NASA Exoplanet Archive upon from Dash UI search input (textbox)   
 # and returns a ranked list of matching planet names from the dropdown.
@@ -406,7 +991,7 @@ def populate_from_url_or_nasa(url_search, n_clicks, pl_value, mm_val, ah_val, em
 # 2. Starts Step Functions execution with input/output S3 prefixes.
 # 3. Computes HZ bounds and stores them in job-info.
 # 4. Returns a placeholder figure, clears kick, enables the status poller, 
-# and clears the URL query so navigation won’t re-trigger jobs.
+# and clears the URL query so navigation won't re-trigger jobs.
 
 # ------- Local Path (AWS_ENABLED = 0) ------
 # Runs either run_simulation_for_years or run_simulation, 
@@ -648,7 +1233,7 @@ def eda_plot(vars_selected, ptype, norm_opts, packed):
     )
     return fig
 
-# Sets pathname to “/” when the “Back to Simulation” button is clicked.
+# Sets pathname to "/" when the "Back to Simulation" button is clicked.
 @app.callback(
     Output("url", "pathname"),
     Input("back-btn", "n_clicks"),
@@ -813,7 +1398,7 @@ def update_status_display(job_info):
     else:
         return html.Span(f"⏳ Job {job_id}: {status}", style={"color": "orange"})
 
-# Clears the URL query string on any navigation so run=1 doesn’t persist.
+# Clears the URL query string on any navigation so run=1 doesn't persist.
 @app.callback(
     Output("url", "search", allow_duplicate=True),
     Input("url", "pathname"),
@@ -835,7 +1420,7 @@ def clear_kick_on_route(pathname):
         return ""
     return no_update
 
-# When navigating back to “/”, rebuilds the orbit-graph from simdata to restore main figure. 
+# When navigating back to "/", rebuilds the orbit-graph from simdata to restore main figure. 
 # Uses plotly_white and uirevision="anim" to stabilize visuals and preserve interactions (zoom state etc.).
 @app.callback(
     Output("orbit-graph", "figure", allow_duplicate=True),

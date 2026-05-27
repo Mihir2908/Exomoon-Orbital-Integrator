@@ -2,8 +2,12 @@ import os
 import json
 import re
 import uuid
+import time
+import signal
 import pathlib
+import threading
 import traceback
+from contextlib import asynccontextmanager
 from typing import Any, Dict, Optional
 
 import numpy as np
@@ -11,11 +15,13 @@ import boto3
 import botocore
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 from exomoon.params import SystemParams
 from exomoon.constants import FOUR_PI2, merth, msun
-from exomoon.eda import unpack_sim
+from exomoon.eda import unpack_sim, traj_to_frame, to_csv_bytes, pack_sim
+from exomoon.simulation import run_simulation, run_simulation_for_years
 from exomoon.exoplanet_archive import fetch_system_by_planet
 from exomoon.mcp_server import env_info, dash_url, export_csv, eda_plot
 
@@ -25,7 +31,31 @@ try:
 except Exception:
     anthropic = None
 
-app = FastAPI(title="Exomoon Agent Service", version="0.1.0")
+
+def _force_exit(sig, frame):
+    """Force-exit immediately so Ctrl+C isn't blocked by in-flight Claude calls."""
+    print("\n[SHUTDOWN] Signal received — exiting immediately.", flush=True)
+    os._exit(0)
+
+
+@asynccontextmanager
+async def lifespan(app):
+    # Re-install SIGINT/SIGTERM after uvicorn has set its own handlers.
+    # This ensures Ctrl+C kills the process immediately rather than waiting
+    # for synchronous thread-pool tasks (Claude tool loops) to finish.
+    signal.signal(signal.SIGINT,  _force_exit)
+    signal.signal(signal.SIGTERM, _force_exit)
+    yield
+
+
+app = FastAPI(title="Exomoon Agent Service", version="0.1.0", lifespan=lifespan)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[os.getenv("FRONTEND_ORIGIN", "*")],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 AWS_ENABLED = os.getenv("AWS_ENABLED", "0") == "1"
 BUCKET = os.getenv("EXOMOON_BUCKET")
@@ -54,14 +84,19 @@ CLAUDE_ENABLED = os.getenv("CLAUDE_ENABLED", "0") == "1"
 
 claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY) if CLAUDE_ENABLED else None
 
-# DEBUG: Startup diagnostics
-print(f"[STARTUP] anthropic module available: {anthropic is not None}", flush=True)
-print(f"[STARTUP] ANTHROPIC_API_KEY length: {len(ANTHROPIC_API_KEY)} chars", flush=True)
-print(f"[STARTUP] ANTHROPIC_API_KEY is empty: {len(ANTHROPIC_API_KEY) == 0}", flush=True)
-if ANTHROPIC_API_KEY:
-    print(f"[STARTUP] ANTHROPIC_API_KEY first 10 chars: {ANTHROPIC_API_KEY[:10]}", flush=True)
-print(f"[STARTUP] CLAUDE_ENABLED: {CLAUDE_ENABLED}", flush=True)
-print(f"[STARTUP] Claude client created: {claude is not None}", flush=True)
+# Startup diagnostics
+print(f"[STARTUP] CLAUDE_ENABLED={CLAUDE_ENABLED}, AWS_ENABLED={AWS_ENABLED}", flush=True)
+print(f"[STARTUP] anthropic available={anthropic is not None}, client created={claude is not None}", flush=True)
+
+# NumPy version guard — Numba 0.60 requires NumPy ≤ 2.0
+_np_ver = tuple(int(x) for x in np.__version__.split(".")[:2])
+if _np_ver > (2, 0):
+    print(
+        f"[STARTUP] WARNING: NumPy {np.__version__} may be incompatible with Numba 0.60 "
+        f"(requires ≤ 2.0). Local simulations will likely crash. "
+        f"Fix: pip install 'numpy<2.1' then delete __pycache__ dirs and restart.",
+        flush=True,
+    )
 
 s3 = boto3.client("s3", region_name=AWS_REGION) if AWS_ENABLED and BUCKET else None
 sf = boto3.client("stepfunctions", region_name=AWS_REGION) if AWS_ENABLED and STATE_MACHINE_ARN else None
@@ -135,6 +170,50 @@ class SessionCache:
             return None
 
 _session = SessionCache()
+
+# ── Local job store (used when AWS_ENABLED=0) ──────────────────────────────────
+# Maps job_id → {status, started, elapsed, csv_bytes, summary, simdata, error}
+LOCAL_JOBS: Dict[str, Dict] = {}
+_LOCAL_AGENT_BASE = os.getenv("AGENT_BASE_URL", "http://localhost:8000")
+
+
+def _run_local_job(job_id: str, params_dict: Dict, years: float) -> None:
+    """Background thread: run simulation locally, store result in LOCAL_JOBS."""
+    LOCAL_JOBS[job_id]["started"] = time.time()
+    try:
+        # Build SystemParams from the flat dict (ignore unknown keys)
+        import dataclasses
+        known = {f.name for f in dataclasses.fields(SystemParams)}
+        p = SystemParams(**{k: v for k, v in params_dict.items() if k in known})
+        sim = run_simulation_for_years(p, years) if years > 0 else run_simulation(p)
+
+        frame = traj_to_frame(sim)
+        csv_bytes = to_csv_bytes(frame)
+        simdata = pack_sim(sim)
+
+        summary = {
+            "t_end": sim["t_end"],
+            "dt": sim["dt"],
+            "rhill_AU": sim["state"].get("rhill_AU"),
+            "n_steps": len(sim["traj"]["xyzarr_mp"]),
+            "years_requested": years,
+            "a_inner_au": sim["a_inner_au"],
+            "a_outer_au": sim["a_outer_au"],
+        }
+
+        LOCAL_JOBS[job_id].update({
+            "status": "SUCCEEDED",
+            "csv_bytes": csv_bytes,
+            "summary": summary,
+            "simdata": simdata,
+            "elapsed": time.time() - LOCAL_JOBS[job_id]["started"],
+        })
+        _session.set_simdata(simdata, params_dict)
+        print(f"[LOCAL-JOB] {job_id} completed ({len(csv_bytes)} csv bytes)", flush=True)
+    except Exception as exc:
+        LOCAL_JOBS[job_id].update({"status": "FAILED", "error": str(exc)})
+        print(f"[LOCAL-JOB] {job_id} FAILED: {exc}", flush=True)
+        traceback.print_exc()
 
 
 class ChatRequest(BaseModel):
@@ -593,26 +672,51 @@ def _execute_tool(tool_name: str, tool_input: Dict[str, Any], req: ChatRequest) 
                             frame = newf
                 
                 csv_bytes = to_csv_bytes(frame)
+                n_rows = len(frame.get("t_years", [])) if isinstance(frame, dict) else (frame.shape[0] if hasattr(frame, 'shape') else 0)
+
+                # Upload to S3 and generate 24h presigned URL when AWS is available
+                download_url = None
+                if AWS_ENABLED and s3 and BUCKET:
+                    import time as _time
+                    ts = int(_time.time())
+                    job_id_hint = getattr(req, 'job_id', None) or "local"
+                    s3_key = f"outputs/{job_id_hint}/export_{ts}.csv"
+                    try:
+                        s3.put_object(Bucket=BUCKET, Key=s3_key, Body=csv_bytes, ContentType="text/csv")
+                        download_url = s3.generate_presigned_url(
+                            "get_object",
+                            Params={"Bucket": BUCKET, "Key": s3_key},
+                            ExpiresIn=86400,
+                        )
+                        print(f"[TOOL] export_csv uploaded to s3://{BUCKET}/{s3_key}", flush=True)
+                    except Exception as s3_err:
+                        print(f"[TOOL] export_csv S3 upload failed: {s3_err}", flush=True)
+
+                # Always write local fallback
                 outdir = pathlib.Path("outputs")
                 outdir.mkdir(exist_ok=True)
                 fname = f"exomoon_dataset_{int(years) if years else 0}y.csv"
                 fpath = outdir / fname
-                with open(fpath, "wb") as f:
-                    f.write(csv_bytes)
-                
-                n_rows = len(frame.get("t_years", [])) if isinstance(frame, dict) else (frame.shape[0] if hasattr(frame, 'shape') else 0)
-                print(f"[TOOL] export_csv success: {n_rows} rows saved to {fpath}", flush=True)
-                
+                with open(fpath, "wb") as fh:
+                    fh.write(csv_bytes)
+
+                print(f"[TOOL] export_csv success: {n_rows} rows", flush=True)
+
                 # Cache simdata after successful export
                 _session.set_simdata(simdata_to_use, req.params)
-                
-                return {
+
+                result_payload = {
                     "ok": True,
-                    "csv_path": str(fpath.resolve()),
                     "rows": n_rows,
                     "columns_exported": len(columns) if columns else None,
-                    "message": f"✅ Exported {n_rows} rows to {fname}"
+                    "message": f"✅ Exported {n_rows} rows.",
                 }
+                if download_url:
+                    result_payload["download_url"] = download_url
+                    result_payload["message"] += f" [Download CSV]({download_url})"
+                else:
+                    result_payload["csv_path"] = str(fpath.resolve())
+                return result_payload
             except Exception as e:
                 print(f"[TOOL] export_csv error: {e}", flush=True)
                 import traceback
@@ -755,27 +859,135 @@ def _chat_with_claude(req: ChatRequest) -> Dict[str, Any]:
                 req.params = cached_par
             print(f"[AGENT] Using cached simdata from previous job", flush=True)
     
-    # Build context for Claude
+    # ── Build context for Claude ──────────────────────────────────────────────
+    # Include all configured system parameters so Claude can reason about
+    # habitability, physical sizes, and orbital dynamics without re-simulation.
+    raw_params = req.params or {}
+    derived: Dict[str, Any] = {}
+    if raw_params:
+        try:
+            from exomoon.habitable_zone import hz_bounds_au
+            from exomoon.constants import stefboltz, rsun as RSUN, au as AU, merth as MERTH, rerth as RERTH, msun as MSUN
+
+            Ts       = float(raw_params.get("Ts",       5772.0))
+            rs_solar = float(raw_params.get("rs_solar", 1.0))
+            ms_solar = float(raw_params.get("ms_solar", 1.0))
+            mp_earth = float(raw_params.get("mp_earth", 1.0))
+            dp_cgs   = float(raw_params.get("dp_cgs",   5.5))
+            mm_earth = float(raw_params.get("mm_earth", 0.01))
+            dm_cgs   = float(raw_params.get("dm_cgs",   5.5))
+            ap_AU    = float(raw_params.get("ap_AU",    1.0))
+            am_hill  = float(raw_params.get("am_hill",  0.3))
+
+            # Star luminosity
+            rs_m   = rs_solar * RSUN
+            L_star = 4 * 3.14159265 * rs_m**2 * stefboltz * Ts**4
+            L_sun  = 4 * 3.14159265 * RSUN**2 * stefboltz * 5778.0**4
+            L_solar = L_star / L_sun
+
+            # Habitable zone
+            a_inner_au, a_outer_au = hz_bounds_au(Ts, rs_m)
+
+            # Body radii
+            mp_kg = mp_earth * MERTH
+            dp_si = dp_cgs * 1e3
+            rp_m  = (0.75 * mp_kg / dp_si) ** (1.0 / 3.0)
+            rp_earth = rp_m / RERTH
+
+            mm_kg = mm_earth * MERTH
+            dm_si = dm_cgs * 1e3
+            rm_m  = (0.75 * mm_kg / dm_si) ** (1.0 / 3.0)
+            rm_earth = rm_m / RERTH
+
+            # Hill radius estimate from params (no simdata needed)
+            mp_solar = mp_earth * MERTH / MSUN
+            rhill_est = ap_AU * (mp_solar / (3.0 * ms_solar)) ** (1.0 / 3.0)
+            am_AU_est = am_hill * rhill_est
+
+            # Moon effective temperature (assume albedo ~0.3, emissivity factor ~2.448)
+            F_at_moon = L_star / (4 * 3.14159265 * (ap_AU * AU)**2)  # approx at planet orbit
+            Tm_K = ((0.7 * F_at_moon) / (2.448 * stefboltz)) ** 0.25
+
+            # Moon surface gravity (m/s^2)
+            moon_g = 6.6732e-11 * mm_kg / rm_m**2 if rm_m > 0 else 0.0
+
+            # Explicitly cast to native Python types — NumPy scalars (numpy.float64,
+            # numpy.bool_) are NOT JSON serializable and will raise TypeError in
+            # json.dumps(ctx) below if left as-is.
+            derived = {
+                "L_star_solar":        round(float(L_solar),    4),
+                "hz_inner_au":         round(float(a_inner_au), 4),
+                "hz_outer_au":         round(float(a_outer_au), 4),
+                "planet_radius_earth": round(float(rp_earth),   3),
+                "moon_radius_earth":   round(float(rm_earth),   4),
+                "rhill_est_au":        round(float(rhill_est),  5),
+                "moon_sma_est_au":     round(float(am_AU_est),  6),
+                "moon_teff_K":         round(float(Tm_K),       1),
+                "moon_surface_g_ms2":  round(float(moon_g),     3),
+                "moon_in_hz":          bool(a_inner_au <= ap_AU <= a_outer_au),
+            }
+        except Exception as _e:
+            print(f"[AGENT] Could not compute derived params: {_e}", flush=True)
+
     ctx = {
-        "has_simdata": bool(effective_simdata),
-        "years_hint": req.years,
+        "has_simdata":  bool(effective_simdata),
+        "years_hint":   req.years,
         "escape_factor": req.escape_factor,
-        "has_params": bool(req.params),
-        "aws_enabled": AWS_ENABLED,
+        "aws_enabled":  AWS_ENABLED,
+        "params":       raw_params,   # all configured system parameters
+        "derived":      derived,      # pre-computed habitability quantities
     }
 
     system_prompt = (
-        "You are an exomoon orbital mechanics assistant. "
-        
-        "Use the provided tools to answer user requests. "
-        "For stability queries: first try stability_from_simdata if simdata is available. "
-        "If simdata is missing or insufficient (needs_rerun=true), call start_backend_job automatically. "
-        "For range queries (e.g., 'show moon distance every 0.5 years from 0 to 10 years'), "
-        "call get_trajectory_at_time() multiple times (eg. years=0, 0.5, 1.0, 1.5, ..., 10.0) and aggregate the results. "
-        "Do not ask the user to manually run simulations—that's your responsibility. "
-        "Be concise and provide numerical results when available."
-        "Be concise and accurate"
-        "For conversion requests (AU → km) or (AU -> fraction of planetary hill radius), multiply by 149,597,870.7 km/AU or divide by rhill."
+        "You are an expert exomoon orbital mechanics and astrobiology assistant embedded in an interactive "
+        "simulation tool. The user is looking at a real-time 3D orbital animation of a star–planet–moon system.\n\n"
+
+        "## Response format\n"
+        "Always respond in **Markdown**. Use headers, bullet points, bold, and code blocks where appropriate. "
+        "Provide numerical results with units. Keep responses focused and concise.\n\n"
+
+        "## System parameters available\n"
+        "The `context.params` dict contains all configured parameters for the current system:\n"
+        "  `Ts` (star temp K), `rs_solar` (star radius R☉), `ms_solar` (star mass M☉),\n"
+        "  `mp_earth` (planet mass M⊕), `dp_cgs` (planet density g/cm³),\n"
+        "  `ap_AU` (planet semi-major axis AU), `ep` (planet eccentricity),\n"
+        "  `mm_earth` (moon mass M⊕), `dm_cgs` (moon density g/cm³),\n"
+        "  `am_hill` (moon SMA as fraction of Hill radius), `em` (moon eccentricity),\n"
+        "  `moon_retrograde` (bool).\n"
+        "The `context.derived` dict provides pre-computed quantities:\n"
+        "  `L_star_solar`, `hz_inner_au`, `hz_outer_au`, `planet_radius_earth`,\n"
+        "  `moon_radius_earth`, `rhill_est_au`, `moon_sma_est_au`,\n"
+        "  `moon_teff_K` (effective blackbody temperature), `moon_surface_g_ms2`,\n"
+        "  `moon_in_hz` (bool — is planet orbit inside HZ?).\n"
+        "Use these directly in habitability and physical analysis — no tool call needed.\n\n"
+
+        "## Habitability reasoning\n"
+        "When asked about habitability, reason across multiple factors using the provided values:\n"
+        "- **Temperature**: `moon_teff_K` — liquid water requires ~273–373 K; compare to Earth (255 K blackbody).\n"
+        "- **HZ position**: `moon_in_hz` / `hz_inner_au` / `hz_outer_au` — is the planet's orbit in the stellar HZ?\n"
+        "- **Atmosphere retention**: escape velocity scales with √(g·R); small moons (< 0.1 M⊕) likely cannot "
+        "  retain N₂/O₂ atmospheres long-term. `moon_surface_g_ms2` and `moon_radius_earth` inform this.\n"
+        "- **Tidal heating**: moons close to the planet (small `am_hill`) or with high eccentricity (`em`) "
+        "  experience tidal dissipation — can supplement stellar flux or cause runaway volcanism (e.g. Io).\n"
+        "- **Orbital stability**: a moon is stable only if it remains within ~0.5 R_Hill. Use trajectory data "
+        "  (`stability_from_simdata`) for quantitative escape analysis.\n"
+        "- **Radiation**: moons inside a planet's magnetosphere are shielded; outside, stellar/cosmic radiation "
+        "  poses habitability risks.\n"
+        "Always note which factors support and which constrain habitability, citing the numerical values.\n\n"
+
+        "## Simdata context\n"
+        "If `has_simdata` is true, you have trajectory data for the most recently run simulation. "
+        "Use `stability_from_simdata` to analyze stability without re-running. "
+        "Return the same `simdata` in your result so the frontend caches it for follow-up queries.\n\n"
+
+        "## Tool usage\n"
+        "- Stability queries: use `stability_from_simdata` if simdata available; otherwise call `start_backend_job`.\n"
+        "- Trajectory at specific times: call `get_trajectory_at_time()` (multiple calls allowed).\n"
+        "- CSV exports: call `export_csv` — returns a presigned URL; include as `[Download CSV](url)` in response.\n"
+        "- Do NOT ask the user to run simulations manually — trigger them yourself.\n\n"
+
+        "## Unit conversions\n"
+        "AU → km: ×149,597,870.7. AU/yr → km/s: ×4.74. Hill fraction: divide by rhill_AU."
     )
 
     messages = [
@@ -786,13 +998,13 @@ def _chat_with_claude(req: ChatRequest) -> Dict[str, Any]:
     ]
 
     try:
-        # Tool-use loop (max 5 iterations to avoid infinite loops)
-        for iteration in range(5):
+        # Tool-use loop (max 12 iterations — complex multi-part queries need more rounds)
+        for iteration in range(12):
             print(f"[AGENT] Claude iteration {iteration + 1}...", flush=True)
             
             resp = claude.messages.create(
                 model=ANTHROPIC_MODEL,
-                max_tokens=900,
+                max_tokens=4096,
                 temperature=0,
                 system=system_prompt,
                 tools=_tool_specs(),
@@ -836,9 +1048,8 @@ def _chat_with_claude(req: ChatRequest) -> Dict[str, Any]:
 
             # If no tools were called, we're done
             if not tool_results_for_next_turn:
-                text = " ".join(t.strip() for t in final_text_parts if t and t.strip()).strip()
-                text = _format_claude_response(text)
-                print(f"[AGENT] Claude final response: {text}", flush=True)
+                text = "\n\n".join(t.strip() for t in final_text_parts if t and t.strip()).strip()
+                print(f"[AGENT] Claude final response: {text[:200]}...", flush=True)
                 
                 # Include simdata in response so Dash can pass back on next request
                 result = {"ok": True, "mode": "claude", "message": text or "Done."}
@@ -929,6 +1140,35 @@ def tool_stability_from_simdata(req: StabilityRequest):
         raise HTTPException(status_code=400, detail=str(e))
 
 
+@app.post("/job/submit")
+def submit_job(req: ChatRequest):
+    """
+    Direct job submission — bypasses Claude entirely.
+    Mirrors Dash Mode 1 / native UI Run button path.
+
+    AWS_ENABLED=1 → uploads params to S3, starts Step Functions, returns immediately.
+    AWS_ENABLED=0 → runs simulation in a background thread locally, same polling API.
+    """
+    if not AWS_ENABLED:
+        job_id = f"local-{uuid.uuid4().hex[:12]}"
+        LOCAL_JOBS[job_id] = {"status": "RUNNING", "started": time.time()}
+        threading.Thread(
+            target=_run_local_job,
+            args=(job_id, req.params or {}, req.years or 0),
+            daemon=True,
+        ).start()
+        print(f"[LOCAL-JOB] Submitted {job_id} (AWS_ENABLED=0)", flush=True)
+        return {"ok": True, "job_id": job_id, "status": "submitted"}
+
+    result = _start_backend_job(
+        req.params or {},
+        req.years or 0,
+        check_stability=False,
+        escape_factor=req.escape_factor or 1.0,
+    )
+    return result
+
+
 @app.post("/chat")
 def chat(req: ChatRequest):
     """
@@ -955,22 +1195,70 @@ def chat_stream(req: ChatRequest):
     text = result.get("message", "")
 
     def gen():
-        # Emit metadata (mode, job_id if applicable)
-        yield f"data: {json.dumps({'type': 'meta', 'payload': {'mode': result.get('mode'), 'job_id': result.get('job_id')}})}\n\n"
-        # Stream tokens
-        for tok in text.split():
-            yield f"data: {json.dumps({'type': 'token', 'payload': tok + ' '})}\n\n"
-        # Final payload
-        yield f"data: {json.dumps({'type': 'done', 'payload': result})}\n\n"
+        # Metadata event — carries job_id if a backend job was started
+        meta_evt = {"type": "meta", "mode": result.get("mode"), "job_id": result.get("job_id")}
+        yield f"data: {json.dumps(meta_evt)}\n\n"
+        # Token-by-token streaming of the markdown response
+        for tok in text.split(" "):
+            yield f"data: {json.dumps({'type': 'token', 'token': tok + ' '})}\n\n"
+        # Done event — carries simdata + presigned URLs for the frontend to cache
+        done_evt = {
+            "type": "done",
+            "simdata": result.get("simdata"),
+            "urls": result.get("urls", {}),
+            "job_id": result.get("job_id"),
+        }
+        yield f"data: {json.dumps(done_evt)}\n\n"
 
     return StreamingResponse(gen(), media_type="text/event-stream")
+
+@app.get("/job/{job_id}/traj.csv")
+def local_traj_csv(job_id: str):
+    """Serve traj.csv for a completed local job (AWS_ENABLED=0)."""
+    job = LOCAL_JOBS.get(job_id)
+    if not job or job.get("status") != "SUCCEEDED" or "csv_bytes" not in job:
+        raise HTTPException(status_code=404, detail="CSV not ready")
+    from fastapi.responses import Response
+    return Response(content=job["csv_bytes"], media_type="text/csv")
+
+
+@app.get("/job/{job_id}/summary.json")
+def local_summary_json(job_id: str):
+    """Serve summary.json for a completed local job (AWS_ENABLED=0)."""
+    job = LOCAL_JOBS.get(job_id)
+    if not job or job.get("status") != "SUCCEEDED" or "summary" not in job:
+        raise HTTPException(status_code=404, detail="Summary not ready")
+    return job["summary"]
+
 
 @app.get("/job/{job_id}/status")
 def get_job_status(job_id: str):
     """
-    Query Step Functions job status.
+    Query job status. Checks local jobs first (AWS_ENABLED=0), then Step Functions.
     Returns: status (RUNNING|SUCCEEDED|FAILED|TIMED_OUT), elapsed_seconds, urls (if done).
     """
+    # ── Local simulation path (AWS_ENABLED=0) ────────────────────────────────
+    if job_id in LOCAL_JOBS:
+        job = LOCAL_JOBS[job_id]
+        status = job.get("status", "RUNNING")
+        elapsed = time.time() - job.get("started", time.time())
+        urls: Dict[str, str] = {}
+        if status == "SUCCEEDED":
+            base = _LOCAL_AGENT_BASE.rstrip("/")
+            urls = {
+                "traj.csv":    f"{base}/job/{job_id}/traj.csv",
+                "summary.json": f"{base}/job/{job_id}/summary.json",
+            }
+        return {
+            "ok": True,
+            "job_id": job_id,
+            "status": status,
+            "elapsed_seconds": int(elapsed),
+            "urls": urls,
+            "error": job.get("error"),
+        }
+
+    # ── AWS Step Functions path ───────────────────────────────────────────────
     if not (sf and STATE_MACHINE_ARN):
         return {
             "ok": False,
@@ -1005,9 +1293,7 @@ def get_job_status(job_id: str):
         
         elapsed = 0
         if start_time:
-            import time
-            from datetime import datetime as _dt
-            start_ts = start_time.timestamp() if hasattr(start_time, "timestamp") else start_time
+            start_ts = start_time.timestamp() if hasattr(start_time, "timestamp") else float(start_time)
             elapsed = int(time.time() - start_ts)
         
         result = {
@@ -1050,10 +1336,25 @@ def get_job_status(job_id: str):
 @app.get("/job/{job_id}/retrieve_simdata")
 def retrieve_job_simdata(job_id: str):
     """
-    Retrieve and cache simdata from completed job.
-    Called by Dash when job status becomes SUCCEEDED.
-    Returns: ok, simdata_cached (bool), message
+    Cache simdata from a completed job into the session.
+    Called by the frontend poller when status becomes SUCCEEDED.
+    Handles both local (AWS_ENABLED=0) and S3-backed jobs.
     """
+    # ── Local job path ────────────────────────────────────────────────────────
+    if job_id in LOCAL_JOBS:
+        job = LOCAL_JOBS[job_id]
+        if job.get("status") != "SUCCEEDED":
+            return {"ok": False, "job_id": job_id, "simdata_cached": False,
+                    "message": f"Job not complete (status={job.get('status')})"}
+        simdata = job.get("simdata")
+        if simdata:
+            _session.set_simdata(simdata, {})
+            return {"ok": True, "job_id": job_id, "simdata_cached": True,
+                    "message": f"Cached local simdata ({len(simdata)} chars)"}
+        return {"ok": False, "job_id": job_id, "simdata_cached": False,
+                "message": "Local simdata missing"}
+
+    # ── AWS S3 path ───────────────────────────────────────────────────────────
     if not (s3 and BUCKET):
         return {
             "ok": False,

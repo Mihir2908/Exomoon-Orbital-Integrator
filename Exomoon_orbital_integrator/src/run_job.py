@@ -82,6 +82,8 @@ def main():
         "rhill_AU": sim["state"].get("rhill_AU"),
         "n_steps": len(sim["traj"]["xyzarr_mp"]),
         "years_requested": yrs,
+        "a_inner_au": sim["a_inner_au"],
+        "a_outer_au": sim["a_outer_au"],
     }
     local_summary = str(workdir / "summary.json")
     with open(local_summary, "w") as f:

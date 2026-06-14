@@ -2,7 +2,7 @@
 import React, { useRef, useState, useCallback, useEffect, memo } from 'react';
 import {
   BarChart2, X, GripHorizontal, Sun, Globe, Moon,
-  CheckCircle, Zap, Loader2, ChevronDown, ChevronUp, Maximize2,
+  CheckCircle, Zap, Loader2, ChevronDown, ChevronUp, Maximize2, Brain,
 } from 'lucide-react';
 import { AppShell } from '@/components/layout/AppShell';
 import { OrbitCanvas } from '@/components/animation/OrbitCanvas';
@@ -12,6 +12,7 @@ import { MiniOrbitView } from '@/components/animation/MiniOrbitView';
 import { useOrbitScene } from '@/components/animation/useOrbitScene';
 import type { BodyRadiiAU } from '@/components/animation/useOrbitScene';
 import { EdaPanel } from '@/components/eda/EdaPanel';
+import { MlMapOverlay } from '@/components/ml/MlMapOverlay';
 import { ChatPanel } from '@/components/chat/ChatPanel';
 import { StellarPanel } from '@/components/controls/StellarPanel';
 import { PlanetPanel } from '@/components/controls/PlanetPanel';
@@ -295,6 +296,7 @@ export default function HomePage() {
   const [showStar,       setShowStar]       = useState(false);
   const [showPlanet,     setShowPlanet]     = useState(false);
   const [showMoon,       setShowMoon]       = useState(false);
+  const [showMl,         setShowMl]         = useState(false);
   const [showFullscreen, setShowFullscreen] = useState(false);
   const [stripCollapsed, setStripCollapsed] = useState(false);
 
@@ -425,6 +427,7 @@ export default function HomePage() {
   const handleCloseStar   = useCallback(() => setShowStar(false),   []);
   const handleClosePlanet = useCallback(() => setShowPlanet(false), []);
   const handleCloseMoon   = useCallback(() => setShowMoon(false),   []);
+  const handleCloseMl     = useCallback(() => setShowMl(false),     []);
 
   const mainContent = (
     <div
@@ -567,6 +570,14 @@ export default function HomePage() {
               <BarChart2 size={12} />
               EDA
             </button>
+            <button onClick={() => setShowMl(v => !v)}
+              className={cn('flex items-center gap-1.5 px-2.5 py-1.5 rounded text-xs font-medium border transition-colors',
+                showMl ? 'bg-violet-600/80 text-white border-violet-500/60'
+                       : 'bg-black/50 text-gray-400 hover:text-violet-300 hover:bg-gray-800/70 border-gray-700/60')}
+              title="Toggle ML Stability Predictor">
+              <Brain size={12} className={showMl ? 'text-white' : 'text-violet-400'} />
+              ML
+            </button>
           </div>
 
           {/* Object parameter overlays */}
@@ -574,6 +585,13 @@ export default function HomePage() {
           {showPlanet && <PlanetOverlay  onClose={handleClosePlanet} containerRef={containerRef} />}
           {showMoon   && <MoonOverlay    onClose={handleCloseMoon}   containerRef={containerRef} />}
           {showEda    && <EdaOverlay     onClose={handleCloseEda}    containerRef={containerRef} />}
+          {showMl     && (
+            <MlMapOverlay
+              onClose={handleCloseMl}
+              containerRef={containerRef}
+              onApplyAndRun={handleRun}
+            />
+          )}
 
           {/* Fullscreen enter button — bottom-left */}
           <button

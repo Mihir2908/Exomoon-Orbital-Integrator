@@ -5,7 +5,7 @@ import { DEFAULT_PARAMS } from '@/lib/paramDefaults';
 import { DEFAULT_EDA_VARS as EDA_DEFAULTS } from '@/lib/trajectoryMath';
 import type {
   SystemParams, TrajectoryFrame, SimulationMeta,
-  ChatMessage, JobStatusState,
+  ChatMessage, JobStatusState, MlPrediction,
 } from '@/lib/types';
 
 export type ParamStatus = 'none' | 'clean' | 'dirty';
@@ -65,6 +65,12 @@ interface SimulationStore {
 
   // ── Simdata alias ─────────────────────────────────────────────────────────────
   setSimdataB64: (s: string | null) => void;
+
+  // ── ML Prediction ────────────────────────────────────────────────────────────
+  mlPrediction: MlPrediction | null;  // 2D stability-habitability map from inference
+  mlMassIdx: number;                  // current slider index into mlPrediction.mmGrid
+  setMlPrediction: (p: MlPrediction | null) => void;
+  setMlMassIdx: (i: number) => void;
 
   // ── Chat ─────────────────────────────────────────────────────────────────────
   chatMessages: ChatMessage[];
@@ -157,6 +163,12 @@ export const useSimulationStore = create<SimulationStore>()(
       setEdaNormalize: (n) => set({ edaNormalize: n }),
       setShowHzOverlay: (v) => set({ showHzOverlay: v }),
       setShowHillOverlay: (v) => set({ showHillOverlay: v }),
+
+      // ── ML Prediction ─────────────────────────────────────────────────────────
+      mlPrediction: null,
+      mlMassIdx: 0,
+      setMlPrediction: (p) => set({ mlPrediction: p, mlMassIdx: 0 }),
+      setMlMassIdx: (i) => set({ mlMassIdx: i }),
 
       // ── Chat ──────────────────────────────────────────────────────────────────
       chatMessages: [],

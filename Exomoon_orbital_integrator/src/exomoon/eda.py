@@ -23,8 +23,10 @@ def traj_to_frame(sim: dict):
     # Relative vectors and distances
     rel_mm_mp = xyz_mm - xyz_mp
     rel_mp_ms = xyz_mp - xyz_ms
+    rel_mm_ms = xyz_mm - xyz_ms          # moon relative to star
     moon_planet_dist = np.sqrt((rel_mm_mp**2).sum(axis=1))
     planet_star_dist = np.sqrt((rel_mp_ms**2).sum(axis=1))
+    moon_star_dist   = np.sqrt((rel_mm_ms**2).sum(axis=1))
 
     data = {
         "t_years": t,
@@ -37,6 +39,7 @@ def traj_to_frame(sim: dict):
         "planet_rel_x": rel_mp_ms[:, 0], "planet_rel_y": rel_mp_ms[:, 1], "planet_rel_z": rel_mp_ms[:, 2],
         "moon_planet_dist": moon_planet_dist,
         "planet_star_dist": planet_star_dist,
+        "moon_star_dist":   moon_star_dist,
     }
 
     # velocities (if present)
@@ -48,6 +51,41 @@ def traj_to_frame(sim: dict):
             "moon_speed": np.sqrt((vel_mm**2).sum(axis=1)),
             "planet_speed": np.sqrt((vel_mp**2).sum(axis=1)),
             "star_speed": np.sqrt((vel_ms**2).sum(axis=1)),
+        })
+
+    # --- ML training columns (only when full sim dict is available, not from unpack_sim) ---
+    p       = sim.get("params")
+    st      = sim.get("state")
+    a_inner = sim.get("a_inner_au")
+    a_outer = sim.get("a_outer_au")
+    t_end   = sim.get("t_end")
+
+    if p is not None and st is not None:
+        rhill = st["rhill_AU"]
+        a_in  = float(a_inner) if a_inner is not None else 0.0
+        a_out = float(a_outer) if a_outer is not None else float("inf")
+        data.update({
+            # system-param constants (broadcast to n rows)
+            "ms_solar":        np.full(n, float(p.ms_solar)),
+            "rs_solar":        np.full(n, float(p.rs_solar)),
+            "Ts":              np.full(n, float(p.Ts)),
+            "mp_earth":        np.full(n, float(p.mp_earth)),
+            "mm_earth":        np.full(n, float(p.mm_earth)),
+            "ap_AU":           np.full(n, float(p.ap_AU)),
+            "ep":              np.full(n, float(p.ep)),
+            "am_hill":         np.full(n, float(p.am_hill)),
+            "am_AU":           np.full(n, float(st["am_AU"])),
+            "rhill_AU":        np.full(n, float(rhill)),
+            "em":              np.full(n, float(p.em)),
+            "moon_retrograde": np.full(n, int(getattr(p, "moon_retrograde", False))),
+            "t_sim":           np.full(n, float(t_end) if t_end is not None else 0.0),
+            "a_inner_au":      np.full(n, a_in),
+            "a_outer_au":      np.full(n, a_out if np.isfinite(a_out) else 0.0),
+            # per-timestep flags
+            "stable":    (moon_planet_dist <= rhill).astype(int),
+            "habitable": (
+                (moon_star_dist >= a_in) & (moon_star_dist <= a_out)
+            ).astype(int),
         })
 
     if _HAS_PANDAS:

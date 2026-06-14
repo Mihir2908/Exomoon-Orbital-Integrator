@@ -43,7 +43,10 @@ export function ChatMessage({ message }: ChatMessageProps) {
               remarkPlugins={[remarkGfm]}
               components={{
                 a: ({ href, children }) => {
-                  const isDownload = href && (href.includes('.csv') || href.includes('download') || href.includes('export'));
+                  const isDownload = href && (
+                    href.includes('.csv') || href.includes('.png') || href.includes('.jpg') ||
+                    href.includes('animation') || href.includes('download') || href.includes('export')
+                  );
                   return (
                     <a
                       href={href}
@@ -54,6 +57,14 @@ export function ChatMessage({ message }: ChatMessageProps) {
                     </a>
                   );
                 },
+                img: ({ src, alt }) => (
+                  <img
+                    src={src}
+                    alt={alt ?? 'plot'}
+                    className="max-w-full rounded-md mt-2 mb-1 border border-gray-700"
+                    style={{ maxHeight: '320px', objectFit: 'contain' }}
+                  />
+                ),
               }}
             >
               {message.content || (message.streaming ? '▋' : '')}

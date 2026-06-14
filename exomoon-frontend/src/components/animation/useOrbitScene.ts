@@ -4,6 +4,7 @@ import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import { CSS2DRenderer, CSS2DObject } from 'three/examples/jsm/renderers/CSS2DRenderer.js';
 import type { TrajectoryFrame, SimulationMeta } from '@/lib/types';
+import { useSimulationStore } from '@/hooks/useSimulationStore';
 
 // ── Tuning knobs ────────────────────────────────────────────────────────────
 const TRAIL_MAX     = 600;    // max trail points per body in the circular buffer
@@ -80,9 +81,15 @@ export function useOrbitScene(
   const hzOuterRef = useRef<THREE.Mesh | null>(null);
   const hzInnerRef = useRef<THREE.Mesh | null>(null);
 
+  // ML stability annulus (purple shell between predicted am_min and am_max)
+  const mlShellRef = useRef<THREE.Mesh | null>(null);
+
   const setFrameIndex      = useCallback((i: number) => { frameIndexRef.current = i; setFrameIndexState(i); }, []);
   const setIsPlaying       = useCallback((v: boolean) => { isPlayingRef.current = v; setIsPlayingState(v); }, []);
   const setSpeedMultiplier = useCallback((v: number) => { speedRef.current = v; setSpeedMultiplierState(v); }, []);
+
+  // ── ML store state ───────────────────────────────────────────────────────────
+  const { mlPrediction, mlMassIdx } = useSimulationStore();
 
   // ── Scene initialisation ─────────────────────────────────────────────────
   useEffect(() => {
@@ -395,6 +402,79 @@ export function useOrbitScene(
       geo.setDrawRange(0, newFill);
     });
   }, []);
+
+  // ── ML stability annulus ─────────────────────────────────────────────────────
+  // When the user moves the moon-mass slider in MlMapOverlay the shell updates
+  // in real time to show the valid orbital-radius band for that mass (Hill radii
+  // converted to AU using the current simulation's rhill_AU from meta).
+  // Uses the identical ShaderMaterial as the HZ shell but violet (0x8b5cf6).
+  useEffect(() => {
+    const scene = sceneRef.current;
+    if (!scene) return;
+
+    // Clean up any previous ML shell
+    if (mlShellRef.current) {
+      scene.remove(mlShellRef.current);
+      mlShellRef.current.geometry.dispose();
+      (mlShellRef.current.material as THREE.Material).dispose();
+      mlShellRef.current = null;
+    }
+
+    // Need both a prediction and a rhill_AU from the current sim to draw the shell
+    if (!mlPrediction || !meta?.rhill_AU) return;
+
+    const amRange = mlPrediction.validAmPerMm[mlMassIdx];
+    if (!amRange) return;   // no valid orbit at this mass
+
+    const rhill      = meta.rhill_AU;
+    const amInnerAU  = amRange[0] * rhill;
+    const amOuterAU  = amRange[1] * rhill;
+
+    if (amOuterAU <= amInnerAU || amOuterAU <= 0) return;
+
+    // Reuse the same GLSL shader as the HZ shell — only uColor changes
+    const shellMat = new THREE.ShaderMaterial({
+      uniforms: {
+        uInnerR2: { value: amInnerAU * amInnerAU },
+        uColor:   { value: new THREE.Color(0x8b5cf6) },   // violet-500
+        uOpacity: { value: 0.18 },
+      },
+      vertexShader: /* glsl */`
+        varying vec3 vWorldPos;
+        void main() {
+          vec4 wp   = modelMatrix * vec4(position, 1.0);
+          vWorldPos = wp.xyz;
+          gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+        }
+      `,
+      fragmentShader: /* glsl */`
+        uniform float uInnerR2;
+        uniform vec3  uColor;
+        uniform float uOpacity;
+        varying vec3  vWorldPos;
+        void main() {
+          vec3  oc   = cameraPosition;
+          vec3  dir  = normalize(vWorldPos - cameraPosition);
+          float b    = dot(oc, dir);
+          float c    = dot(oc, oc) - uInnerR2;
+          float disc = b * b - c;
+          if (disc > 0.0 && (-b - sqrt(disc)) > 0.0) discard;
+          gl_FragColor = vec4(uColor, uOpacity);
+        }
+      `,
+      transparent: true,
+      side: THREE.DoubleSide,
+      depthWrite: false,
+    });
+
+    const mlShell = new THREE.Mesh(
+      new THREE.SphereGeometry(amOuterAU, 48, 48),
+      shellMat,
+    );
+    scene.add(mlShell);
+    mlShellRef.current = mlShell;
+
+  }, [mlPrediction, mlMassIdx, meta]);
 
   return {
     frameIndex,

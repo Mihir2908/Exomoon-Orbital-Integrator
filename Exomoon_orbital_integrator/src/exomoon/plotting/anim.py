@@ -199,7 +199,7 @@ def build_animation(traj: dict,
         sliders=[dict(
             active=0,
             yanchor="bottom", xanchor="left",
-            currentvalue={"font": {"size": 16}, "prefix": "Frames: ", "visible": True, "xanchor": "right"},
+            currentvalue={"font": {"size": 16}, "prefix": "t = ", "visible": True, "xanchor": "right"},
             transition={"duration": transition_ms, "easing": "linear"},
             pad={"b": 10, "t": 55},
             len=0.9, x=0.1, y=1.08,

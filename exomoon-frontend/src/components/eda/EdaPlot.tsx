@@ -1,6 +1,7 @@
 'use client';
-import React from 'react';
+import React, { useRef, useState, useCallback } from 'react';
 import dynamic from 'next/dynamic';
+import { Download } from 'lucide-react';
 import { VAR_INFO } from '@/lib/trajectoryMath';
 import type { TrajectoryFrame } from '@/lib/types';
 
@@ -48,6 +49,40 @@ export function EdaPlot({
   frames, variables, plotType, normalize,
   showHz, showHill, overlayBounds,
 }: EdaPlotProps) {
+  const gdRef = useRef<HTMLDivElement | null>(null);
+  const [saving, setSaving] = useState(false);
+  const handleExport = useCallback(async () => {
+    const gd = gdRef.current;
+    if (!gd) return;
+    setSaving(true);
+    try {
+      // Import the pre-built browser bundle directly. plotly.js/dist/plotly.js is already
+      // fully bundled — no unresolved buffer/ or glslify deps — and exports the Plotly
+      // object as module.exports (exposed as .default via webpack ESM dynamic import).
+      // @ts-ignore – no .d.ts for subpath; webpack resolves plotly.js/dist/plotly.js at runtime
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const Plotly = ((await import('plotly.js/dist/plotly')) as any).default as any;
+      if (!Plotly?.toImage) {
+        console.warn('Plotly.toImage not available');
+        return;
+      }
+      const url: string = await Plotly.toImage(gd, {
+        format: 'png',
+        width: 1000,
+        height: 480,
+        scale: 2,
+      });
+      const a = document.createElement('a');
+      a.download = 'eda_plot.png';
+      a.href = url;
+      a.click();
+    } catch (e) {
+      console.error('EDA export failed:', e);
+    } finally {
+      setSaving(false);
+    }
+  }, []);
+
   if (frames.length === 0 || variables.length === 0) {
     return (
       <div className="flex items-center justify-center h-full text-gray-600 text-sm">
@@ -105,9 +140,11 @@ export function EdaPlot({
   }
 
   return (
-    <Plot
-      data={traces}
-      layout={{
+    <div className="relative w-full h-full">
+      <Plot
+        onInitialized={(_, gd) => { gdRef.current = gd as HTMLDivElement; }}
+        data={traces}
+        layout={{
         paper_bgcolor: 'transparent',
         plot_bgcolor: '#0d1117',
         font: { color: '#9ca3af', family: 'monospace', size: 11 },
@@ -132,6 +169,18 @@ export function EdaPlot({
       config={{ displayModeBar: false, responsive: true }}
       style={{ width: '100%', height: '100%' }}
       useResizeHandler
-    />
+      />
+      <button
+        onClick={handleExport}
+        disabled={saving}
+        className="absolute top-1 right-2 flex items-center gap-1 px-1.5 py-0.5 rounded
+                   bg-gray-800/80 hover:bg-gray-700 text-gray-400 hover:text-gray-200
+                   text-[10px] transition-colors disabled:opacity-40 z-10"
+        title="Export as PNG"
+      >
+        <Download size={10} />
+        {saving ? 'Saving…' : 'PNG'}
+      </button>
+    </div>
   );
 }

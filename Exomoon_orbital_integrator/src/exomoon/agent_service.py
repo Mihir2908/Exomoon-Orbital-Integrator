@@ -16,6 +16,7 @@ import botocore
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from exomoon.params import SystemParams
@@ -23,7 +24,18 @@ from exomoon.constants import FOUR_PI2, merth, msun
 from exomoon.eda import unpack_sim, traj_to_frame, to_csv_bytes, pack_sim
 from exomoon.simulation import run_simulation, run_simulation_for_years
 from exomoon.exoplanet_archive import fetch_system_by_planet
-from exomoon.mcp_server import env_info, dash_url, export_csv, eda_plot
+# Import the FunctionTool wrappers and unwrap to raw callables via .fn
+# (fastmcp @mcp.tool() returns FunctionTool objects, not plain functions)
+from exomoon.mcp_server import (
+    env_info  as _mcp_env_info,
+    dash_url  as _mcp_dash_url,
+    export_csv as _mcp_export_csv,
+    eda_plot  as _mcp_eda_plot,
+)
+env_info   = getattr(_mcp_env_info,   'fn', _mcp_env_info)
+_dash_url  = getattr(_mcp_dash_url,   'fn', _mcp_dash_url)
+_mcp_export_csv_fn = getattr(_mcp_export_csv, 'fn', _mcp_export_csv)
+_mcp_eda_plot_fn   = getattr(_mcp_eda_plot,   'fn', _mcp_eda_plot)
 
 # NEW: Claude SDK
 try:
@@ -56,6 +68,11 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Serve static outputs (EDA PNGs, animation.html) at GET /outputs/<filename>
+_OUTPUTS_DIR = pathlib.Path("outputs")
+_OUTPUTS_DIR.mkdir(exist_ok=True)
+app.mount("/outputs", StaticFiles(directory=str(_OUTPUTS_DIR)), name="outputs")
 
 AWS_ENABLED = os.getenv("AWS_ENABLED", "0") == "1"
 BUCKET = os.getenv("EXOMOON_BUCKET")
@@ -110,7 +127,10 @@ class SessionCache:
         self.last_output_prefix: Optional[str] = None
         self.cached_simdata: Optional[str] = None
         self.cached_params: Dict[str, Any] = {}
-    
+        self.last_animation_url: Optional[str] = None
+        self.last_ml_prediction: Optional[Dict[str, Any]] = None
+        self._ml_fresh: bool = False  # True only for the turn in which ml_predict was called
+
     def update_job(self, job_id: str, output_prefix: str):
         """Called when a new job is started."""
         self.last_job_id = job_id
@@ -223,6 +243,7 @@ class ChatRequest(BaseModel):
     params: Dict[str, Any] = Field(default_factory=dict)
     years: Optional[float] = None
     escape_factor: float = 1.0
+    ml_prediction: Optional[Dict[str, Any]] = None  # summary from frontend ML predictor (no full arrays)
 
 
 class StabilityRequest(BaseModel):
@@ -537,6 +558,95 @@ def _tool_specs() -> list[dict]:
                 "required": ["t_start", "t_end", "step"],
             },
         },
+        {
+            "name": "env_info",
+            "description": "Debug: get Python interpreter path and module resolution info. Use when diagnosing import or environment issues.",
+            "input_schema": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+            },
+        },
+        {
+            "name": "dash_url",
+            "description": "Build a Dash UI URL encoding the current simulation parameters as a query string. Useful when the user asks to share or bookmark a configuration.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "planet": {"type": "string", "description": "Planet name to include in the URL (optional)"},
+                    "autorun": {"type": "boolean", "description": "Add run=1 so Dash auto-starts simulation on load (default false)"},
+                },
+                "required": [],
+            },
+        },
+        {
+            "name": "eda_plot",
+            "description": "Generate an EDA time-series plot from the current simulation data. Returns the path to a saved HTML figure. Use when the user asks to visualise distances, speeds, or positions over time.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "variables": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Variables to plot (e.g. ['moon_planet_dist', 'planet_star_dist', 'moon_speed']). Omit to use defaults."
+                    },
+                    "plot_type": {"type": "string", "description": "'line' or 'scatter' (default 'line')"},
+                    "normalize": {"type": "boolean", "description": "Normalise all series to max=1 for multi-variable comparison (default false)"},
+                },
+                "required": [],
+            },
+        },
+        {
+            "name": "ml_predict",
+            "description": "Run ML stability-habitability prediction: sweeps a moon mass × semi-major axis grid and returns valid stable+habitable orbit ranges. Requires a trained model. Use when the user asks about optimal moon parameters or ML-predicted stability.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "t_sim": {"type": "number", "description": "Prediction horizon in simulated years (default 10)"},
+                    "mm_resolution": {"type": "integer", "description": "Moon mass grid points (default 50)"},
+                    "am_resolution": {"type": "integer", "description": "Moon orbit grid points (default 50)"},
+                },
+                "required": [],
+            },
+        },
+        {
+            "name": "ml_train",
+            "description": "Start training the ML stability predictor model in the background. Returns immediately with a job_id. Use when the user asks to train or retrain the ML model.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "data_path": {"type": "string", "description": "Path to ml_dataset.parquet training file (required)"},
+                    "epochs": {"type": "integer", "description": "Training epochs (default 30)"},
+                    "batch_size": {"type": "integer", "description": "Batch size (default 64)"},
+                    "lr": {"type": "number", "description": "Learning rate (default 0.001)"},
+                    "hidden": {"type": "integer", "description": "GRU hidden size (default 256)"},
+                    "layers": {"type": "integer", "description": "Number of GRU layers (default 2)"},
+                    "rnn_type": {"type": "string", "description": "'gru' or 'lstm' (default 'gru')"},
+                },
+                "required": ["data_path"],
+            },
+        },
+        {
+            "name": "ml_plot",
+            "description": (
+                "Generate a PNG plot for ML model results. "
+                "plot_type options: "
+                "'loss_curves' — training + validation loss over epochs from training_history.json; "
+                "'flag_accuracy' — stable/habitable flag accuracy over epochs from training_history.json; "
+                "'heatmap' — 50×50 moon mass × orbit stability map from the last ML prediction. "
+                "Use when the user asks to visualise ML model performance or the stability heatmap."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "plot_type": {
+                        "type": "string",
+                        "description": "'loss_curves', 'flag_accuracy', or 'heatmap'",
+                    },
+                },
+                "required": ["plot_type"],
+            },
+        },
     ]
 
 
@@ -647,8 +757,7 @@ def _execute_tool(tool_name: str, tool_input: Dict[str, Any], req: ChatRequest) 
                 print(f"[TOOL] export_csv using simdata with columns={columns}", flush=True)
                 sim = unpack_sim(simdata_to_use)
                 
-                # Build frame from unpacked simdata
-                from exomoon.eda import traj_to_frame, to_csv_bytes
+                # Build frame from unpacked simdata (traj_to_frame imported at module level)
                 frame = traj_to_frame(sim)
                 
                 # Filter columns if requested
@@ -715,7 +824,10 @@ def _execute_tool(tool_name: str, tool_input: Dict[str, Any], req: ChatRequest) 
                     result_payload["download_url"] = download_url
                     result_payload["message"] += f" [Download CSV]({download_url})"
                 else:
+                    local_csv_url = f"{_LOCAL_AGENT_BASE}/outputs/{fname}"
+                    result_payload["download_url"] = local_csv_url
                     result_payload["csv_path"] = str(fpath.resolve())
+                    result_payload["message"] += f" [Download CSV]({local_csv_url})"
                 return result_payload
             except Exception as e:
                 print(f"[TOOL] export_csv error: {e}", flush=True)
@@ -723,6 +835,357 @@ def _execute_tool(tool_name: str, tool_input: Dict[str, Any], req: ChatRequest) 
                 print(traceback.format_exc(), flush=True)
                 return {"ok": False, "message": f"Export failed: {str(e)}"}
 
+
+        if tool_name == "get_trajectory_range":
+            t_start = float(tool_input.get("t_start", 0))
+            t_end_q = float(tool_input.get("t_end", req.years or 10))
+            step    = float(tool_input.get("step", 1.0))
+
+            simdata_to_use = req.simdata
+            if not simdata_to_use:
+                cached_sim, _ = _session.get_cached()
+                if cached_sim:
+                    simdata_to_use = cached_sim
+
+            if not simdata_to_use:
+                return {"ok": False, "message": "No simulation data available. Run a simulation first."}
+
+            sim   = unpack_sim(simdata_to_use)
+            t_end_actual = float(sim["t_end"])
+            dt    = float(sim["dt"])
+            times = np.arange(t_start, min(t_end_q, t_end_actual) + step * 0.5, step)
+            snapshots = []
+            for t in times:
+                snap = _get_trajectory_at_time(simdata_to_use, req.params, float(t))
+                if snap.get("ok"):
+                    snapshots.append(snap)
+            _session.set_simdata(simdata_to_use, req.params)
+            return {"ok": True, "snapshots": snapshots, "count": len(snapshots), "dt": dt}
+
+        if tool_name == "env_info":
+            return env_info()
+
+        if tool_name == "dash_url":
+            planet  = tool_input.get("planet")
+            autorun = bool(tool_input.get("autorun", False))
+            base    = tool_input.get("base", os.getenv("DASH_URL", "http://127.0.0.1:8050/"))
+            return _dash_url(params=req.params, planet=planet, autorun=autorun, base=base)
+
+        if tool_name == "eda_plot":
+            variables = tool_input.get("variables")
+            plot_type = tool_input.get("plot_type", "line")
+            normalize = bool(tool_input.get("normalize", False))
+
+            simdata_to_use = req.simdata
+            if not simdata_to_use:
+                cached_sim, _ = _session.get_cached()
+                if cached_sim:
+                    simdata_to_use = cached_sim
+
+            if not simdata_to_use:
+                return {"ok": False, "message": "No simulation data available. Run a simulation first."}
+
+            try:
+                import matplotlib
+                matplotlib.use("Agg")  # non-interactive — safe in server context
+                import matplotlib.pyplot as _plt
+                from exomoon.eda import var_info as _var_info
+
+                sim   = unpack_sim(simdata_to_use)
+                frame = traj_to_frame(sim)
+                cols  = frame.columns.tolist() if hasattr(frame, "columns") else list(frame.keys())
+
+                var_list = variables if isinstance(variables, list) else (
+                    [variables] if isinstance(variables, str) and variables else None
+                )
+                if not var_list:
+                    defaults = [c for c in ("moon_planet_dist", "planet_star_dist", "moon_speed", "planet_speed") if c in cols]
+                    var_list = defaults if defaults else [c for c in cols if c != "t_years"][:3]
+                var_list = [v for v in var_list if v in cols]
+                if not var_list:
+                    return {"ok": False, "message": "No valid variables.", "available": cols}
+
+                t     = frame["t_years"] if hasattr(frame, "__getitem__") else frame.get("t_years")
+                t_arr = t.to_numpy() if hasattr(t, "to_numpy") else np.asarray(t)
+
+                # Build matplotlib figure (PNG — renders inline in chat)
+                mfig, ax = _plt.subplots(figsize=(10, 4), facecolor="#1a1a2e")
+                ax.set_facecolor("#0f0f1a")
+                ax.tick_params(colors="#9ca3af")
+                ax.xaxis.label.set_color("#9ca3af")
+                ax.yaxis.label.set_color("#9ca3af")
+                ax.title.set_color("#e5e7eb")
+                for spine in ax.spines.values():
+                    spine.set_edgecolor("#374151")
+
+                _COLORS = ["#60a5fa", "#34d399", "#f87171", "#fbbf24", "#a78bfa", "#fb923c"]
+                for _i, v in enumerate(var_list):
+                    y = frame[v] if hasattr(frame, "__getitem__") else frame.get(v)
+                    y_arr = y.to_numpy() if hasattr(y, "to_numpy") else np.asarray(y, dtype=float)
+                    if normalize:
+                        m = float(np.max(np.abs(y_arr))) if len(y_arr) else 1.0
+                        if m != 0.0:
+                            y_arr = y_arr / m
+                    lbl, unit = _var_info(v)
+                    full_lbl = f"{lbl} ({unit})" if unit else lbl
+                    if normalize:
+                        full_lbl += " (norm)"
+                    if plot_type == "scatter":
+                        ax.scatter(t_arr, y_arr, label=full_lbl, s=2, color=_COLORS[_i % len(_COLORS)])
+                    else:
+                        ax.plot(t_arr, y_arr, label=full_lbl, linewidth=1.2, color=_COLORS[_i % len(_COLORS)])
+
+                ax.set_xlabel("Time (years)")
+                ax.set_ylabel("Value (normalized)" if normalize else "Value")
+                years_lbl = int(sim.get("t_end", 0))
+                ax.set_title(f"EDA — {years_lbl}-year simulation")
+                ax.legend(fontsize=8, framealpha=0.3, labelcolor="white")
+                ax.grid(True, alpha=0.2, color="#374151")
+                mfig.tight_layout(pad=0.5)
+
+                _OUTPUTS_DIR.mkdir(exist_ok=True)
+                fname = f"exomoon_eda_{years_lbl}y.png"
+                fpath = _OUTPUTS_DIR / fname
+                # ── HZ overlay ────────────────────────────────────────────────
+                a_inner = sim.get("a_inner_au")
+                a_outer = sim.get("a_outer_au")
+                dist_vars = {"planet_star_dist", "moon_star_dist"}
+                if a_inner and a_outer and any(v in dist_vars for v in var_list):
+                    if normalize:
+                        # pick the first distance variable's scale for normalization
+                        _dv = next(v for v in var_list if v in dist_vars)
+                        _dy = np.asarray(frame[_dv], dtype=float)
+                        _dy_mn, _dy_mx = float(_dy.min()), float(_dy.max())
+                        _dy_span = _dy_mx - _dy_mn or 1.0
+                        _hz_lo = (a_inner - _dy_mn) / _dy_span
+                        _hz_hi = (a_outer - _dy_mn) / _dy_span
+                    else:
+                        _hz_lo, _hz_hi = float(a_inner), float(a_outer)
+                    ax.axhspan(_hz_lo, _hz_hi, alpha=0.10, color="#22c55e", zorder=0)
+                    ax.axhline(_hz_lo, color="#22c55e", linewidth=0.6, linestyle="--", alpha=0.5, label="HZ inner")
+                    ax.axhline(_hz_hi, color="#22c55e", linewidth=0.6, linestyle="--", alpha=0.5, label="HZ outer")
+                    ax.legend(fontsize=8, framealpha=0.3, labelcolor="white")
+
+                mfig.savefig(str(fpath), dpi=130, bbox_inches="tight",
+                             facecolor=mfig.get_facecolor())
+                _plt.close(mfig)
+
+                image_url = f"{_LOCAL_AGENT_BASE}/outputs/{fname}"
+                _session.set_simdata(simdata_to_use, req.params)
+                return {
+                    "ok": True,
+                    "figure_url":     image_url,
+                    "figure_path":    str(fpath.resolve()),
+                    "variables_used": var_list,
+                }
+            except Exception as e:
+                print(f"[TOOL] eda_plot error: {e}", flush=True)
+                import traceback as _tb; print(_tb.format_exc(), flush=True)
+                return {"ok": False, "message": f"EDA plot failed: {str(e)}"}
+
+        if tool_name == "ml_predict":
+            try:
+                from exomoon.ml.inference import predict_stability_map as _predict_map
+
+                raw_params = req.params or {}
+                system_params = {
+                    "ms_solar": float(raw_params.get("ms_solar", 1.0)),
+                    "rs_solar": float(raw_params.get("rs_solar", 1.0)),
+                    "Ts":       float(raw_params.get("Ts",       5772.0)),
+                    "mp_earth": float(raw_params.get("mp_earth", 1.0)),
+                    "dp_cgs":   float(raw_params.get("dp_cgs",   5.5)),
+                    "ap_AU":    float(raw_params.get("ap_AU",    1.0)),
+                    "ep":       float(raw_params.get("ep",       0.0)),
+                }
+                t_sim        = float(tool_input.get("t_sim",         req.years or 10.0))
+                mm_res       = int(tool_input.get("mm_resolution",   50))
+                am_res       = int(tool_input.get("am_resolution",   50))
+                moon_retro   = bool(raw_params.get("moon_retrograde", False))
+                em           = float(raw_params.get("em",            0.0))
+
+                result = _predict_map(
+                    system_params   = system_params,
+                    t_sim           = t_sim,
+                    moon_retrograde = moon_retro,
+                    em              = em,
+                    mm_resolution   = mm_res,
+                    am_resolution   = am_res,
+                    model_dir       = ML_MODEL_DIR,
+                )
+                if not result.get("ok"):
+                    return result
+
+                # Cache full prediction in session so it can be sent to frontend via done event
+                _session.last_ml_prediction = result
+                _session._ml_fresh = True
+
+                valid_mm        = result.get("valid_mm_range")
+                valid_am_per_mm = result.get("valid_am_per_mm", [])
+                mm_grid         = result.get("mm_grid", [])
+                am_grid         = result.get("am_grid", [])
+                n_valid         = sum(1 for am in valid_am_per_mm if am is not None)
+
+                # Return text summary only — full arrays are NOT sent to Claude (too large)
+                return {
+                    "ok": True,
+                    "valid_mm_range_earth":  valid_mm,
+                    "n_valid_mass_bins":     n_valid,
+                    "total_mass_bins":       mm_res,
+                    "mm_grid_range":         [round(mm_grid[0], 4), round(mm_grid[-1], 4)] if mm_grid else None,
+                    "am_grid_range":         [round(am_grid[0], 4), round(am_grid[-1], 4)] if am_grid else None,
+                    "message": (
+                        f"ML prediction complete. {n_valid}/{mm_res} mass bins have stable+habitable orbits. "
+                        f"Valid mass range: {valid_mm[0]:.4f}–{valid_mm[1]:.4f} M⊕ "
+                        f"(grid: {mm_grid[0]:.4f}–{mm_grid[-1]:.4f} M⊕). "
+                        f"Moon orbit grid spans {am_grid[0]:.3f}–{am_grid[-1]:.3f} Hill radii."
+                        if valid_mm else
+                        f"ML prediction complete. No stable+habitable orbits found in the {mm_res}×{am_res} grid. "
+                        "Consider adjusting system parameters or training the model on more data."
+                    ),
+                }
+            except Exception as e:
+                return {"ok": False, "message": f"ML prediction failed: {str(e)}"}
+
+        if tool_name == "ml_train":
+            global _train_job
+            if _train_job.get("status") == "running":
+                return {"ok": False, "error": "already_training",
+                        "message": "A training job is already running. Wait for it to complete."}
+            data_path = str(tool_input.get("data_path", "")).strip()
+            if not data_path:
+                return {"ok": False, "message": "'data_path' is required for ml_train (path to ml_dataset.parquet)."}
+            train_req = MlTrainRequest(
+                data_path  = data_path,
+                out_dir    = tool_input.get("out_dir"),
+                epochs     = int(tool_input.get("epochs",     30)),
+                batch_size = int(tool_input.get("batch_size", 64)),
+                lr         = float(tool_input.get("lr",       1e-3)),
+                hidden     = int(tool_input.get("hidden",     256)),
+                layers     = int(tool_input.get("layers",     2)),
+                rnn_type   = str(tool_input.get("rnn_type",   "gru")),
+            )
+            job_id = f"train-{uuid.uuid4().hex[:8]}"
+            _train_job = {
+                "job_id": job_id, "status": "running",
+                "epoch": 0, "total_epochs": train_req.epochs,
+                "train_loss": None, "val_loss": None,
+            }
+            threading.Thread(target=_run_training_thread, args=(train_req,), daemon=True).start()
+            print(f"[ML-TOOL] Training job {job_id} started via Claude tool call", flush=True)
+            return {
+                "ok": True, "job_id": job_id, "status": "started",
+                "message": f"Training started (job_id={job_id}). Poll /ml/train/status for progress.",
+            }
+
+        if tool_name == "ml_plot":
+            import matplotlib
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as _plt
+
+            plot_type = str(tool_input.get("plot_type", "loss_curves")).strip().lower()
+            _OUTPUTS_DIR.mkdir(exist_ok=True)
+
+            try:
+                if plot_type in ("loss_curves", "flag_accuracy"):
+                    hist_path = pathlib.Path(ML_MODEL_DIR) / "training_history.json"
+                    if not hist_path.exists():
+                        return {"ok": False, "message": "No training_history.json found. Train the model first via ml_train."}
+                    import json as _json
+                    with open(hist_path) as _fh:
+                        hist = _json.load(_fh)
+
+                    mfig, ax = _plt.subplots(figsize=(9, 4), facecolor="#1a1a2e")
+                    ax.set_facecolor("#0f0f1a")
+                    ax.tick_params(colors="#9ca3af"); ax.xaxis.label.set_color("#9ca3af"); ax.yaxis.label.set_color("#9ca3af")
+                    for spine in ax.spines.values(): spine.set_edgecolor("#374151")
+
+                    epochs_arr = list(range(1, len(hist.get("train_loss", [])) + 1))
+
+                    if plot_type == "loss_curves":
+                        train_l = hist.get("train_loss", [])
+                        val_l   = hist.get("val_loss", [])
+                        if train_l: ax.plot(epochs_arr[:len(train_l)], train_l, color="#60a5fa", linewidth=1.5, label="Train loss")
+                        if val_l:   ax.plot(epochs_arr[:len(val_l)],   val_l,   color="#34d399", linewidth=1.5, label="Val loss")
+                        ax.set_xlabel("Epoch", color="#9ca3af")
+                        ax.set_ylabel("Loss", color="#9ca3af")
+                        ax.set_title("Training & Validation Loss", color="#e5e7eb")
+                        fname = "ml_loss_curves.png"
+                    else:
+                        flag_acc_train = hist.get("flag_accuracy_train", [])
+                        flag_acc_val   = hist.get("flag_accuracy", [])
+                        if flag_acc_train:
+                            ax.plot(epochs_arr[:len(flag_acc_train)], flag_acc_train,
+                                    color="#60a5fa", linewidth=1.5, label="Train acc")
+                        if flag_acc_val:
+                            ax.plot(epochs_arr[:len(flag_acc_val)], flag_acc_val,
+                                    color="#a78bfa", linewidth=1.5, linestyle="--", label="Val acc")
+                        ax.set_xlabel("Epoch", color="#9ca3af")
+                        ax.set_ylabel("Accuracy", color="#9ca3af")
+                        ax.set_title("Stable/Habitable Flag Accuracy", color="#e5e7eb")
+                        fname = "ml_flag_accuracy.png"
+
+                    ax.legend(fontsize=9, framealpha=0.3, labelcolor="white")
+                    ax.grid(True, color="#1f2937", linewidth=0.5, linestyle="--")
+                    mfig.tight_layout()
+                    fpath = _OUTPUTS_DIR / fname
+                    mfig.savefig(str(fpath), dpi=130, bbox_inches="tight", facecolor=mfig.get_facecolor())
+                    _plt.close(mfig)
+
+                elif plot_type == "heatmap":
+                    pred = _session.last_ml_prediction
+                    if not pred or not pred.get("ok"):
+                        return {"ok": False, "message": "No ML prediction available. Run ml_predict first."}
+
+                    mm_grid = pred.get("mm_grid", [])
+                    am_grid = pred.get("am_grid", [])
+                    map_both = pred.get("map_both", [])
+
+                    if not mm_grid or not am_grid or not map_both:
+                        return {"ok": False, "message": "ML prediction data is incomplete."}
+
+                    import numpy as _np
+                    _arr = _np.array(map_both, dtype=float)  # [mm_res][am_res]
+
+                    mfig, ax = _plt.subplots(figsize=(8, 6), facecolor="#1a1a2e")
+                    ax.set_facecolor("#0f0f1a")
+                    ax.tick_params(colors="#9ca3af"); ax.xaxis.label.set_color("#9ca3af"); ax.yaxis.label.set_color("#9ca3af")
+                    for spine in ax.spines.values(): spine.set_edgecolor("#374151")
+
+                    _im = ax.imshow(
+                        _arr.T,
+                        origin="lower",
+                        aspect="auto",
+                        extent=[mm_grid[0], mm_grid[-1], am_grid[0], am_grid[-1]],
+                        cmap="YlGn",
+                        vmin=0, vmax=1,
+                    )
+                    _cb = mfig.colorbar(_im, ax=ax, fraction=0.03, pad=0.04)
+                    _cb.ax.yaxis.label.set_color("#9ca3af"); _cb.ax.tick_params(colors="#9ca3af")
+                    _cb.set_label("Stable + Habitable", color="#9ca3af")
+                    ax.set_xlabel("Moon Mass (M⊕, log scale)")
+                    ax.set_xscale("log")
+                    ax.set_ylabel("Moon Semi-Major Axis (Hill radii)")
+                    ax.set_title("ML Stability–Habitability Map (50×50)", color="#e5e7eb")
+                    mfig.tight_layout()
+                    fname = "ml_heatmap.png"
+                    fpath = _OUTPUTS_DIR / fname
+                    mfig.savefig(str(fpath), dpi=130, bbox_inches="tight", facecolor=mfig.get_facecolor())
+                    _plt.close(mfig)
+
+                else:
+                    return {"ok": False, "message": f"Unknown plot_type '{plot_type}'. Use 'loss_curves', 'flag_accuracy', or 'heatmap'."}
+
+                image_url = f"{_LOCAL_AGENT_BASE}/outputs/{fname}"
+                return {
+                    "ok": True,
+                    "figure_url": image_url,
+                    "figure_path": str(fpath.resolve()),
+                    "plot_type": plot_type,
+                }
+            except Exception as e:
+                print(f"[TOOL] ml_plot error: {e}", flush=True)
+                import traceback as _tb2; print(_tb2.format_exc(), flush=True)
+                return {"ok": False, "message": f"ml_plot failed: {str(e)}"}
 
         return {"ok": False, "message": f"Unknown tool: {tool_name}"}
     except Exception as e:
@@ -929,13 +1392,80 @@ def _chat_with_claude(req: ChatRequest) -> Dict[str, Any]:
         except Exception as _e:
             print(f"[AGENT] Could not compute derived params: {_e}", flush=True)
 
+    # Lazy-resolve animation URL so Claude can return it when asked
+    if not _session.last_animation_url:
+        if AWS_ENABLED and s3 and BUCKET and _session.last_job_id:
+            try:
+                anim_key = f"outputs/{_session.last_job_id}/animation.html"
+                _session.last_animation_url = s3.generate_presigned_url(
+                    "get_object",
+                    Params={"Bucket": BUCKET, "Key": anim_key},
+                    ExpiresIn=86400,
+                )
+                print(f"[AGENT] Lazy-resolved animation URL for {_session.last_job_id}", flush=True)
+            except Exception:
+                pass
+        elif not AWS_ENABLED and _session.cached_simdata:
+            # Generate animation.html locally from cached simdata and serve via static endpoint
+            try:
+                from exomoon.plotting.anim import build_animation as _build_anim
+                _sim = unpack_sim(_session.cached_simdata)
+                _traj = _sim["traj"]
+                _fig = _build_anim(
+                    _traj,
+                    _sim.get("a_inner_au", 0.95),
+                    _sim.get("a_outer_au", 1.37),
+                    open_in_browser=False,
+                    dt=_sim.get("dt"),
+                    t_end=_sim.get("t_end"),
+                )
+                _OUTPUTS_DIR.mkdir(exist_ok=True)
+                _anim_path = _OUTPUTS_DIR / "animation.html"
+                _fig.write_html(str(_anim_path), include_plotlyjs="cdn", full_html=True)
+                _session.last_animation_url = f"{_LOCAL_AGENT_BASE}/outputs/animation.html"
+                print(f"[AGENT] Generated local animation.html", flush=True)
+            except Exception as _ae:
+                print(f"[AGENT] Could not generate local animation: {_ae}", flush=True)
+
+    # Summarise any existing ML prediction for Claude (don't send full arrays)
+    ml_pred_summary: Optional[Dict[str, Any]] = None
+    if req.ml_prediction:
+        try:
+            p = req.ml_prediction
+            n_v = sum(1 for a in (p.get("valid_am_per_mm") or []) if a is not None)
+            ml_pred_summary = {
+                "available":        True,
+                "n_valid_mass_bins": n_v,
+                "valid_mm_range":   p.get("valid_mm_range"),
+                "mm_grid_range":    [p["mm_grid"][0], p["mm_grid"][-1]] if p.get("mm_grid") else None,
+                "am_grid_range":    [p["am_grid"][0], p["am_grid"][-1]] if p.get("am_grid") else None,
+            }
+        except Exception:
+            ml_pred_summary = {"available": True}
+    elif _session.last_ml_prediction:
+        try:
+            p = _session.last_ml_prediction
+            n_v = sum(1 for a in (p.get("valid_am_per_mm") or []) if a is not None)
+            ml_pred_summary = {
+                "available":        True,
+                "source":           "agent_run",
+                "n_valid_mass_bins": n_v,
+                "valid_mm_range":   p.get("valid_mm_range"),
+                "mm_grid_range":    [p["mm_grid"][0], p["mm_grid"][-1]] if p.get("mm_grid") else None,
+                "am_grid_range":    [p["am_grid"][0], p["am_grid"][-1]] if p.get("am_grid") else None,
+            }
+        except Exception:
+            ml_pred_summary = {"available": True, "source": "agent_run"}
+
     ctx = {
-        "has_simdata":  bool(effective_simdata),
-        "years_hint":   req.years,
-        "escape_factor": req.escape_factor,
-        "aws_enabled":  AWS_ENABLED,
-        "params":       raw_params,   # all configured system parameters
-        "derived":      derived,      # pre-computed habitability quantities
+        "has_simdata":    bool(effective_simdata),
+        "years_hint":     req.years,
+        "escape_factor":  req.escape_factor,
+        "aws_enabled":    AWS_ENABLED,
+        "params":         raw_params,
+        "derived":        derived,
+        "ml_prediction":  ml_pred_summary,
+        "animation_url":  _session.last_animation_url,
     }
 
     system_prompt = (
@@ -983,7 +1513,22 @@ def _chat_with_claude(req: ChatRequest) -> Dict[str, Any]:
         "## Tool usage\n"
         "- Stability queries: use `stability_from_simdata` if simdata available; otherwise call `start_backend_job`.\n"
         "- Trajectory at specific times: call `get_trajectory_at_time()` (multiple calls allowed).\n"
+        "- Trajectory over a range: call `get_trajectory_range(t_start, t_end, step)` for time-series snapshots.\n"
         "- CSV exports: call `export_csv` — returns a presigned URL; include as `[Download CSV](url)` in response.\n"
+        "- EDA plots: call `eda_plot(variables, plot_type, normalize)` to generate a PNG time-series figure. "
+        "When the tool returns `figure_url`, embed the image inline in your response as `![EDA Plot](figure_url)` "
+        "AND include a download link `[Download PNG](figure_url)` on the next line.\n"
+        "- Dash URL: call `dash_url(planet, autorun)` to generate a shareable URL encoding current system parameters.\n"
+        "- Environment debug: call `env_info()` when diagnosing Python import or module path issues.\n"
+        "- ML stability map: call `ml_predict(t_sim, mm_resolution, am_resolution)` to run GRU stability sweep (requires trained model).\n"
+        "- ML training: call `ml_train(data_path, epochs, ...)` to start background model training.\n"
+        "- ML plots: call `ml_plot(plot_type)` to generate a PNG. "
+        "plot_type='loss_curves' → training/val loss curves; "
+        "plot_type='flag_accuracy' → stable/habitable flag accuracy over epochs; "
+        "plot_type='heatmap' → 50×50 stability map from last ml_predict run. "
+        "Embed the returned `figure_url` as `![ML Plot](figure_url)` AND `[Download PNG](figure_url)` on the next line.\n"
+        "- If `context.ml_prediction` is set, you already have ML prediction results — answer questions about valid mass/orbit ranges directly from that summary without calling `ml_predict` again.\n"
+        "- Animation: if `context.animation_url` is set and the user asks for the animation, return `[Download Animation](url)` as a link. Do NOT call any tool for this — the URL is already in context.\n"
         "- Do NOT ask the user to run simulations manually — trigger them yourself.\n\n"
 
         "## Unit conversions\n"
@@ -1062,6 +1607,12 @@ def _chat_with_claude(req: ChatRequest) -> Dict[str, Any]:
                     if final_attempt:
                         result["simdata"] = final_attempt
                         print(f"[AGENT] Returning retrieved simdata ({len(final_attempt)} chars)", flush=True)
+
+                # Include ML prediction result only when ml_predict was called this turn
+                if _session._ml_fresh and _session.last_ml_prediction:
+                    result["ml_prediction"] = _session.last_ml_prediction
+                    _session._ml_fresh = False  # consume — won't re-send on next turn
+
                 return result
 
 
@@ -1107,19 +1658,19 @@ def tool_env_info():
 @app.post("/tool/dash_url")
 def tool_dash_url(req: ToolRequest):
     """Generate Dash UI URL with query params (for sharing sim configs)."""
-    return dash_url(params=req.params, autorun=False)
+    return _dash_url(params=req.params, autorun=False)
 
 
 @app.post("/tool/export_csv")
 def tool_export_csv(req: ToolRequest):
     """Export trajectory as CSV (fast if using cached simdata)."""
-    return export_csv(params=req.params, years=req.years, columns=req.columns)
+    return _mcp_export_csv_fn(params=req.params, years=req.years, columns=req.columns)
 
 
 @app.post("/tool/eda_plot")
 def tool_eda_plot(req: ToolRequest):
     """Generate EDA time-series plot (positions, distances, speeds)."""
-    return eda_plot(
+    return _mcp_eda_plot_fn(
         params=req.params,
         years=req.years,
         variables=req.variables,
@@ -1201,12 +1752,13 @@ def chat_stream(req: ChatRequest):
         # Token-by-token streaming of the markdown response
         for tok in text.split(" "):
             yield f"data: {json.dumps({'type': 'token', 'token': tok + ' '})}\n\n"
-        # Done event — carries simdata + presigned URLs for the frontend to cache
+        # Done event — carries simdata, presigned URLs, and ML prediction for the frontend to cache
         done_evt = {
-            "type": "done",
-            "simdata": result.get("simdata"),
-            "urls": result.get("urls", {}),
-            "job_id": result.get("job_id"),
+            "type":          "done",
+            "simdata":       result.get("simdata"),
+            "urls":          result.get("urls", {}),
+            "job_id":        result.get("job_id"),
+            "ml_prediction": result.get("ml_prediction"),
         }
         yield f"data: {json.dumps(done_evt)}\n\n"
 
@@ -1393,7 +1945,20 @@ def retrieve_job_simdata(job_id: str):
         # Cache the simdata in session
         _session.set_simdata(simdata, params or {})
         print(f"[JOB-RETRIEVE] Cached simdata for {job_id} in session", flush=True)
-        
+
+        # Generate presigned URL for animation.html so Claude can surface it in chat
+        if s3 and BUCKET:
+            try:
+                anim_key = f"{output_prefix}/animation.html"
+                _session.last_animation_url = s3.generate_presigned_url(
+                    "get_object",
+                    Params={"Bucket": BUCKET, "Key": anim_key},
+                    ExpiresIn=86400,
+                )
+                print(f"[JOB-RETRIEVE] Cached animation URL for {job_id}", flush=True)
+            except Exception as _ae:
+                print(f"[JOB-RETRIEVE] Could not generate animation URL: {_ae}", flush=True)
+
         return {
             "ok": True,
             "job_id": job_id,
@@ -1510,5 +2075,205 @@ def _format_claude_response(text: str) -> str:
     
     # Add blank lines between logical sections (lines starting with •)
     text = re.sub(r'\n([^•])', r'\n\n\1', text)
-    
+
     return text.strip()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ML endpoints — /ml/predict, /ml/train, /ml/train/status, /ml/train/history
+# All bypass the Claude tool loop and are called directly from the frontend.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Default model directory — override with ML_MODEL_DIR env var
+ML_MODEL_DIR = os.getenv("ML_MODEL_DIR", os.path.join(os.path.dirname(__file__), "..", "models"))
+ML_MODEL_DIR = os.path.abspath(ML_MODEL_DIR)
+
+# Lazy-loaded model: populated on first /ml/predict call, reloaded after training
+_ml_model      = None
+_ml_model_lock = threading.Lock()
+
+# Training job state (single training job at a time)
+_train_job: Dict[str, Any] = {}
+
+
+class MlPredictRequest(BaseModel):
+    system_params:   Dict[str, Any]       # ms_solar, rs_solar, Ts, mp_earth, ap_AU, ep
+    t_sim:           float   = 10.0
+    moon_retrograde: bool    = False
+    em:              float   = 0.0
+    mm_resolution:   int     = 50
+    am_resolution:   int     = 50
+
+
+class MlTrainRequest(BaseModel):
+    data_path:  str
+    out_dir:    Optional[str]  = None     # defaults to ML_MODEL_DIR
+    epochs:     int   = 30
+    batch_size: int   = 64
+    lr:         float = 1e-3
+    hidden:     int   = 256
+    layers:     int   = 2
+    rnn_type:   str   = "gru"
+
+
+def _load_ml_model():
+    """Lazy-load the trained MoonRNN from ML_MODEL_DIR. Returns None if not found."""
+    global _ml_model
+    model_pt = os.path.join(ML_MODEL_DIR, "gru_model.pt")
+    cfg_pt   = os.path.join(ML_MODEL_DIR, "model_config.json")
+    if not (os.path.exists(model_pt) and os.path.exists(cfg_pt)):
+        return None
+    try:
+        from exomoon.ml.model import MoonRNN
+        _ml_model = MoonRNN.load(ML_MODEL_DIR)
+        print(f"[ML] Loaded model from {ML_MODEL_DIR}", flush=True)
+        return _ml_model
+    except Exception as e:
+        print(f"[ML] Failed to load model: {e}", flush=True)
+        return None
+
+
+@app.post("/ml/predict")
+def ml_predict(req: MlPredictRequest):
+    """
+    Run stability-habitability map inference over a mm_earth × am_hill grid.
+    Lazy-loads the trained MoonRNN on first call.
+    Returns {"ok": False, "error": "no_model"} if no trained model exists yet.
+    """
+    global _ml_model
+    with _ml_model_lock:
+        if _ml_model is None:
+            _ml_model = _load_ml_model()
+        if _ml_model is None:
+            return {"ok": False, "error": "no_model",
+                    "message": f"No trained model found in {ML_MODEL_DIR}. "
+                               "Train one first using the ML window."}
+
+    try:
+        from exomoon.ml.inference import predict_stability_map
+        result = predict_stability_map(
+            system_params   = req.system_params,
+            t_sim           = req.t_sim,
+            moon_retrograde = req.moon_retrograde,
+            em              = req.em,
+            mm_resolution   = req.mm_resolution,
+            am_resolution   = req.am_resolution,
+            model_dir       = ML_MODEL_DIR,
+        )
+        return result
+    except Exception as e:
+        print(f"[ML] Predict error: {e}", flush=True)
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+def _run_training_thread(req: MlTrainRequest) -> None:
+    """Background thread: run training and update _train_job dict."""
+    global _ml_model, _train_job
+    out_dir = req.out_dir or ML_MODEL_DIR
+
+    # Resolve data_path relative to src/ (same anchor as ML_MODEL_DIR) so that
+    # a bare filename like "ml_dataset.parquet" always finds the file next to
+    # run_ml_dataset.py regardless of where uvicorn was launched from.
+    _src_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    data_path = req.data_path if os.path.isabs(req.data_path) else os.path.join(_src_dir, req.data_path)
+
+    def _status_cb(epoch, total, train_loss, val_loss):
+        _train_job.update({
+            "status": "running", "epoch": epoch, "total_epochs": total,
+            "train_loss": round(train_loss, 6), "val_loss": round(val_loss, 6),
+        })
+
+    try:
+        from exomoon.ml.train import train
+        history = train(
+            data_path  = data_path,
+            out_dir    = out_dir,
+            epochs     = req.epochs,
+            batch_size = req.batch_size,
+            lr         = req.lr,
+            hidden     = req.hidden,
+            layers     = req.layers,
+            rnn_type   = req.rnn_type,
+            verbose    = True,
+            status_cb  = _status_cb,
+        )
+        _train_job.update({
+            "status": "complete",
+            "epoch": req.epochs,
+            "total_epochs": req.epochs,
+            "train_loss": history["train_loss"][-1] if history["train_loss"] else None,
+            "val_loss":   history["val_loss"][-1]   if history["val_loss"]   else None,
+        })
+        # Invalidate cached model so next /ml/predict reloads the freshly-trained weights
+        with _ml_model_lock:
+            _ml_model = None
+        print(f"[ML] Training complete. Model saved to {out_dir}", flush=True)
+    except Exception as e:
+        _train_job.update({"status": "failed", "error": str(e)})
+        print(f"[ML] Training failed: {e}", flush=True)
+        traceback.print_exc()
+
+
+@app.post("/ml/train")
+def ml_train(req: MlTrainRequest):
+    """
+    Start a background training job. Returns immediately with a job_id.
+    Only one training job runs at a time (returns error if one is already running).
+    """
+    global _train_job
+    if _train_job.get("status") == "running":
+        return {"ok": False, "error": "already_training",
+                "message": "A training job is already running. Wait for it to complete."}
+
+    job_id = f"train-{uuid.uuid4().hex[:8]}"
+    _train_job = {
+        "job_id": job_id, "status": "running",
+        "epoch": 0, "total_epochs": req.epochs,
+        "train_loss": None, "val_loss": None,
+    }
+    threading.Thread(
+        target=_run_training_thread, args=(req,), daemon=True
+    ).start()
+    print(f"[ML] Training job {job_id} started (rnn_type={req.rnn_type}, epochs={req.epochs})", flush=True)
+    return {"ok": True, "job_id": job_id, "status": "started"}
+
+
+@app.get("/ml/train/status")
+def ml_train_status():
+    """
+    Return current training progress from train_status.json (written each epoch).
+    Also includes training_history.json content if training is complete.
+    """
+    # Check in-memory state first
+    status = dict(_train_job) if _train_job else {"status": "idle"}
+
+    # Also try to read train_status.json written by the training process
+    status_file = os.path.join(ML_MODEL_DIR, "train_status.json")
+    if os.path.exists(status_file):
+        try:
+            with open(status_file) as f:
+                file_status = json.load(f)
+            # Merge: in-memory takes priority for live updates
+            status = {**file_status, **status}
+        except Exception:
+            pass
+
+    return {"ok": True, **status}
+
+
+@app.get("/ml/train/history")
+def ml_train_history():
+    """
+    Return training_history.json (loss curves, hyperparams, flag accuracy).
+    Returns {"ok": False} if no history file exists yet.
+    """
+    hist_file = os.path.join(ML_MODEL_DIR, "training_history.json")
+    if not os.path.exists(hist_file):
+        return {"ok": False, "message": "No training history found. Train a model first."}
+    try:
+        with open(hist_file) as f:
+            history = json.load(f)
+        return {"ok": True, **history}
+    except Exception as e:
+        return {"ok": False, "message": f"Error reading history: {e}"}

@@ -1,0 +1,7 @@
+{
+  "rnn_type": "gru",
+  "hidden": 256,
+  "layers": 2,
+  "system_dim": 12,
+  "state_dim": 8
+}

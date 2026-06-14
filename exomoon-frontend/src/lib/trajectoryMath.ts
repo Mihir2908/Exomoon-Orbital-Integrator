@@ -76,6 +76,7 @@ export const VAR_INFO: Record<string, VarInfo> = {
   moon_vz:          { label: 'Moon Vz',              unit: 'AU/yr' },
   moon_planet_dist: { label: 'Moon–Planet distance', unit: 'AU' },
   planet_star_dist: { label: 'Planet–Star distance', unit: 'AU' },
+  moon_star_dist:   { label: 'Moon–Star distance',   unit: 'AU' },
   moon_speed:       { label: 'Moon speed',           unit: 'AU/yr' },
   planet_speed:     { label: 'Planet speed',         unit: 'AU/yr' },
   star_speed:       { label: 'Star speed',           unit: 'AU/yr' },
@@ -89,7 +90,7 @@ export function varInfo(col: string): VarInfo {
 
 // All EDA-plottable columns (excludes t_years and rel_ columns)
 export const EDA_COLUMNS = [
-  'moon_planet_dist', 'planet_star_dist',
+  'moon_planet_dist', 'planet_star_dist', 'moon_star_dist',
   'moon_speed', 'planet_speed', 'star_speed',
   'moon_x', 'moon_y', 'moon_z',
   'planet_x', 'planet_y', 'planet_z',

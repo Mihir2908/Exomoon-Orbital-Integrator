@@ -22,6 +22,7 @@ export interface TrajectoryFrame {
   moon_vx: number; moon_vy: number; moon_vz: number;
   moon_planet_dist: number;
   planet_star_dist: number;
+  moon_star_dist?:  number;
   moon_speed: number;
   planet_speed: number;
   star_speed: number;
@@ -71,3 +72,13 @@ export interface AgentHealthResponse {
 }
 
 export type JobStatusState = 'idle' | 'running' | 'succeeded' | 'failed';
+
+export interface MlPrediction {
+  mmGrid: number[];                          // mm_earth values [M_earth], log-spaced
+  amGrid: number[];                          // am_hill values [Hill radii], linear-spaced
+  mapStable: boolean[][];                    // [mm_resolution][am_resolution] — stable throughout
+  mapHabitable: boolean[][];                 // [mm_resolution][am_resolution] — habitable throughout
+  mapBoth: boolean[][];                      // [mm_resolution][am_resolution] — stable AND habitable
+  validMmRange: [number, number] | null;     // [min_mm, max_mm] in M_earth, or null if none
+  validAmPerMm: ([number, number] | null)[]; // per-mm valid [min_am, max_am] in Hill radii
+}

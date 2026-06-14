@@ -37,6 +37,7 @@ export function parseTrajectoryCsv(
       moon_vx:          g('moon_vx'),  moon_vy:   g('moon_vy'),  moon_vz:   g('moon_vz'),
       moon_planet_dist: g('moon_planet_dist'),
       planet_star_dist: g('planet_star_dist'),
+      moon_star_dist:   colIdx['moon_star_dist'] !== undefined ? g('moon_star_dist') : undefined,
       moon_speed:       g('moon_speed'),
       planet_speed:     g('planet_speed'),
       star_speed:       g('star_speed'),

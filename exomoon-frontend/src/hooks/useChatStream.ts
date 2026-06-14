@@ -1,6 +1,7 @@
 'use client';
 import { useCallback, useRef } from 'react';
 import { useSimulationStore } from './useSimulationStore';
+import type { MlPrediction } from '@/lib/types';
 
 const AGENT_URL =
   process.env.NEXT_PUBLIC_AGENT_URL ??
@@ -9,8 +10,9 @@ const AGENT_URL =
 export function useChatStream() {
   const {
     params, simYears, simdataB64, dmCgs,
+    mlPrediction,
     addChatMessage, appendToLastAssistant, finalizeChatMessage,
-    setSimdataB64, updateJobStatus,
+    setSimdataB64, setMlPrediction, updateJobStatus,
   } = useSimulationStore();
 
   const abortRef = useRef<AbortController | null>(null);
@@ -29,12 +31,23 @@ export function useChatStream() {
     abortRef.current = new AbortController();
 
     try {
+      // Build a compact summary of the current ML prediction to send to the agent
+      // (only metadata, not the full 2500-element arrays — those stay on the frontend)
+      const mlPredSummary = mlPrediction ? {
+        valid_mm_range:   mlPrediction.validMmRange,
+        mm_grid:          mlPrediction.mmGrid,
+        am_grid:          mlPrediction.amGrid,
+        valid_am_per_mm:  mlPrediction.validAmPerMm,
+        // omit mapStable/mapHabitable/mapBoth — too large for the request body
+      } : null;
+
       const body = {
-        message: userText,
-        simdata: simdataB64,
-        params: { ...params, dm_cgs: dmCgs },  // include moon density for habitability context
-        years: simYears,
+        message:       userText,
+        simdata:       simdataB64,
+        params:        { ...params, dm_cgs: dmCgs },
+        years:         simYears,
         escape_factor: 1.0,
+        ml_prediction: mlPredSummary,
       };
 
       const response = await fetch(`${AGENT_URL}/chat/stream`, {
@@ -77,6 +90,15 @@ export function useChatStream() {
               urls?: Record<string, string>;
               status?: string;
               elapsed_seconds?: number;
+              ml_prediction?: {
+                mm_grid: number[];
+                am_grid: number[];
+                map_stable: boolean[][];
+                map_habitable: boolean[][];
+                map_both: boolean[][];
+                valid_mm_range: [number, number] | null;
+                valid_am_per_mm: ([number, number] | null)[];
+              } | null;
             };
 
             if (payload.type === 'token' && payload.token) {
@@ -86,6 +108,20 @@ export function useChatStream() {
               updateJobStatus('running', 0, {});
             } else if (payload.type === 'done') {
               if (payload.simdata) setSimdataB64(payload.simdata);
+              // If the agent ran ml_predict, populate the ML overlay with the result
+              if (payload.ml_prediction) {
+                const p = payload.ml_prediction;
+                const mlPred: MlPrediction = {
+                  mmGrid:        p.mm_grid,
+                  amGrid:        p.am_grid,
+                  mapStable:     p.map_stable,
+                  mapHabitable:  p.map_habitable,
+                  mapBoth:       p.map_both,
+                  validMmRange:  p.valid_mm_range,
+                  validAmPerMm:  p.valid_am_per_mm,
+                };
+                setMlPrediction(mlPred);
+              }
               finalizeChatMessage(assistantId);
             }
           } catch {
@@ -97,7 +133,7 @@ export function useChatStream() {
       if (err instanceof Error && err.name === 'AbortError') return;
       finalizeChatMessage(assistantId, 'Connection error. Is the agent service running?');
     }
-  }, [params, simYears, simdataB64, dmCgs, addChatMessage, appendToLastAssistant, finalizeChatMessage, setSimdataB64, updateJobStatus]);
+  }, [params, simYears, simdataB64, dmCgs, mlPrediction, addChatMessage, appendToLastAssistant, finalizeChatMessage, setSimdataB64, setMlPrediction, updateJobStatus]);
 
   const abort = useCallback(() => abortRef.current?.abort(), []);
 

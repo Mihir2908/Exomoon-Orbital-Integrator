@@ -1,0 +1,161 @@
+﻿Model A : models_hnn_hill_hinge4
+Model B : models_hnn_hill_rollout_v3
+n_steps : 1000
+Grids   : 7
+
+----------------------------------------------------------------------
+  Kepler 1229 b prograde   [t_sim=10.0yr  30x30  gt_frac_stable=0.508  gt_frac_both=0.469]
+  [eligible_mask] MLP eligible cells: 460/900 (51.1%)
+  [eligible_mask] computed in 0.4s
+  [A] Starting models_hnn_hill_hinge4 ...
+  Hill HNN batch: physics dt=5.00e-05 yr  T_moon_ref=0.0458 yr  n_phys=200,000  N=900  (t_sim=10.00yr)
+    step 50,000/200,000 (25%)  active=456/900  elapsed=342s  ETA=1025s
+    step 100,000/200,000 (50%)  active=448/900  elapsed=622s  ETA=622s
+    step 150,000/200,000 (75%)  active=427/900  elapsed=896s  ETA=299s
+  [A] Inference done: 1203s
+  [A] stable_recall=0.271  hab_recall=0.294  frac_stable=0.142  frac_both=0.142  (1203s)
+  [B] Starting models_hnn_hill_rollout_v3 ...
+  Hill HNN batch: physics dt=5.00e-05 yr  T_moon_ref=0.0458 yr  n_phys=200,000  N=900  (t_sim=10.00yr)
+    step 50,000/200,000 (25%)  active=442/900  elapsed=329s  ETA=988s
+    step 100,000/200,000 (50%)  active=385/900  elapsed=625s  ETA=625s
+    step 150,000/200,000 (75%)  active=338/900  elapsed=911s  ETA=304s
+  [B] Inference done: 1210s
+  [B] stable_recall=0.042  hab_recall=0.045  frac_stable=0.021  frac_both=0.021  (1210s)
+  [delta B-A]  stable=-0.230  hab=-0.249  (REGRESSED)
+----------------------------------------------------------------------
+  Kepler 442 b prograde   [t_sim=10.0yr  30x30  gt_frac_stable=0.438  gt_frac_both=0.438]
+  [eligible_mask] MLP eligible cells: 458/900 (50.9%)
+  [eligible_mask] computed in 0.1s
+  [A] Starting models_hnn_hill_hinge4 ...
+  Hill HNN batch: physics dt=5.00e-05 yr  T_moon_ref=0.0635 yr  n_phys=200,000  N=900  (t_sim=10.00yr)
+    step 50,000/200,000 (25%)  active=457/900  elapsed=301s  ETA=903s
+    step 100,000/200,000 (50%)  active=437/900  elapsed=598s  ETA=598s
+    step 150,000/200,000 (75%)  active=430/900  elapsed=899s  ETA=300s
+  [A] Inference done: 1200s
+  [A] stable_recall=0.584  hab_recall=0.576  frac_stable=0.293  frac_both=0.290  (1200s)
+  [B] Starting models_hnn_hill_rollout_v3 ...
+  Hill HNN batch: physics dt=5.00e-05 yr  T_moon_ref=0.0635 yr  n_phys=200,000  N=900  (t_sim=10.00yr)
+    step 50,000/200,000 (25%)  active=449/900  elapsed=310s  ETA=931s
+    step 100,000/200,000 (50%)  active=428/900  elapsed=619s  ETA=619s
+    step 150,000/200,000 (75%)  active=405/900  elapsed=940s  ETA=313s
+  [B] Inference done: 1252s
+  [B] stable_recall=0.122  hab_recall=0.119  frac_stable=0.061  frac_both=0.060  (1252s)
+  [delta B-A]  stable=-0.462  hab=-0.457  (REGRESSED)
+----------------------------------------------------------------------
+  Kepler 452 b prograde   [t_sim=10.0yr  30x30  gt_frac_stable=0.529  gt_frac_both=0.000]
+  [eligible_mask] MLP eligible cells: 479/900 (53.2%)
+  [eligible_mask] computed in 0.0s
+  [A] Starting models_hnn_hill_hinge4 ...
+  Hill HNN batch: physics dt=5.00e-05 yr  T_moon_ref=0.2111 yr  n_phys=200,000  N=900  (t_sim=10.00yr)
+    step 50,000/200,000 (25%)  active=378/900  elapsed=319s  ETA=957s
+    step 100,000/200,000 (50%)  active=367/900  elapsed=630s  ETA=630s
+    step 150,000/200,000 (75%)  active=365/900  elapsed=835s  ETA=278s
+  [A] Inference done: 1033s
+  [A] stable_recall=0.735  hab_recall=nan  frac_stable=0.397  frac_both=0.000  (1033s)
+  [B] Starting models_hnn_hill_rollout_v3 ...
+  Hill HNN batch: physics dt=5.00e-05 yr  T_moon_ref=0.2111 yr  n_phys=200,000  N=900  (t_sim=10.00yr)
+    step 50,000/200,000 (25%)  active=302/900  elapsed=197s  ETA=591s
+    step 100,000/200,000 (50%)  active=223/900  elapsed=415s  ETA=415s
+    step 150,000/200,000 (75%)  active=181/900  elapsed=730s  ETA=243s
+  [B] Inference done: 1021s
+  [B] stable_recall=0.288  hab_recall=nan  frac_stable=0.160  frac_both=0.000  (1021s)
+  [delta B-A]  stable=-0.447  hab=+nan  (TIE)
+----------------------------------------------------------------------
+  Kepler 452 b v2 prograde   [t_sim=10.0yr  30x30  gt_frac_stable=0.528  gt_frac_both=0.528]
+  [eligible_mask] MLP eligible cells: 485/900 (53.9%)
+  [eligible_mask] computed in 0.0s
+  [A] Starting models_hnn_hill_hinge4 ...
+  Hill HNN batch: physics dt=5.00e-05 yr  T_moon_ref=0.2588 yr  n_phys=200,000  N=900  (t_sim=10.00yr)
+    step 50,000/200,000 (25%)  active=485/900  elapsed=302s  ETA=907s
+    step 100,000/200,000 (50%)  active=479/900  elapsed=582s  ETA=582s
+    step 150,000/200,000 (75%)  active=465/900  elapsed=880s  ETA=293s
+  [A] Inference done: 1130s
+  [A] stable_recall=0.886  hab_recall=0.821  frac_stable=0.480  frac_both=0.446  (1130s)
+  [B] Starting models_hnn_hill_rollout_v3 ...
+  Hill HNN batch: physics dt=5.00e-05 yr  T_moon_ref=0.2588 yr  n_phys=200,000  N=900  (t_sim=10.00yr)
+    step 50,000/200,000 (25%)  active=471/900  elapsed=271s  ETA=812s
+    step 100,000/200,000 (50%)  active=444/900  elapsed=611s  ETA=611s
+    step 150,000/200,000 (75%)  active=420/900  elapsed=964s  ETA=321s
+  [B] Inference done: 1371s
+  [B] stable_recall=0.480  hab_recall=0.478  frac_stable=0.260  frac_both=0.259  (1371s)
+  [delta B-A]  stable=-0.406  hab=-0.343  (REGRESSED)
+----------------------------------------------------------------------
+  OGLE 2005 BLG 390Lb prograde   [t_sim=10.0yr  30x30  gt_frac_stable=0.476  gt_frac_both=0.000]
+  [eligible_mask] MLP eligible cells: 0/900 (0.0%)
+  [eligible_mask] computed in 0.1s
+  [A] Starting models_hnn_hill_hinge4 ...
+  Hill HNN batch: physics dt=5.00e-05 yr  T_moon_ref=1.8304 yr  n_phys=200,000  N=900  (t_sim=10.00yr)
+  [A] Inference done: 0s
+  [A] stable_recall=0.000  hab_recall=nan  frac_stable=0.000  frac_both=0.000  (0s)
+  [B] Starting models_hnn_hill_rollout_v3 ...
+  Hill HNN batch: physics dt=5.00e-05 yr  T_moon_ref=1.8304 yr  n_phys=200,000  N=900  (t_sim=10.00yr)
+  [B] Inference done: 0s
+  [B] stable_recall=0.000  hab_recall=nan  frac_stable=0.000  frac_both=0.000  (0s)
+  [delta B-A]  stable=+0.000  hab=+nan  (TIE)
+----------------------------------------------------------------------
+  TRAPPIST 1 e prograde   [t_sim=10.0yr  30x30  gt_frac_stable=0.182  gt_frac_both=0.182]
+  [eligible_mask] MLP eligible cells: 152/900 (16.9%)
+  [eligible_mask] computed in 0.0s
+  [A] Starting models_hnn_hill_hinge4 ...
+  Hill HNN batch: physics dt=3.87e-05 yr  T_moon_ref=0.0039 yr  n_phys=258,705  N=900  (t_sim=10.00yr)
+  [A] Inference done: 227s
+  [A] stable_recall=0.000  hab_recall=0.000  frac_stable=0.000  frac_both=0.000  (227s)
+  [B] Starting models_hnn_hill_rollout_v3 ...
+  Hill HNN batch: physics dt=3.87e-05 yr  T_moon_ref=0.0039 yr  n_phys=258,705  N=900  (t_sim=10.00yr)
+  [B] Inference done: 48s
+  [B] stable_recall=0.000  hab_recall=0.000  frac_stable=0.000  frac_both=0.000  (48s)
+  [delta B-A]  stable=+0.000  hab=+0.000  (TIE)
+----------------------------------------------------------------------
+  custom system prograde   [t_sim=10.0yr  30x30  gt_frac_stable=0.508  gt_frac_both=0.469]
+  [eligible_mask] MLP eligible cells: 460/900 (51.1%)
+  [eligible_mask] computed in 0.0s
+  [A] Starting models_hnn_hill_hinge4 ...
+  Hill HNN batch: physics dt=5.00e-05 yr  T_moon_ref=0.0458 yr  n_phys=200,000  N=900  (t_sim=10.00yr)
+    step 50,000/200,000 (25%)  active=456/900  elapsed=53774s  ETA=161323s
+    step 100,000/200,000 (50%)  active=448/900  elapsed=54009s  ETA=54009s
+    step 150,000/200,000 (75%)  active=427/900  elapsed=54242s  ETA=18081s
+  [A] Inference done: 54511s
+  [A] stable_recall=0.271  hab_recall=0.294  frac_stable=0.142  frac_both=0.142  (54511s)
+  [B] Starting models_hnn_hill_rollout_v3 ...
+  Hill HNN batch: physics dt=5.00e-05 yr  T_moon_ref=0.0458 yr  n_phys=200,000  N=900  (t_sim=10.00yr)
+    step 50,000/200,000 (25%)  active=442/900  elapsed=277s  ETA=831s
+    step 100,000/200,000 (50%)  active=385/900  elapsed=622s  ETA=622s
+    step 150,000/200,000 (75%)  active=338/900  elapsed=953s  ETA=318s
+  [B] Inference done: 1266s
+  [B] stable_recall=0.042  hab_recall=0.045  frac_stable=0.021  frac_both=0.021  (1266s)
+  [delta B-A]  stable=-0.230  hab=-0.249  (REGRESSED)
+
+====================================================================================================
+RECALL SUMMARY  (Model A=models_hnn_hill_hinge4   Model B=models_hnn_hill_rollout_v3)
+  Metric: recall = |GT_pos & HNN_pos| / |GT_pos|  (denominator: GT-positive cells)
+====================================================================================================
+System                                Stb_A  Stb_B    dStb   Hab_A  Hab_B    dHab
+----------------------------------------------------------------------------------------------------
+Kepler 1229 b prograde                0.271  0.042  -0.230   0.294  0.045  -0.249 !!
+Kepler 442 b prograde                 0.584  0.122  -0.462   0.576  0.119  -0.457 !!
+Kepler 452 b prograde                 0.735  0.288  -0.447     nan    nan    +nan
+Kepler 452 b v2 prograde              0.886  0.480  -0.406   0.821  0.478  -0.343 !!
+OGLE 2005 BLG 390Lb prograde          0.000  0.000  +0.000     nan    nan    +nan
+TRAPPIST 1 e prograde                 0.000  0.000  +0.000   0.000  0.000  +0.000
+custom system prograde                0.271  0.042  -0.230   0.294  0.045  -0.249 !!
+----------------------------------------------------------------------------------------------------
+Habitable recall (B vs A):  improved=0  tie=1  regressed=4
+** = improved >1pp   !! = regressed >1pp
+====================================================================================================
+
+====================================================================================================
+FRACTION SUMMARY  (Model A=models_hnn_hill_hinge4   Model B=models_hnn_hill_rollout_v3)
+  Metric: fraction = HNN_pos.sum() / N  (denominator: all N cells, same as GT fraction)
+  Fair GT comparison: GT_frac vs A_frac vs B_frac  (all on same denominator)
+====================================================================================================
+System                                GT_stb   A_stb   B_stb    GT_hab   A_hab   B_hab
+----------------------------------------------------------------------------------------------------
+Kepler 1229 b prograde                 0.508   0.142   0.021     0.469   0.142   0.021
+Kepler 442 b prograde                  0.438   0.293   0.061     0.438   0.290   0.060
+Kepler 452 b prograde                  0.529   0.397   0.160     0.000   0.000   0.000
+Kepler 452 b v2 prograde               0.528   0.480   0.260     0.528   0.446   0.259
+OGLE 2005 BLG 390Lb prograde           0.476   0.000   0.000     0.000   0.000   0.000
+TRAPPIST 1 e prograde                  0.182   0.000   0.000     0.182   0.000   0.000
+custom system prograde                 0.508   0.142   0.021     0.469   0.142   0.021
+----------------------------------------------------------------------------------------------------
+====================================================================================================

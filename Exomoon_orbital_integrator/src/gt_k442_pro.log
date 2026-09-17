@@ -1,0 +1,13 @@
+Running 30x30 ground-truth grid (prograde, t_sim=10.0yr, warmup_steps=10)...
+   10.0%  (90/900)
+   20.0%  (180/900)
+   30.0%  (270/900)
+   40.0%  (360/900)
+   50.0%  (450/900)
+   60.0%  (540/900)
+   70.0%  (630/900)
+   80.0%  (720/900)
+   90.0%  (810/900)
+  100.0%  (900/900)
+Done in 309.4s. map_both valid: 394/900
+Saved to C:\Users\mihir\Exomoon Orbital Integrator\Exomoon_orbital_integrator\src\ground_truth_grids\Kepler_442_b_prograde.npz

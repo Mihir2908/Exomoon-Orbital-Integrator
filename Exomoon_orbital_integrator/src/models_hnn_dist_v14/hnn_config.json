@@ -1,0 +1,8 @@
+{
+  "d_dim": 3,
+  "sys_dim": 5,
+  "hidden": 256,
+  "layers": 2,
+  "layer_sizes": null,
+  "dropout": 0.0
+}

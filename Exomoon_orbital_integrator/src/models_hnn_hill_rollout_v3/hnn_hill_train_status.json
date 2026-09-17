@@ -1,0 +1,10 @@
+{
+  "status": "complete",
+  "epoch": 10,
+  "total_epochs": 30,
+  "train_loss": 25.698650115664968,
+  "val_loss": 0.37949712201952934,
+  "hinge_loss": 0.2516356053504538,
+  "rollout_loss": 254.47014081970283,
+  "elapsed_s": 11124.473013899988
+}

@@ -1,0 +1,11 @@
+{
+  "sys_dim": 5,
+  "hidden": 128,
+  "layers": 3,
+  "epochs": 50,
+  "lr": 0.001,
+  "batch_size": 4096,
+  "best_val_loss": 0.03542379811187857,
+  "best_epoch": 48,
+  "data_path": "C:\\Users\\mihir\\Exomoon Orbital Integrator\\Exomoon_orbital_integrator\\src\\ml_dataset.parquet"
+}

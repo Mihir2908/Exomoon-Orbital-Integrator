@@ -1,0 +1,10 @@
+{
+  "status": "complete",
+  "epoch": 1,
+  "total_epochs": 1,
+  "train_loss": 0.2459602341132221,
+  "val_loss": 0.34835948772116065,
+  "mono_loss": 1.3765819729958716e-06,
+  "best_val": 0.34835948772116065,
+  "elapsed_s": 57.2
+}

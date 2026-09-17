@@ -1,0 +1,5 @@
+{
+  "model_type": "factorized",
+  "hidden": 64,
+  "layers": 3
+}

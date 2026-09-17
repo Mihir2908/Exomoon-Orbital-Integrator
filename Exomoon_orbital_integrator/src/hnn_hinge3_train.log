@@ -1,0 +1,77 @@
+Hill-frame HNN training
+  Data   : C:\Users\mihir\Exomoon Orbital Integrator\Exomoon_orbital_integrator\src\ml_dataset.parquet
+  Out    : C:\Users\mihir\Exomoon Orbital Integrator\Exomoon_orbital_integrator\src\models_hnn_hill_hinge3
+  Device : cpu
+  Config : hidden=256  layers=3  epochs=50  batch=256  lr=5e-05
+
+Loading and preprocessing data …
+  Train: 599,298 rows  Val: 149,016 rows  (14.2s)
+  Scaler saved.
+
+Model: HNN_Hill  params=134,401
+  Warm-start weights loaded from C:\Users\mihir\Exomoon Orbital Integrator\Exomoon_orbital_integrator\src\models_hnn_hill_hinge2\hnn_hill_model.pt
+
+  Epoch   1/50  train=0.33250  val=0.54273  lr=5.00e-05  elapsed=3528s
+    * New best saved (val=0.54273)
+  Epoch   2/50  train=0.32901  val=0.46524  lr=5.00e-05  elapsed=3599s
+    * New best saved (val=0.46524)
+  Epoch   3/50  train=0.32556  val=0.52198  lr=5.00e-05  elapsed=3648s
+  Epoch   4/50  train=0.32270  val=0.43739  lr=5.00e-05  elapsed=3695s
+    * New best saved (val=0.43739)
+  Epoch   5/50  train=0.32100  val=0.41613  lr=5.00e-05  elapsed=3737s
+    * New best saved (val=0.41613)
+  Epoch   6/50  train=0.31872  val=0.43332  lr=5.00e-05  elapsed=3779s
+  Epoch   7/50  train=0.32224  val=0.39841  lr=5.00e-05  elapsed=3818s
+    * New best saved (val=0.39841)
+  Epoch   8/50  train=0.31633  val=0.41962  lr=5.00e-05  elapsed=3854s
+  Epoch   9/50  train=0.32200  val=0.43133  lr=5.00e-05  elapsed=3891s
+  Epoch  10/50  train=0.32030  val=0.40103  lr=5.00e-05  elapsed=3927s
+  Epoch  11/50  train=0.31828  val=0.42217  lr=5.00e-05  elapsed=3963s
+  Epoch  12/50  train=0.31823  val=0.44080  lr=5.00e-05  elapsed=4001s
+  Epoch  13/50  train=0.31505  val=0.39056  lr=5.00e-05  elapsed=4039s
+    * New best saved (val=0.39056)
+  Epoch  14/50  train=0.31464  val=0.40947  lr=5.00e-05  elapsed=4079s
+  Epoch  15/50  train=0.31318  val=0.43955  lr=5.00e-05  elapsed=4117s
+  Epoch  16/50  train=0.31307  val=0.46815  lr=5.00e-05  elapsed=4152s
+  Epoch  17/50  train=0.31535  val=0.40718  lr=5.00e-05  elapsed=4192s
+  Epoch  18/50  train=0.31348  val=0.42240  lr=5.00e-05  elapsed=4228s
+  Epoch  19/50  train=0.31429  val=0.40760  lr=5.00e-05  elapsed=4265s
+  Epoch  20/50  train=0.31353  val=0.43814  lr=5.00e-05  elapsed=4307s
+  Epoch  21/50  train=0.31151  val=0.38572  lr=5.00e-05  elapsed=4344s
+    * New best saved (val=0.38572)
+  Epoch  22/50  train=0.31505  val=0.44106  lr=5.00e-05  elapsed=4380s
+  Epoch  23/50  train=0.31188  val=0.41053  lr=5.00e-05  elapsed=4416s
+  Epoch  24/50  train=0.30981  val=0.42670  lr=5.00e-05  elapsed=4450s
+  Epoch  25/50  train=0.31199  val=0.45059  lr=5.00e-05  elapsed=4486s
+  Epoch  26/50  train=0.30855  val=0.42474  lr=5.00e-05  elapsed=4521s
+  Epoch  27/50  train=0.30671  val=0.50834  lr=5.00e-05  elapsed=4557s
+  Epoch  28/50  train=0.30585  val=0.37678  lr=5.00e-05  elapsed=4594s
+    * New best saved (val=0.37678)
+  Epoch  29/50  train=0.30458  val=0.59935  lr=5.00e-05  elapsed=4630s
+  Epoch  30/50  train=0.30555  val=0.39694  lr=5.00e-05  elapsed=4668s
+  Epoch  31/50  train=0.31005  val=0.42687  lr=5.00e-05  elapsed=4706s
+  Epoch  32/50  train=0.30554  val=0.41567  lr=5.00e-05  elapsed=4743s
+  Epoch  33/50  train=0.30092  val=0.39711  lr=5.00e-05  elapsed=4779s
+  Epoch  34/50  train=0.30329  val=0.40404  lr=5.00e-05  elapsed=4814s
+  Epoch  35/50  train=0.30536  val=0.40106  lr=5.00e-05  elapsed=4849s
+  Epoch  36/50  train=0.30483  val=0.39068  lr=5.00e-05  elapsed=4884s
+  Epoch  37/50  train=0.27637  val=0.40359  lr=2.50e-05  elapsed=4919s
+  Epoch  38/50  train=0.27496  val=0.36644  lr=2.50e-05  elapsed=4954s
+    * New best saved (val=0.36644)
+  Epoch  39/50  train=0.27649  val=0.37576  lr=2.50e-05  elapsed=4992s
+  Epoch  40/50  train=0.27291  val=0.41327  lr=2.50e-05  elapsed=5029s
+  Epoch  41/50  train=0.27342  val=0.36637  lr=2.50e-05  elapsed=5065s
+    * New best saved (val=0.36637)
+  Epoch  42/50  train=0.27468  val=0.36651  lr=2.50e-05  elapsed=5103s
+  Epoch  43/50  train=0.27073  val=0.37065  lr=2.50e-05  elapsed=5137s
+  Epoch  44/50  train=0.27057  val=0.37751  lr=2.50e-05  elapsed=5171s
+  Epoch  45/50  train=0.27116  val=0.37646  lr=2.50e-05  elapsed=5208s
+  Epoch  46/50  train=0.27213  val=0.38836  lr=2.50e-05  elapsed=5243s
+  Epoch  47/50  train=0.27174  val=0.39767  lr=2.50e-05  elapsed=5280s
+  Epoch  48/50  train=0.26978  val=0.37688  lr=2.50e-05  elapsed=5318s
+  Epoch  49/50  train=0.26883  val=0.35566  lr=2.50e-05  elapsed=5369s
+    * New best saved (val=0.35566)
+  Epoch  50/50  train=0.27005  val=0.39521  lr=2.50e-05  elapsed=5405s
+
+Done.  best_val_loss=0.35566  total=5405s
+Artifacts in: C:\Users\mihir\Exomoon Orbital Integrator\Exomoon_orbital_integrator\src\models_hnn_hill_hinge3

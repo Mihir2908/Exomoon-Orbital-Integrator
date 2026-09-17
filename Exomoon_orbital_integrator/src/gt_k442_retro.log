@@ -1,0 +1,14 @@
+Fetched Kepler-442 b (Kepler-442): {'Ts': 4402.0, 'rs_solar': 0.598, 'ms_solar': 0.609, 'mp_earth': 2.36, 'ap_AU': 0.409, 'ep': 0.04}
+Running 30x30 ground-truth grid (retrograde, t_sim=10.0yr, warmup_steps=10)...
+   10.0%  (90/900)
+   20.0%  (180/900)
+   30.0%  (270/900)
+   40.0%  (360/900)
+   50.0%  (450/900)
+   60.0%  (540/900)
+   70.0%  (630/900)
+   80.0%  (720/900)
+   90.0%  (810/900)
+  100.0%  (900/900)
+Done in 148.0s. map_both valid: 725/900
+Saved to C:\Users\mihir\Exomoon Orbital Integrator\Exomoon_orbital_integrator\src\ground_truth_grids\Kepler_442_b_retrograde.npz

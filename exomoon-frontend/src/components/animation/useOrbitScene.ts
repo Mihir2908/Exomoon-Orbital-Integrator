@@ -31,6 +31,7 @@ export interface SceneControls {
   totalFrames: number;
   isPlaying: boolean;
   speedMultiplier: number;
+  webGLError: string | null;
   setFrameIndex: (i: number) => void;
   setIsPlaying: (v: boolean) => void;
   setSpeedMultiplier: (v: number) => void;
@@ -51,6 +52,7 @@ export function useOrbitScene(
   const [frameIndex, setFrameIndexState] = useState(0);
   const [isPlaying, setIsPlayingState] = useState(false);
   const [speedMultiplier, setSpeedMultiplierState] = useState(1);
+  const [webGLError, setWebGLError] = useState<string | null>(null);
 
   const frameIndexRef = useRef(0);
   const isPlayingRef  = useRef(false);
@@ -96,7 +98,19 @@ export function useOrbitScene(
     const canvas = canvasRef.current;
     if (!canvas) return;
 
-    const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: false });
+    let renderer: THREE.WebGLRenderer;
+    try {
+      renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: false, failIfMajorPerformanceCaveat: false });
+    } catch (err) {
+      const isVSCode = /Electron\//.test(navigator.userAgent);
+      const msg = err instanceof Error ? err.message : String(err);
+      setWebGLError(
+        isVSCode
+          ? `3D view unavailable in VS Code's browser (${msg}). Open http://localhost:3000 in Chrome or Edge for full functionality.`
+          : `WebGL unavailable — ${msg}. Enable hardware acceleration (Chrome/Edge: Settings → System → Use hardware acceleration when available → relaunch).`
+      );
+      return;
+    }
     renderer.setPixelRatio(window.devicePixelRatio);
     renderer.setSize(canvas.clientWidth, canvas.clientHeight);
     renderer.setClearColor(0x050a14);
@@ -232,9 +246,12 @@ export function useOrbitScene(
 
     if (!frames || frames.length === 0) return;
 
-    // Reset playback and all trail state
+    // Reset playback and all trail state; auto-start so both MiniOrbitViews
+    // animate immediately when new frames arrive (cell click or physics Run).
     frameIndexRef.current = 0;
     setFrameIndexState(0);
+    isPlayingRef.current = true;
+    setIsPlayingState(true);
     trailHeadsRef.current = [0, 0, 0];
     trailFillsRef.current = [0, 0, 0];
     trailRingBufs.current.forEach(b => b.fill(0));
@@ -481,6 +498,7 @@ export function useOrbitScene(
     totalFrames: frames?.length ?? 0,
     isPlaying,
     speedMultiplier,
+    webGLError,
     setFrameIndex,
     setIsPlaying,
     setSpeedMultiplier,

@@ -1,0 +1,6 @@
+{
+  "mode": "binary",
+  "hidden": 64,
+  "input_dim": 14,
+  "label_thresh": 0.99
+}

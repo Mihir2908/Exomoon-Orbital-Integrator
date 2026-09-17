@@ -1,0 +1,4 @@
+# Parquet training datasets — only ml_dataset.parquet is tracked (via Git LFS)
+Exomoon_orbital_integrator/src/ml_dataset_*.parquet
+Exomoon_orbital_integrator/src/test_smoke.parquet
+Exomoon_orbital_integrator/src/ml_dataset_smoketest.parquet

@@ -1,0 +1,75 @@
+Model A : models_hnn_hill_hinge4
+Model B : models_hnn_hill_hinge8_rollout_v2
+n_steps : 1000
+Grids   : 3
+
+----------------------------------------------------------------------
+  Kepler 1229 b prograde   [t_sim=10.0yr  30x30  gt_stable=0.508  gt_both=0.469]
+  [eligible_mask] MLP eligible cells: 460/900 (51.1%)
+  [eligible_mask] computed in 0.0s
+  [A] Starting models_hnn_hill_hinge4 ...
+  Hill HNN batch: physics dt=5.00e-05 yr  T_moon_ref=0.0458 yr  n_phys=200,000  N=900  (t_sim=10.00yr)
+    step 50,000/200,000 (25%)  active=456/900  elapsed=246s  ETA=738s
+    step 100,000/200,000 (50%)  active=448/900  elapsed=540s  ETA=540s
+    step 150,000/200,000 (75%)  active=427/900  elapsed=828s  ETA=276s
+  [A] Inference done: 1119s
+  [A] stable_recall=0.271  hab_recall=0.294  (1119s)
+  [B] Starting models_hnn_hill_hinge8_rollout_v2 ...
+  Hill HNN batch: physics dt=5.00e-05 yr  T_moon_ref=0.0458 yr  n_phys=200,000  N=900  (t_sim=10.00yr)
+    step 50,000/200,000 (25%)  active=436/900  elapsed=287s  ETA=860s
+    step 100,000/200,000 (50%)  active=342/900  elapsed=574s  ETA=574s
+    step 150,000/200,000 (75%)  active=273/900  elapsed=863s  ETA=288s
+  [B] Inference done: 1152s
+  [B] stable_recall=0.024  hab_recall=0.026  (1152s)
+  [delta B-A]  stable=-0.247  hab=-0.268  (REGRESSED)
+----------------------------------------------------------------------
+  Kepler 452 b prograde   [t_sim=10.0yr  30x30  gt_stable=0.529  gt_both=0.000]
+  [eligible_mask] MLP eligible cells: 479/900 (53.2%)
+  [eligible_mask] computed in 0.1s
+  [A] Starting models_hnn_hill_hinge4 ...
+  Hill HNN batch: physics dt=5.00e-05 yr  T_moon_ref=0.2111 yr  n_phys=200,000  N=900  (t_sim=10.00yr)
+    step 50,000/200,000 (25%)  active=378/900  elapsed=291s  ETA=872s
+    step 100,000/200,000 (50%)  active=367/900  elapsed=579s  ETA=579s
+    step 150,000/200,000 (75%)  active=365/900  elapsed=869s  ETA=290s
+  [A] Inference done: 1165s
+  [A] stable_recall=0.735  hab_recall=nan  (1165s)
+  [B] Starting models_hnn_hill_hinge8_rollout_v2 ...
+  Hill HNN batch: physics dt=5.00e-05 yr  T_moon_ref=0.2111 yr  n_phys=200,000  N=900  (t_sim=10.00yr)
+    step 50,000/200,000 (25%)  active=350/900  elapsed=296s  ETA=888s
+    step 100,000/200,000 (50%)  active=255/900  elapsed=587s  ETA=587s
+    step 150,000/200,000 (75%)  active=212/900  elapsed=876s  ETA=292s
+  [B] Inference done: 1168s
+  [B] stable_recall=0.368  hab_recall=nan  (1168s)
+  [delta B-A]  stable=-0.368  hab=+nan  (TIE)
+----------------------------------------------------------------------
+  Kepler 452 b v2 prograde   [t_sim=10.0yr  30x30  gt_stable=0.528  gt_both=0.528]
+  [eligible_mask] MLP eligible cells: 485/900 (53.9%)
+  [eligible_mask] computed in 0.0s
+  [A] Starting models_hnn_hill_hinge4 ...
+  Hill HNN batch: physics dt=5.00e-05 yr  T_moon_ref=0.2588 yr  n_phys=200,000  N=900  (t_sim=10.00yr)
+    step 50,000/200,000 (25%)  active=485/900  elapsed=305s  ETA=914s
+    step 100,000/200,000 (50%)  active=479/900  elapsed=611s  ETA=611s
+    step 150,000/200,000 (75%)  active=465/900  elapsed=886s  ETA=295s
+  [A] Inference done: 1092s
+  [A] stable_recall=0.886  hab_recall=0.821  (1092s)
+  [B] Starting models_hnn_hill_hinge8_rollout_v2 ...
+  Hill HNN batch: physics dt=5.00e-05 yr  T_moon_ref=0.2588 yr  n_phys=200,000  N=900  (t_sim=10.00yr)
+    step 50,000/200,000 (25%)  active=480/900  elapsed=201s  ETA=604s
+    step 100,000/200,000 (50%)  active=433/900  elapsed=399s  ETA=399s
+    step 150,000/200,000 (75%)  active=415/900  elapsed=593s  ETA=198s
+  [B] Inference done: 790s
+  [B] stable_recall=0.499  hab_recall=0.478  (790s)
+  [delta B-A]  stable=-0.387  hab=-0.343  (REGRESSED)
+
+==========================================================================================
+SUMMARY  (Model A=models_hnn_hill_hinge4   Model B=models_hnn_hill_hinge8_rollout_v2)
+==========================================================================================
+System                                Stb_A  Stb_B    dStb   Hab_A  Hab_B    dHab
+------------------------------------------------------------------------------------------
+Kepler 1229 b prograde                0.271  0.024  -0.247   0.294  0.026  -0.268 !!
+Kepler 452 b prograde                 0.735  0.368  -0.368     nan    nan    +nan
+Kepler 452 b v2 prograde              0.886  0.499  -0.387   0.821  0.478  -0.343 !!
+------------------------------------------------------------------------------------------
+Habitable recall (B vs A):  improved=0  tie=0  regressed=2
+** = improved >1pp   !! = regressed >1pp
+==========================================================================================

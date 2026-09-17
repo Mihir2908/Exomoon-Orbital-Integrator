@@ -1,5 +1,5 @@
 annotated-types==0.7.0
-anthropic==0.42.0
+anthropic>=0.50.0
 anyio==4.11.0
 astropy==6.1.1
 astropy-iers-data==0.2024.7.1.0.34.3

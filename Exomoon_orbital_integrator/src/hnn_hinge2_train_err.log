@@ -1,0 +1,2 @@
+C:\Users\mihir\Exomoon Orbital Integrator\Exomoon_orbital_integrator\src\exomoon\ml\hnn_dataset_hill.py:224: FutureWarning: DataFrameGroupBy.apply operated on the grouping columns. This behavior is deprecated, and in a future version of pandas the grouping columns will be excluded from the operation. Either pass `include_groups=False` to exclude the groupings or explicitly select the grouping columns after groupby to silence this warning.
+  df = df.groupby("sim_id", group_keys=False).apply(_trim).reset_index(drop=True)

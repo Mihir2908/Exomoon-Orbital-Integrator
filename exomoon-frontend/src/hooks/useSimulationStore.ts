@@ -72,6 +72,12 @@ interface SimulationStore {
   setMlPrediction: (p: MlPrediction | null) => void;
   setMlMassIdx: (i: number) => void;
 
+  // ── Trajectory preview cell (clicked cell in Layer 2 grid) ───────────────────
+  previewCellFrames: TrajectoryFrame[] | null;  // synthetic orbit frames for clicked cell
+  previewRocheFrac: number | null;              // Roche limit fraction of rhill for that cell
+  previewRhillAU: number | null;                // Hill sphere radius in AU for that cell's system
+  setPreviewCellFrames: (frames: TrajectoryFrame[] | null, rocheFrac: number | null, rhillAU?: number | null) => void;
+
   // ── Chat ─────────────────────────────────────────────────────────────────────
   chatMessages: ChatMessage[];
   addChatMessage: (msg: Omit<ChatMessage, 'timestamp'> & { id: string }) => void;
@@ -169,6 +175,13 @@ export const useSimulationStore = create<SimulationStore>()(
       mlMassIdx: 0,
       setMlPrediction: (p) => set({ mlPrediction: p, mlMassIdx: 0 }),
       setMlMassIdx: (i) => set({ mlMassIdx: i }),
+
+      // ── Trajectory preview cell ───────────────────────────────────────────────
+      previewCellFrames: null,
+      previewRocheFrac: null,
+      previewRhillAU: null,
+      setPreviewCellFrames: (frames, rocheFrac, rhillAU = null) =>
+        set({ previewCellFrames: frames, previewRocheFrac: rocheFrac, previewRhillAU: rhillAU }),
 
       // ── Chat ──────────────────────────────────────────────────────────────────
       chatMessages: [],

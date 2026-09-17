@@ -314,6 +314,7 @@ export default function HomePage() {
   const {
     params, simYears, setSimYears,
     trajectoryFrames, simMeta,
+    previewCellFrames, previewRocheFrac,
     setJob, jobStatus,
     dmCgs,
     starStatus, planetStatus, moonStatus,
@@ -374,7 +375,11 @@ export default function HomePage() {
   const handleRun = useCallback(async () => {
     showStatus('Starting simulation…');
     try {
-      const result = await agentApi.submitJob(paramsToAgentFormat(params), simYears);
+      // Read latest params/simYears from store instead of closing over stale values —
+      // callers like handleCellApplyAndRun call setParam() just before onApplyAndRun(),
+      // and Zustand updates synchronously, so getState() always has the latest values.
+      const { params: currentParams, simYears: currentSimYears } = useSimulationStore.getState();
+      const result = await agentApi.submitJob(paramsToAgentFormat(currentParams), currentSimYears);
       if (result.ok && result.job_id) {
         setJob(result.job_id);
       } else {
@@ -385,7 +390,7 @@ export default function HomePage() {
       showStatus('Failed to reach agent service');
       scheduleStatusFade();
     }
-  }, [params, simYears, setJob, showStatus, scheduleStatusFade]);
+  }, [setJob, showStatus, scheduleStatusFade]);
 
   // ── Playback drag ────────────────────────────────────────────────────────
   const handlePlaybackDragStart = useCallback((e: React.MouseEvent<HTMLDivElement>) => {
@@ -441,6 +446,7 @@ export default function HomePage() {
       <OrbitCanvas
         canvasRef={canvasRef}
         hasFrames={!!trajectoryFrames}
+        webGLError={sceneControls.webGLError}
         className="absolute inset-0 w-full h-full"
       />
 
@@ -590,6 +596,7 @@ export default function HomePage() {
               onClose={handleCloseMl}
               containerRef={containerRef}
               onApplyAndRun={handleRun}
+              frameIndex={sceneControls.frameIndex}
             />
           )}
 
@@ -630,7 +637,12 @@ export default function HomePage() {
       )}
 
       {/* ── Always-visible: MiniOrbitView + playback ────────────────────────── */}
-      <MiniOrbitView frames={trajectoryFrames} frameIndex={sceneControls.frameIndex} />
+      <MiniOrbitView
+        frames={trajectoryFrames}
+        frameIndex={sceneControls.frameIndex}
+        showHillSphereRings={!!previewCellFrames}
+        rocheInnerFrac={previewRocheFrac ?? undefined}
+      />
 
       {sceneControls.totalFrames > 0 && (
         <div

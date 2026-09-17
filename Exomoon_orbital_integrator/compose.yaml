@@ -9,7 +9,7 @@ services:
     environment:
       - PYTHONPATH=/app/src
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
-      - ANTHROPIC_MODEL=claude-sonnet-4-20250514
+      - ANTHROPIC_MODEL=claude-sonnet-4-6
       - CLAUDE_ENABLED=1
       - AWS_ENABLED=1
       - AWS_REGION=eu-west-2
@@ -33,7 +33,7 @@ services:
       - DEBUG=1
       - AGENT_SERVICE_URL=http://agent:8000
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
-      - ANTHROPIC_MODEL=claude-sonnet-4-20250514
+      - ANTHROPIC_MODEL=claude-sonnet-4-6
       - AWS_ENABLED=1
       - AWS_REGION=eu-west-2
       - EXOMOON_BUCKET=${EXOMOON_BUCKET}

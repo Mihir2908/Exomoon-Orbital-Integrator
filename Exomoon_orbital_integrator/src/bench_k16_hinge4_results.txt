@@ -1,0 +1,24 @@
+﻿
+======================================================================
+  SANITY CHECK: Kepler-1229b prograde  (K_ORBIT=16)
+  {'ms_solar': 0.54, 'rs_solar': 0.51, 'Ts': 3784.0, 'mp_earth': 2.54, 'ap_AU': 0.3006, 'ep': 0.0}
+======================================================================
+  t_sim_eff = 4.5023 yr  (1644.5 days)
+  [MLP] eligible: 1341/2500 (53.6%)
+
+A) GT batch leapfrog  (K=16, eligible 1341/2500)
+  GT batch leapfrog: per-cell k=16  dt_min=3.70e-05 yr  dt_max=7.93e-03 yr  n_phys=121,733  N=2500
+   n_phys=121,733  dt=3.70e-05 yr  n_out=1006
+   Elapsed: 329.7 s  (131.89 ms/cell)
+   stable=0.005  habitable=0.117  both=0.000  both/eligible=0.001
+   GT valid_mm_range: [2.54, 2.54]
+
+B) HNN hinge4  (K=16, eligible 1341/2500)
+  Hill HNN batch: per-cell k=16  dt_min=3.70e-05 yr  dt_max=7.93e-03 yr  n_phys=121,733  N=2500  (t_sim=4.50yr)
+   n_phys=121,733  dt=3.70e-05 yr  n_out=1006
+   Elapsed: 1454.5 s  (581.79 ms/cell)
+   stable=0.000  habitable=0.062  both=0.000  both/eligible=0.000
+   Speed ratio HNN/GT: 4.41x
+   HNN valid_mm_range: None
+
+Done.

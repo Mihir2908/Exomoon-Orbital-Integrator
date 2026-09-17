@@ -1,0 +1,15 @@
+{
+  "system": "k452bv2_pro",
+  "label": "Kepler-452b-v2 prograde",
+  "mm_res": 50,
+  "am_res": 50,
+  "t_sim": 10.0,
+  "model_dir": "models_hnn_hill_hinge4",
+  "n_phys": 200000,
+  "dt_phys": 5e-05,
+  "autograd_elapsed_s": 2467.217843399849,
+  "analytical_elapsed_s": 2257.5374725,
+  "speedup": 1.0928801286596799,
+  "time_saved_s": 209.68037089984864,
+  "maps_agree": false
+}

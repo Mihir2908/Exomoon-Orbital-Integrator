@@ -1,34 +1,44 @@
-# Include any files or directories that you don't want to be copied to your
-# container here (e.g., local build artifacts, temporary files, etc.).
-#
-# For more help, visit the .dockerignore file reference guide at
-# https://docs.docker.com/go/build-context-dockerignore/
+# Exclude large data and cache files from build context.
+# Build context root: Exomoon_orbital_integrator/
+# ** is required for subdirectory matching.
 
-**/.DS_Store
-**/__pycache__
-**/.venv
-**/.classpath
-**/.dockerignore
-**/.env
-**/.git
-**/.gitignore
-**/.project
-**/.settings
-**/.toolstarget
-**/.vs
-**/.vscode
-**/*.*proj.user
-**/*.dbmdl
-**/*.jfm
-**/bin
-**/charts
-**/docker-compose*
-**/compose.y*ml
-**/Dockerfile*
-**/node_modules
-**/npm-debug.log
-**/obj
-**/secrets.dev.yaml
-**/values.dev.yaml
-LICENSE
-README.md
+# Large data files
+**/*.parquet
+**/*.csv
+**/*.html
+**/*.png
+**/*.log
+**/*.npy
+**/*.nbc
+**/*.nbi
+
+# Python cache
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+
+# Model directories NOT needed for HNN inference
+src/models/
+src/models_temphead/
+src/models_temphead_ss/
+src/models_temphead_ss_prefix/
+src/models_logfix/
+src/models_hnn_hill_hinge1/
+src/models_hnn_hill_hinge2/
+src/models_hnn_hill_hinge3/
+src/models_hnn_hill_hinge5/
+src/models_hnn_hill_hinge6/
+src/models_hnn_hill_hinge7/
+src/models_hnn_hill_hinge8/
+src/models_hnn_log/
+src/eval_*/
+
+# Ground truth grids (test-only)
+src/ground_truth_grids/
+
+# Project infra files not needed inside container
+*.sh
+*.yaml
+*.yml
+Dockerfile
+*.Dockerfile

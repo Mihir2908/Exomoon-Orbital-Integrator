@@ -31,28 +31,104 @@ except ImportError:
 
 # ── feature columns ───────────────────────────────────────────────────────────
 # System params: constant per simulation (used as conditioning at every step)
+# a_inner_au/a_outer_au are deterministic Stefan-Boltzmann HZ bounds derived from
+# Ts/rs_solar -- the same category of closed-form physics quantity as rhill_AU
+# (already a SYS_COLS input), so giving the model both is consistent, not a new
+# kind of information leak. Without a_inner_au/a_outer_au, the model had to
+# reverse-engineer the HZ-location-from-stellar-params relationship purely from
+# training examples, which was a likely contributor to habitable being the harder,
+# more error-prone of the two flag classifications.
 SYS_COLS = [
     "ms_solar", "rs_solar", "Ts", "mp_earth", "ap_AU", "ep",
     "mm_earth", "am_hill", "em", "moon_retrograde", "t_sim", "rhill_AU",
+    "a_inner_au", "a_outer_au",
 ]
-SYS_DIM = len(SYS_COLS)   # 12
+SYS_DIM = len(SYS_COLS)   # 14
 
-# Per-step state (input features at step t)
+# These four columns are LHS-sampled (or, for rhill_AU, multiplicatively derived from
+# LHS-sampled quantities) on a LOG scale, but were previously fed raw into a linear
+# StandardScaler. A linear scaler preserves whatever skew the raw values have, so
+# equal-count percentile groups at the low end of a log-sampled range get crushed into
+# a tiny z-score window relative to the high end (empirically: mp_earth's bottom decile
+# spans ~290x less z-score resolution than its top decile, despite equal sample counts
+# and equal multiplicative spread in both). Log-transforming before scaling re-aligns
+# the scaling geometry with the sampling geometry, exactly as arcsinh already does for
+# moon_star_dist_norm/moon_temp_norm elsewhere in this pipeline.
+LOG_SYS_COLS = ["mp_earth", "mm_earth", "t_sim", "rhill_AU"]
+
+
+def _log_transform_sys_cols(df: "pd.DataFrame") -> "pd.DataFrame":
+    """Return a copy of df with LOG_SYS_COLS replaced by their natural log.
+    All four columns are strictly positive physical quantities (masses, durations,
+    Hill radii), so log() is always well-defined."""
+    df = df.copy()
+    for col in LOG_SYS_COLS:
+        if col in df.columns:
+            df[col] = np.log(df[col].values.astype(np.float64))
+    return df
+
+
+def _add_planet_star_dist_norm(df: "pd.DataFrame") -> "pd.DataFrame":
+    """Add planet_star_dist_norm = planet_star_dist / ap_AU.
+
+    Raw planet_star_dist (AU) means something different in every system, exactly the
+    same problem that motivated normalizing moon_planet_dist (by rhill_AU) and
+    moon_star_dist (by HZ band) instead of feeding them raw -- this was the one
+    distance column left un-normalized. Dividing by ap_AU (the system's own orbital
+    semi-major axis, already a SYS_COLS input) re-expresses it as orbital phase: ~1.0
+    at zero eccentricity, oscillating in [1-ep, 1+ep] for eccentric orbits -- a
+    bounded, cross-system-comparable ratio, mirroring exactly how am_hill already
+    expresses the moon's orbit as a Hill-radius fraction rather than raw AU.
+    planet_star_dist is also part of TARGET_DIST_COLS (fed back autoregressively),
+    so an un-normalized, system-scale-dependent representation there could plausibly
+    degrade its own rollout stability -- and since moon_star_dist is dominated by
+    planet_star_dist, that instability would propagate into the already-weak
+    habitable channel too.
+    """
+    df = df.copy()
+    if "planet_star_dist" in df.columns and "ap_AU" in df.columns:
+        df["planet_star_dist_norm"] = df["planet_star_dist"].values / df["ap_AU"].values
+    return df
+
+# Per-step state (input features at step t).
+# stable and habitable are deliberately excluded: feeding binary flags back into
+# the GRU during autoregressive inference creates hard attractor states (stable=1
+# or stable=0) that prevent the model from discovering stability thresholds on its
+# own. The model receives only continuous kinematic features and learns stability
+# via the flag head targets (BCE loss), not via binary input feedback.
+#
+# moon_planet_dist_norm / moon_star_dist_norm replace the raw-AU distance columns:
+# raw AU values mean something different in every system (the same 0.78 AU can be
+# inside or outside the HZ depending on the star), forcing the model to relearn an
+# absolute-scale interpretation per system. Normalizing by rhill_AU (stable <=> <=1.0)
+# and by HZ band position (habitable <=> in [0,1]) makes both quantities universal
+# across systems and is exactly analogous to how am_hill already expresses the moon's
+# orbital semi-major axis as a Hill-radius fraction rather than raw AU.
+#
+# moon_temp_norm is a second, independently-derived encoding of the same habitability
+# fact via the Stefan-Boltzmann equilibrium-temperature relation (habitable <=> in
+# [0,1], same convention as moon_star_dist_norm). It is mathematically redundant with
+# moon_star_dist_norm in the training LABELS (both come from the same true
+# moon_star_dist), but the model predicts it through a SEPARATE nn.Linear head with
+# its own weights -- nothing forces the two heads to agree at inference time. Their
+# disagreement during autoregressive rollout is therefore a genuine, free reliability
+# signal: a real ~6-step disagreement window was observed exactly at a discontinuity
+# in the existing moon_star_dist_norm/habitable pair, confirming the two heads can
+# and do diverge independently rather than always moving in lockstep.
 STATE_COLS = [
-    "moon_planet_dist", "moon_star_dist", "planet_star_dist",
+    "moon_planet_dist_norm", "moon_star_dist_norm", "moon_temp_norm", "planet_star_dist",
     "moon_speed", "planet_speed",
-    "stable", "habitable",
     "t_frac",
 ]
-STATE_DIM = len(STATE_COLS)   # 8
+STATE_DIM = len(STATE_COLS)   # 7
 
 # Per-step targets (what the model predicts: next-step state minus flags)
 # Flags get their own BCE head; distances/speeds get MSE head
-TARGET_DIST_COLS  = ["moon_planet_dist", "moon_star_dist", "planet_star_dist",
-                     "moon_speed", "planet_speed"]
-TARGET_FLAG_COLS  = ["stable", "habitable"]
+TARGET_DIST_COLS  = ["moon_planet_dist_norm", "moon_star_dist_norm", "moon_temp_norm",
+                     "planet_star_dist", "moon_speed", "planet_speed"]
+TARGET_FLAG_COLS  = ["stable", "habitable", "habitable_from_temp"]
 TARGET_COLS       = TARGET_DIST_COLS + TARGET_FLAG_COLS
-OUT_DIM           = len(TARGET_COLS)   # 7
+OUT_DIM           = len(TARGET_COLS)   # 9
 
 
 def load_parquet(path: str) -> "pd.DataFrame":
@@ -142,10 +218,19 @@ if _HAS_TORCH:
             target_raw = grp[_safe_cols(grp, TARGET_COLS)].values.astype(np.float32)
             target_shifted = np.concatenate([target_raw[1:], target_raw[-1:]], axis=0)
 
+            # Distance/speed regression is only meaningful while the moon remains
+            # bound to the planet. Once stable=0, the raw trajectory is unbounded
+            # ballistic drift post-escape with no relevance to the stability-mapping
+            # task; dist_mask excludes those rows from the MSE term in compute_loss
+            # while the flag head (BCE) stays fully supervised on every row.
+            stable_idx = len(TARGET_DIST_COLS)   # "stable" is the first flag column
+            dist_mask = target_shifted[:, stable_idx:stable_idx + 1].copy()   # (T, 1)
+
             return (
                 torch.from_numpy(state_norm),          # (T, STATE_DIM)
                 torch.from_numpy(sys_vals),             # (SYS_DIM,)
                 torch.from_numpy(target_shifted),       # (T, OUT_DIM)
+                torch.from_numpy(dist_mask),            # (T, 1)
             )
 
 
@@ -153,10 +238,17 @@ def make_splits(
     parquet_path: str,
     val_frac: float = 0.20,
     seed: int = 42,
+    log_transform: bool = False,
 ) -> tuple["pd.DataFrame", "pd.DataFrame", object, object]:
     """
     Load Parquet, split by simulation_id (not by row), fit scalers on train split.
     Returns (train_df, val_df, sys_scaler, state_scaler).
+
+    log_transform: apply _log_transform_sys_cols before fitting/returning. Defaults
+    to False -- the log transform broke autoregressive habitable recall in practice
+    (K-452b-v2 dropped from 0.386 to 0.016) despite fixing resolution-compression,
+    which the dose-response test showed was not the dominant driver of recall problems.
+    Pass True only when explicitly experimenting with it on a fresh training run.
     """
     df = load_parquet(parquet_path)
 
@@ -164,9 +256,11 @@ def make_splits(
     # Use dict.fromkeys to deduplicate while preserving order — t_frac appears
     # in both the explicit list and STATE_COLS, so without this df[existing]
     # would produce duplicate column names and raise an error.
-    required = ["sim_id"] + SYS_COLS + STATE_COLS
+    required = ["sim_id"] + SYS_COLS + STATE_COLS + TARGET_FLAG_COLS
     existing = list(dict.fromkeys(c for c in required if c in df.columns))
     df = df[existing].dropna()
+    if log_transform:
+        df = _log_transform_sys_cols(df)
 
     # Split by sim_id
     rng     = np.random.default_rng(seed)

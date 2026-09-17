@@ -1,0 +1,31 @@
+Model A : models_hnn_hill_hinge4
+Model B : models_hnn_hill_hinge8_rollout_v2
+n_steps : 1000
+Grids   : 2
+
+----------------------------------------------------------------------
+  Kepler 1229 b prograde   [t_sim=10.0yr  30x30  gt_stable=0.508  gt_both=0.469]
+  Hill HNN batch: per-cell k=16  dt_min=3.70e-05 yr  dt_max=7.93e-03 yr  n_phys=270,377  N=900  (t_sim=10.00yr)
+  [A] stable_recall=0.000  hab_recall=0.000  (1554s)
+  Hill HNN batch: per-cell k=16  dt_min=3.70e-05 yr  dt_max=7.93e-03 yr  n_phys=270,377  N=900  (t_sim=10.00yr)
+  [B] stable_recall=0.000  hab_recall=0.000  (581s)
+  [delta B-A]  stable=+0.000  hab=+0.000  (TIE)
+----------------------------------------------------------------------
+  Kepler 452 b v2 prograde   [t_sim=10.0yr  30x30  gt_stable=0.528  gt_both=0.528]
+  Hill HNN batch: per-cell k=16  dt_min=3.78e-05 yr  dt_max=4.58e-02 yr  n_phys=264,351  N=900  (t_sim=10.00yr)
+  [A] stable_recall=0.124  hab_recall=0.101  (1724s)
+  Hill HNN batch: per-cell k=16  dt_min=3.78e-05 yr  dt_max=4.58e-02 yr  n_phys=264,351  N=900  (t_sim=10.00yr)
+  [B] stable_recall=0.002  hab_recall=0.000  (1301s)
+  [delta B-A]  stable=-0.122  hab=-0.101  (REGRESSED)
+
+==========================================================================================
+SUMMARY  (Model A=models_hnn_hill_hinge4   Model B=models_hnn_hill_hinge8_rollout_v2)
+==========================================================================================
+System                                Stb_A  Stb_B    dStb   Hab_A  Hab_B    dHab
+------------------------------------------------------------------------------------------
+Kepler 1229 b prograde                0.000  0.000  +0.000   0.000  0.000  +0.000
+Kepler 452 b v2 prograde              0.124  0.002  -0.122   0.101  0.000  -0.101 !!
+------------------------------------------------------------------------------------------
+Habitable recall (B vs A):  improved=0  tie=1  regressed=1
+** = improved >1pp   !! = regressed >1pp
+==========================================================================================

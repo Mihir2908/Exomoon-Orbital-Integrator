@@ -1,0 +1,66 @@
+﻿HNN Greydanus training (Option E -- joint H_theta with velocity supervision)
+  data       : ml_dataset.parquet
+  out        : models_hnn_greydanus
+  arch       : 128×2  dropout=0.0
+  optim      : epochs=30  batch=512  lr=0.001  weight_decay=0.0
+  lambda_vel : 1.0  (weight on velocity supervision vs force supervision)
+
+Loading dataset...
+  Loading ml_dataset.parquet ...
+  2,957,000 total rows  |  2205 sims excluded (non-stable+habitable start)
+  After filter: 748,314 rows kept (25.3%)
+  d_sp_n: 0.6528–1.1919  d_sm_n: 0.1233–15.8393  d_pm_n: 0.0059–735.9006
+  v_circ: 1.053–25.906 AU/yr
+  v_n range: -2.475–3.770  p_n range: -2.273–2.273
+  Train rows: 599,298  |  Val rows: 149,016  (split by sim_id)
+  hnn_sys_scaler.pkl -> models_hnn_greydanus/
+
+Model: 18,945 trainable params  (input dim = 17)
+
+ Epoch       train         val    t_force      t_vel        lr    t (s)
+--------------------------------------------------------------------
+     1     7.52658     5.42346    6.89868    0.62791   1.0e-03     15.5
+         * saved best model (val=5.42346)
+     2     5.54067     7.16731    5.07716    0.46350   1.0e-03     30.9
+     3     4.91195     4.41011    4.46104    0.45091   1.0e-03     46.9
+         * saved best model (val=4.41011)
+     4     4.39850     4.20057    3.95577    0.44273   1.0e-03     62.6
+         * saved best model (val=4.20057)
+     5     3.65460     4.51932    3.22260    0.43201   1.0e-03     79.5
+     6     3.90826     4.36452    3.47309    0.43517   1.0e-03     95.7
+     7     3.59035     5.04682    3.15906    0.43129   1.0e-03    111.4
+     8     3.55784     2.75764    3.11943    0.43840   1.0e-03    126.9
+         * saved best model (val=2.75764)
+     9     3.30589     4.10174    2.87801    0.42788   1.0e-03    142.4
+    10     3.37605     3.58847    2.94445    0.43160   1.0e-03    157.9
+    11     3.41489     3.05695    2.97873    0.43617   1.0e-03    173.9
+    12     3.45444     3.43354    3.01795    0.43649   1.0e-03    189.4
+    13     3.50856     3.21073    3.06768    0.44088   1.0e-03    205.1
+    14     3.11289     3.68618    2.68255    0.43034   5.0e-04    220.2
+    15     2.89608     2.62431    2.46946    0.42663   5.0e-04    236.0
+         * saved best model (val=2.62431)
+    16     2.65637     2.59891    2.22419    0.43219   5.0e-04    252.1
+         * saved best model (val=2.59891)
+    17     2.76252     3.14988    2.33164    0.43087   5.0e-04    267.8
+    18     2.83535     2.57112    2.40521    0.43013   5.0e-04    283.6
+         * saved best model (val=2.57112)
+    19     2.54470     2.48009    2.11955    0.42516   5.0e-04    298.8
+         * saved best model (val=2.48009)
+    20     2.49127     2.87629    2.06727    0.42400   5.0e-04    320.0
+    21     3.07430     2.89176    2.63955    0.43475   5.0e-04    344.5
+    22     2.96028     2.40688    2.52817    0.43212   5.0e-04    368.3
+         * saved best model (val=2.40688)
+    23     2.19876     2.39188    1.77332    0.42545   5.0e-04    391.9
+         * saved best model (val=2.39188)
+    24     2.70175     2.17193    2.27354    0.42821   5.0e-04    415.5
+         * saved best model (val=2.17193)
+    25     2.32144     3.16188    1.89648    0.42496   5.0e-04    437.8
+    26     2.25333     2.20258    1.82850    0.42484   5.0e-04    460.2
+    27     2.33010     1.91515    1.90223    0.42787   5.0e-04    482.9
+         * saved best model (val=1.91515)
+    28     2.36757     2.39561    1.94223    0.42534   5.0e-04    507.2
+    29     2.29238     2.09737    1.86764    0.42474   5.0e-04    531.9
+    30     2.45721     2.24557    2.03099    0.42623   5.0e-04    555.9
+
+Training complete.  Best val_loss = 1.91515
+Model and config saved to: models_hnn_greydanus/

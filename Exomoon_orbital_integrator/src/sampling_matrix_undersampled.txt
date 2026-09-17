@@ -1,0 +1,7 @@
+Sampling matrix diagnostic  |  N=2957 sims  |  ml_dataset.parquet
+Equal-width bins in sampling space  |  3 bins per parameter
+Expected per cell (independent LHS): ~329 sims
+Under-flag: < 164 sims (0x expected)  |  Over-flag: > 657 sims (2x expected)
+
+mp_earth x mm_earth:
+  [UNDER]  mp_earth=0.5-4.22  x  mm_earth=0.988-3   count=150  expected≈329  ratio=0.46

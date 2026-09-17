@@ -1,0 +1,31 @@
+﻿Hill-frame HNN rollout training (Path 3)
+  Data      : C:\Users\mihir\Exomoon Orbital Integrator\Exomoon_orbital_integrator\src\ml_dataset.parquet
+  Out       : C:\Users\mihir\Exomoon Orbital Integrator\Exomoon_orbital_integrator\src\models_hnn_hill_rollout_v3
+  Warmstart : models_hnn_hill_hinge4
+  Device    : cpu
+  Mode      : PHYSICS-DT (rollout_v3) — dt_phys=5.00e-05 yr  k=1  n_sub~200  NO CLAMP
+  max_win=10  batch=32  lr=1e-05  patience_stop=8
+
+Loading and preprocessing data …
+  Train: 6,004 windows  Val: 1,500 windows  (11.3s)
+
+Model: HNN_Hill  params=134,401
+  Warm-start weights loaded from C:\Users\mihir\Exomoon Orbital Integrator\Exomoon_orbital_integrator\src\models_hnn_hill_hinge4\hnn_hill_model.pt
+
+Epoch   1/30  train=28.88340  val=0.35068  hinge=0.24203  rollout=286.41373  clamp=0.00  lr=1.00e-05  1418s
+  [saved] best model  val=0.35068
+Epoch   2/30  train=25.95414  val=0.38921  hinge=0.24582  rollout=257.08319  clamp=0.00  lr=1.00e-05  2663s
+Epoch   3/30  train=24.98353  val=0.33972  hinge=0.25309  rollout=247.30445  clamp=0.00  lr=1.00e-05  4000s
+  [saved] best model  val=0.33972
+Epoch   4/30  train=24.02520  val=0.37663  hinge=0.25099  rollout=237.74207  clamp=0.00  lr=1.00e-05  5305s
+Epoch   5/30  train=22.30801  val=0.34973  hinge=0.24725  rollout=220.60753  clamp=0.00  lr=1.00e-05  6560s
+Epoch   6/30  train=21.83564  val=0.37429  hinge=0.24670  rollout=215.88936  clamp=0.00  lr=1.00e-05  7428s
+Epoch   7/30  train=23.89285  val=0.36063  hinge=0.24873  rollout=236.44120  clamp=0.00  lr=1.00e-05  8375s
+Epoch   8/30  train=21.11535  val=0.42271  hinge=0.25093  rollout=208.64427  clamp=0.00  lr=1.00e-05  9419s
+Epoch   9/30  train=26.95119  val=0.37120  hinge=0.24888  rollout=267.02307  clamp=0.00  lr=1.00e-05  10263s
+Epoch  10/30  train=25.69865  val=0.37950  hinge=0.25164  rollout=254.47014  clamp=0.00  lr=1.00e-05  11124s
+Epoch  11/30  train=19.56657  val=0.37612  hinge=0.25503  rollout=193.11537  clamp=0.00  lr=1.00e-05  12309s
+  Early stop: val_loss did not improve for 8 epochs.
+
+Done. Best val_loss=0.33972
+Artifacts: C:\Users\mihir\Exomoon Orbital Integrator\Exomoon_orbital_integrator\src\models_hnn_hill_rollout_v3

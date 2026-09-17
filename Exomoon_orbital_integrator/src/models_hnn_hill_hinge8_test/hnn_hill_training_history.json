@@ -1,0 +1,29 @@
+{
+  "train_loss": [
+    0.2459602341132221
+  ],
+  "val_loss": [
+    0.34835948772116065
+  ],
+  "mono_loss": [
+    1.3765819729958716e-06
+  ],
+  "epochs": 1,
+  "hyperparams": {
+    "data": "ml_dataset.parquet",
+    "out": "models_hnn_hill_hinge8_test",
+    "epochs": 1,
+    "batch": 256,
+    "lr": 1e-05,
+    "hidden": 256,
+    "layers": 3,
+    "dropout": 0.0,
+    "val_frac": 0.2,
+    "seed": 42,
+    "patience": 7,
+    "warmstart": "models_hnn_hill_hinge4",
+    "mono_weight": 5.0,
+    "n_mono": 512
+  },
+  "best_val_loss": 0.34835948772116065
+}

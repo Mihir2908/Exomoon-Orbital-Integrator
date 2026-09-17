@@ -1,0 +1,10 @@
+{
+  "status": "running",
+  "epoch": 10,
+  "total_epochs": 30,
+  "train_loss": 0.5299404405374476,
+  "val_loss": 0.3683764319074281,
+  "hinge_loss": 0.23804432672864578,
+  "rollout_loss": 29.189612003279283,
+  "elapsed_s": 3783.4322601000313
+}

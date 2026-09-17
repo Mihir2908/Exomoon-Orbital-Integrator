@@ -1,0 +1,1 @@
+{"status": "complete", "epoch": 50, "total_epochs": 50, "train_loss": 0.10716087219681524, "val_loss": 0.339254613946613, "train_force": 0.05546083147172282, "train_vel": 0.05170004078394628, "train_h": 0.0, "val_force": 0.2632855937149605, "val_vel": 0.0759690204963777, "val_h": 0.0, "elapsed_s": 1761.788978099823}

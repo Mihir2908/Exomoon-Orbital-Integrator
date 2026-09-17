@@ -1,0 +1,28 @@
+# HNN GPU inference service — additional requirements
+# Base image pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime already provides torch.
+# numpy pinned to 1.26.4 for scikit-learn / scipy compatibility.
+
+numpy==1.26.4
+
+# API service
+fastapi==0.115.4
+uvicorn==0.31.1
+pydantic==2.12.4
+python-dotenv==1.2.1
+
+# Scientific compute
+scipy==1.14.0
+scikit-learn==1.7.2
+pandas==2.2.3
+pyarrow==17.0.0
+
+# Astronomy (exomoon.constants, exomoon.habitable_zone)
+astropy==6.1.1
+astropy-iers-data==0.2024.7.1.0.34.3
+
+# AWS (optional S3 model loading)
+boto3==1.35.40
+botocore
+
+# Utilities
+typing_extensions==4.15.0

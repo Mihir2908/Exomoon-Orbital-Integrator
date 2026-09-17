@@ -1,0 +1,18 @@
+{
+  "system_params": {
+    "Ts": 3100.0,
+    "rs_solar": 0.24,
+    "ms_solar": 0.22,
+    "mp_earth": 5.5,
+    "ap_AU": 2.6,
+    "ep": 0.0
+  },
+  "t_sim": 10.0,
+  "moon_retrograde": false,
+  "em": 0.0,
+  "mm_resolution": 30,
+  "am_resolution": 30,
+  "warmup_steps": 10,
+  "n_resample": 1000,
+  "elapsed_s": 313.0064334869385
+}

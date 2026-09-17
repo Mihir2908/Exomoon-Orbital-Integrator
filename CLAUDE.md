@@ -1,7 +1,7 @@
 # Exomoon Orbital Integrator — CLAUDE.md
 
-**Last Updated:** May 28, 2026
-**Status:** Production-stable (core functionality verified, multi-turn queries working; ML stability predictor layer added)
+**Last Updated:** July 14, 2026
+**Status:** Production-stable (core functionality verified, multi-turn queries working; ML stability predictor layer added; extended thinking enabled)
 **Pending Issues:** CSV file retrieval via chatbot UI
 
 ---
@@ -168,7 +168,7 @@ A machine-learning layer that acts as a fast physics emulator — no new deploym
 │  │  │  FastAPI Agent Service (agent_service.py:8000)       │   │   │
 │  │  │  Core Components:                                    │   │   │
 │  │  │  • SessionCache: in-memory simdata + params cache    │   │   │
-│  │  │  • Claude SDK: multi-turn LLM reasoning              │   │   │
+│  │  │  • Claude SDK: multi-turn LLM reasoning + thinking   │   │   │
 │  │  │  • Tool Executor: run_simulation, export_csv, etc    │   │   │
 │  │  │  • Job Orchestrator: Step Functions integration      │   │   │
 │  │  │  • ML Endpoints: /ml/predict, /ml/train, /ml/train/* │   │   │
@@ -429,6 +429,8 @@ These columns are required by `run_ml_dataset.py` and `exomoon/ml/dataset.py` fo
 
 **Purpose**: FastAPI service (port 8000) handling Claude-powered multi-turn conversations, job orchestration, simdata caching, and ML inference/training. Triggered by the Dash chatbot frontend. Depending on the scenario, itself triggers the AWS Step Functions backend.
 
+**LLM Configuration**: Model `claude-sonnet-4-6` with extended thinking enabled (`budget_tokens=8000`, `max_tokens=16000`). Temperature is omitted (extended thinking requires default 1.0). Thinking blocks from each assistant turn are preserved in multi-turn message context but never surfaced to the user. Simple queries consume minimal thinking tokens; complex physics reasoning queries use the full budget automatically.
+
 #### `SessionCache` Class
 
 ```python
@@ -650,21 +652,21 @@ python run_ml_dataset.py --n_samples 3000 --n_workers 6 --t_sim_max 20 --out ml_
 
 | Param | Min | Max | Scale | Notes |
 |-------|-----|-----|-------|-------|
-| `ms_solar` | 0.4 | 2.0 | linear | M/K through A stars |
-| `rs_solar` | 0.4 | 2.0 | linear | |
-| `Ts` | 3000 | 12000 | linear | K |
+| `ms_solar` | 0.08 | 2.0 | linear | M-dwarf through A star; lower bound covers K-1229b host |
+| `rs_solar` | 0.08 | 2.0 | linear | |
+| `Ts` | 2500 | 12000 | linear | K; lower bound covers cool M-dwarfs |
 | `mp_earth` | 0.5 | 300 | log | Super-Earth through sub-Jupiter |
-| `ap_AU` | 0.2 | 3.5 | linear | Interior through outer HZ |
+| `ap_AU` | 0.01 | 3.5 | linear | Covers close-in HZs of cool stars (K-1229b ap≈0.30 AU) |
 | `ep` | 0.0 | 0.35 | linear | |
-| `mm_earth` | 0.107 | `min(mp_earth×0.30, 0.5)` | log | Min = Mars mass; max adaptive per mp_earth draw |
-| `am_hill` | 0.05 | 0.80 | linear | 5%–80% of Hill radius |
+| `mm_earth` | 0.107 | `min(mp_earth, 3.0)` | log | Min = Mars mass; max = planet mass or 3 M_earth, whichever is smaller. Matches inference.py mm_grid upper bound exactly. |
+| `am_hill` | Roche-limit per-sim (≈0.009–0.02) | 1.00 | linear | Lower bound = Roche limit fraction of rhill_AU computed per simulation; upper bound 1.0. The `am_AU > 0.95 × rhill_AU` degeneracy filter was removed — am_hill goes to 1.0 and am_AU = am_hill × rhill ≤ rhill by construction. |
 | `em` | 0.0 | 0.25 | linear | Moon orbit eccentricity |
 | `moon_retrograde` | 0 | 1 | Bernoulli(0.5) | |
 | `t_sim` | 1 | 20 | log | Simulated years |
 
 Each simulation trajectory is **resampled to a fixed 1000-step grid** (uniformly in time from t=0 to t=t_sim) before being written to Parquet. This ensures all training sequences have identical length for batched GRU training.
 
-Runs where `rhill_AU < 1e-4` or `am_AU > 0.95 × rhill_AU` are skipped as degenerate.
+Runs where `rhill_AU < 1e-4` are skipped as degenerate. `am_AU > rhill_AU` cannot occur by construction since `am_AU = am_hill × rhill_AU` and `am_hill ≤ 1.0`.
 
 **Output**: `ml_dataset.parquet` — one row per timestep, ~1000 rows per simulation, ~3M rows for N=3000.
 
@@ -676,11 +678,12 @@ Loads the Parquet file, fits `sklearn.StandardScaler` normalizers on the trainin
 
 **Feature vectors**:
 
-| Vector | Columns (12 system, 8 state) |
-|--------|------------------------------|
-| `SYS_COLS` (12) | `ms_solar, rs_solar, Ts, mp_earth, ap_AU, ep, mm_earth, am_hill, em, moon_retrograde, t_sim, rhill_AU` |
-| `STATE_COLS` (8) | `moon_planet_dist, moon_star_dist, planet_star_dist, moon_speed, planet_speed, stable, habitable, t_frac` |
-| `TARGET_COLS` (7) | Next-step `moon_planet_dist, moon_star_dist, planet_star_dist, moon_speed, planet_speed, stable, habitable` |
+| Vector | Columns |
+|--------|---------|
+| `SYS_COLS` (14) | `ms_solar, rs_solar, Ts, mp_earth, ap_AU, ep, mm_earth, am_hill, em, moon_retrograde, t_sim, rhill_AU, a_inner_au, a_outer_au` |
+| `STATE_COLS` (7) | `moon_planet_dist_norm` (mpd/rhill — stable ⟺ ≤1.0), `moon_star_dist_norm` (arcsinh HZ-band position — habitable ⟺ in [0, 0.881]), `moon_temp_norm` (arcsinh equilibrium temperature, second independent HZ encoding), `planet_star_dist` (raw AU), `moon_speed`, `planet_speed`, `t_frac`. **`stable` and `habitable` are deliberately excluded** — they are TARGET_FLAG_COLS only and never fed back as inputs, preventing binary-flag autoregressive lock-in. |
+| `TARGET_DIST_COLS` (6 — MSE head) | Next-step: `moon_planet_dist_norm`, `moon_star_dist_norm`, `moon_temp_norm`, `planet_star_dist`, `moon_speed`, `planet_speed` |
+| `TARGET_FLAG_COLS` (3 — BCE head) | Next-step: `stable`, `habitable`, `habitable_from_temp` |
 
 `make_splits(path, val_frac=0.20, seed=42)` splits **by sim_id** (not by row) so no information leaks between train and val sequences.
 
@@ -692,21 +695,22 @@ Loads the Parquet file, fits `sklearn.StandardScaler` normalizers on the trainin
 
 ```python
 class MoonRNN(nn.Module):
-    def __init__(self, system_dim=12, state_dim=8, hidden=256, layers=2,
+    def __init__(self, system_dim=14, state_dim=7, hidden=256, layers=2,
                  rnn_type="gru", dropout=0.0):
         # nn.GRU or nn.LSTM selected by rnn_type
-        # Input at each step: state (8) concat system params (12) = 20-dim
-        # head_dist: Linear(hidden, 5) → relu → predicted distances/speeds
-        # head_flags: Linear(hidden, 2) → raw logits for stable + habitable
+        # Input at each step: state (7) concat system params (14) = 21-dim
+        # head_dist: Linear(hidden, 6) → relu → predicted distances/speeds + moon_temp_norm (MSE loss)
+        # head_flags: Linear(hidden, 3) → raw logits for stable, habitable, habitable_from_temp (BCE loss)
+        # stable/habitable are NOT in STATE_COLS — targets only, never fed back as inputs
 ```
 
 **Key methods**:
-- `forward(state_seq, sys_params)` → `(dist_pred, flag_logits)` — sys_params are broadcast and concatenated to state at every step
-- `compute_loss(dist_pred, flag_logits, targets)` — MSE for distances + 3× BCEWithLogitsLoss for flags
+- `forward(state_seq, sys_params)` → `(dist_pred, flag_logits)` — sys_params are broadcast and concatenated to state at every step; `dist_pred` is shape `(batch, seq, 6)`, `flag_logits` is `(batch, seq, 3)`
+- `compute_loss(dist_pred, flag_logits, targets)` — MSE on 6 dist/speed targets + BCEWithLogitsLoss on each of 3 flag targets (stable, habitable, habitable_from_temp), with 7× pos_weight on the two habitable targets
 - `save(out_dir)` — writes `gru_model.pt` (state dict) + `model_config.json`
 - `MoonRNN.load(out_dir)` — reads `model_config.json` first to reconstruct exact architecture, then loads weights
 
-`model_config.json` schema: `{"rnn_type", "hidden", "layers", "system_dim", "state_dim"}` — required so inference always reconstructs the correct architecture regardless of which hyperparams were used at training time.
+`model_config.json` schema: `{"rnn_type", "hidden", "layers", "system_dim", "state_dim"}` — required so inference always reconstructs the correct architecture regardless of which hyperparams were used at training time. Current trained models use `system_dim=14, state_dim=7`.
 
 ---
 
@@ -770,10 +774,10 @@ def predict_stability_map(
 ```
 
 **Algorithm**:
-1. Build `mm_grid` (log-spaced, `0.107 M⊕` → `min(mp_earth×0.30, 0.5) M⊕`) and `am_grid` (linear, 0.05 → 0.80 Hill radii)
+1. Build `mm_grid` (log-spaced, `0.107 M⊕` → `min(mp_earth×0.30, 0.5) M⊕`) and `am_grid` (linear, Roche-limit fraction → 1.0 Hill radii)
 2. For each of the N×N candidates: call `initial_state(SystemParams(...))` to get t=0 positions/velocities
 3. Normalize via `normalizer.pkl`; run all N×N through model in one batched forward pass
-4. Autoregressive rollout for `n_steps` steps: threshold `stable_logit > 0` and `habitable_logit > 0` at every step; track `ever_unstable` and `ever_uninhabited` boolean arrays
+4. Autoregressive rollout for `n_steps` steps. **Stability**: `stable_logit > 0` from flag head sets `ever_unstable`. **Habitability (AND criterion)**: both `moon_star_dist_norm ∉ [0, ARCSINH_1]` (dist head, `ARCSINH_1 = arcsinh(1.0) ≈ 0.881`) AND `habitable_logit < 0` (flag head) must agree at the same step before the candidate is marked `ever_uninhabited`. This requires both heads to simultaneously signal uninhabitable — a single-head misfire alone cannot disqualify a candidate.
 5. A candidate is "valid" if it remains stable AND habitable at **every** step
 
 **Returns**:
@@ -810,6 +814,115 @@ All four endpoints are defined in `agent_service.py`. They bypass the Claude too
 - `_ml_model_lock` — threading lock for concurrent predict requests
 - `_train_job` — dict tracking active training thread state
 - `ML_MODEL_DIR` — from `os.getenv("ML_MODEL_DIR", "../../models")` (absolute path resolved at startup)
+
+---
+
+### Permanent Baseline: `models_temphead` (NEVER OVERWRITE)
+
+**`src/models_temphead/` is the permanent reference checkpoint.** All files in this directory must never be deleted, overwritten, or used as the `--out` target for any training run. It is the guaranteed fallback for production inference.
+
+**To revert production to baseline**: copy all files from `models_temphead/` to `models/`.
+
+**Inference config that achieves the baseline numbers**: AND criterion + 5% outer-HZ tolerance (`ARCSINH_1_OUTER = arcsinh(1.05) ≈ 0.916`). Both are active in the current `inference.py`.
+
+**Architecture**: `system_dim=14, state_dim=7, hidden=256, layers=2, rnn_type=gru`
+- STATE_COLS: `[moon_planet_dist_norm, moon_star_dist_norm, moon_temp_norm, planet_star_dist, moon_speed, planet_speed, t_frac]` — no binary flags in state
+- `moon_star_dist_norm = arcsinh((moon_star_dist − a_inner) / hz_width)` — arcsinh-encoded HZ position
+- `moon_temp_norm = arcsinh((T_moon − T_cold) / temp_width)` — second independent habitability encoding via Stefan-Boltzmann temperature
+- SYS_COLS (14): includes `a_inner_au`, `a_outer_au` alongside `rhill_AU`
+- TARGET_FLAG_COLS: `[stable, habitable, habitable_from_temp]` (3 BCE heads)
+
+**4-gate acceptance evaluation** (strict metric: `(gt_stable AND gt_habitable AND ml_stable AND ml_habitable) / (gt_stable AND gt_habitable)`):
+
+| Gate | Stable recall | Habitable recall |
+|------|--------------|-----------------|
+| Kepler-452b-v2 prograde | 0.964 | 0.463 |
+| Kepler-452b-v2 retrograde | 0.940 | 0.632 |
+| Kepler-1229b prograde | 0.849 | 0.205 |
+| Kepler-1229b retrograde | 0.950 | 0.602 |
+| **Average habitable recall** | | **0.476** |
+
+**Training provenance**: Trained Jun 22, 2026. Dataset: pre-Stage-C local build — parameter ranges ms/rs 0.4–2.0 solar, Ts 3000–12000 K, ap_AU 0.2–3.5, am_hill fixed 0.05–0.80, mm_earth capped at min(mp×0.30, 0.50 M⊕), pure LHS (no conditional HZ), freeze-post-escape to first out-of-Hill-sphere value. 30 epochs, val_loss=0.208.
+
+**Future model versions** write to `models/` (the live inference target) or a new named directory. The `models_temphead/` directory is never the `--out` target. See `src/models_temphead/BASELINE_LOCKED.md` for full details.
+
+---
+
+### Current ML Status & Recall Baselines
+
+**Critical constraint**: Empirical stability thresholds (prograde ~0.4–0.5 Hill radii, retrograde ~0.93 Hill radii) must **never** be used in training or inference. The model must discover these emergent limits from simulated dynamics. Deterministic closed-form quantities (`rhill_AU`, `a_inner_au`, `a_outer_au`) are permitted inputs.
+
+#### Ground Truth Evaluation Grids
+
+Located in `src/ground_truth_grids/`. Four `.npz` + `.meta.json` file pairs — one per (system × direction):
+
+| File prefix | System | Why chosen |
+|---|---|---|
+| `Kepler_452_b_v2_{pro,retro}` | K-452b-v2 | Well-covered, typical mid-HZ system; representative of the bulk training distribution |
+| `Kepler_1229_b_{pro,retro}` | K-1229b | Sparse-regime system: small rhill_AU, planet near its HZ edge (ap=0.3006 AU, outer HZ≈0.309 AU); tests model behaviour at the hardest part of the parameter space |
+
+These four cases form the **4-system acceptance gate** — a model change must not regress any of them to be considered an improvement.
+
+Metric used: CLEAN-SUBSET habitable recall = correctly predicted stable-AND-habitable / (gt_stable=True AND gt_habitable=True). Requires model to predict both `ml_stable=True` AND `ml_habitable=True`.
+
+#### Trained Checkpoint Inventory
+
+| Directory (in `src/`) | Description | Notes |
+|---|---|---|
+| `models/` (deployed) | Currently holds `models_temphead` weights | Loaded by agent service at runtime |
+| `models_temphead/` | Baseline: temphead architecture (moon_temp_norm + habitable_from_temp head), no logfix/psdfix | Primary reference model |
+| `models_temphead_ss/` | Per-step Bernoulli SS fine-tune of models_temphead (sampling_prob 0→0.1, stopped epoch 8, never exceeded ~5% sampling) | Improved prograde recall; hurt retrograde (aligned both heads at wrong answer in retrograde edge-of-HZ systems) |
+| `models_temphead_ss_prefix/` | Shrinking-prefix K-step SS fine-tune (k_start=1000→k_end=1 over 15 ramp epochs, warm from models_temphead) | Best on K-452b-v2 alone; fails 4-system gate — regresses K-1229b retrograde catastrophically |
+| `models_logfix/` | Resolution-compression bug fix (log-transform of log-sampled SYS_COLS before StandardScaler) | Bug fix is real and correct; recall not improved vs baseline — not the dominant driver of habitable recall gap |
+
+`models_temphead` and `models_temphead_ss` carry their original pre-logfix/pre-psdfix weights. The AND criterion is inference-only and does not affect stored weights.
+
+#### Recall Baselines (fresh, as of 2026-07-02)
+
+Metric: `(gt_stable=True AND gt_habitable=True AND ml_stable=True AND ml_habitable=True) / (gt_stable=True AND gt_habitable=True)`
+
+**Stable recall** (for reference — much higher than habitable recall):
+
+| Model | K-452b-v2 pro | K-452b-v2 retro | K-1229b pro | K-1229b retro |
+|---|---|---|---|---|
+| models_temphead | 0.964 | 0.944 | 0.887 | 0.950 |
+| models_temphead_ss | 0.935 | 0.959 | 0.910 | 0.964 |
+
+**Habitable recall** — with AND criterion applied at inference (current state):
+
+| Model | K-452b-v2 pro | K-452b-v2 retro | K-1229b pro | K-1229b retro | Overall avg |
+|---|---|---|---|---|---|
+| models_temphead + AND | 0.386 | 0.581 | 0.170 | 0.596 | 0.433 |
+| models_temphead_ss + AND | 0.438 | 0.361 | 0.373 | 0.314 | 0.372 |
+
+The stable vs habitable recall gap (e.g. 0.964 vs 0.386 for K-452b-v2 prograde) is the core unsolved problem. It is not explained by any of the hypotheses tested to date.
+
+#### Two Failure Modes
+
+1. **Trajectory tracking failure** (K-452b-v2 prograde, K-1229b prograde): both dist head AND flag head fail together — the dist head's `moon_star_dist_norm` drifts outside [0, 0.881] during autoregressive rollout even for candidates that are truly habitable. The AND criterion cannot help — it requires head disagreement, but here both heads agree (and are both wrong). Root cause unknown; candidate: `moon_star_dist` is dominated by the slower planet-orbit timescale while `moon_planet_dist` benefits from the faster, frequently-repeating moon orbit timescale — a structural asymmetry between the two regression targets that was identified but never properly tested.
+
+2. **Classification miscalibration** (K-1229b retrograde): dist head tracks correctly (stays in [0, 0.881]) but flag head misfires uninhabitable. AND criterion fixed this for models_temphead (0.314→0.596). models_temphead_ss is largely immune to this fix because SS aligned both heads at the wrong answer together.
+
+#### What Was Tried and Discarded
+
+| Approach | Outcome |
+|---|---|
+| logfix: log-transform of log-sampled SYS_COLS before StandardScaler | Real bug, correctly fixed — but not the dominant driver of recall gap. Full recall regression when not applied consistently across all paths (training, dataset, inference). Abandoned. |
+| psdfix: planet_star_dist → planet_star_dist/ap_AU in STATE_COLS | Caused 0.386→0.025 recall catastrophe. Abandoned. |
+| Representational competition (dedicated habitable-only head) | Tied with multi-task model in fair 30-epoch comparison. Not a capacity/architecture problem. Discarded. |
+| Warmup-window extension / fractional-tolerance thresholds | Helped only one specific failure shape (K-1229b retrograde brief-dip pattern), negligible or harmful elsewhere. Discarded. |
+| ep capacity hypothesis | Refuted with n=595 validation sims (correlation ≈0). ep is proportionally represented in training. Discarded. |
+| 2D (Ts, ap_AU) box coverage gap | Original "0.9% vs 5.3%" comparison was apples-to-oranges. Redone fairly: 0.91% vs 1.31%, modest ~1.4×, not explanatory. Discarded. |
+| Per-step Bernoulli scheduled sampling (models_temphead_ss) | Hurt retrograde recall: aligned both heads at wrong answer. Only ~5% sampling at epoch 8 — barely any SS. Discarded. |
+| Shrinking-prefix K-step scheduled sampling (models_temphead_ss_prefix) | Helps K-452b-v2 (both directions) but catastrophically regresses K-1229b retrograde. Fails 4-system gate. Discarded. |
+| AND criterion for habitability (Option #1 — IMPLEMENTED) | Meaningful fix for classification miscalibration (K-1229b retrograde: +28pp on models_temphead). No effect on trajectory tracking failures. Kept in inference.py. |
+| Consistency regularization loss between dist and flag heads (Option #5) | Redundant with AND on the one failure mode it addresses; cannot help trajectory tracking failures where both heads fail together. Requires retraining. Not implemented. |
+
+#### Known Data Artifacts (Explicitly Deferred)
+
+1. **Freeze-post-escape labeling**: when a moon escapes mid-simulation, `moon_star_dist` freezes at its last pre-escape position for the remainder of the ~1000-step resampled trajectory. This means ~21–50% of `habitable=True` labels for escaped moons are actually replays of the last valid position, not real trajectory evolution. Confirmed real; confirmed not the dominant cause of the clean-subset recall problem; the fix (replace the freeze with a continuing arcsinh-scaled trajectory) requires full dataset regeneration and has never been built or tested.
+
+2. **Deep ensembles / uncertainty quantification**: discussed as a mechanism to surface low-confidence predictions near sparse regions of parameter space (small rhill_AU systems), not to fix accuracy directly. Not implemented.
 
 ---
 
@@ -1443,7 +1556,7 @@ curl -X POST http://localhost:8000/ml/predict \
 | `EXOMOON_BUCKET` | `my-exomoon-bucket` | S3 bucket for inputs/outputs. Agent writes `inputs/{job_id}/`, `outputs/{job_id}/`. |
 | `STATE_MACHINE_ARN` | `arn:aws:states:eu-west-2:...` | Full ARN of Step Functions state machine. |
 | `ANTHROPIC_API_KEY` | `sk-ant-v0-...` | Claude API key. Required for agent service. |
-| `ANTHROPIC_MODEL` | `claude-sonnet-4-20250514` | Claude model ID. Controls LLM capability and latency. |
+| `ANTHROPIC_MODEL` | `claude-sonnet-4-6` | Claude model ID. Controls LLM capability and latency. |
 | `CLAUDE_ENABLED` | `1` | Gates Claude client init. `0` to run agent without LLM (debug). |
 | `AGENT_SERVICE_URL` | `http://exomoon-agent-nlb-451ecd.elb.eu-west-2.amazonaws.com:8000` | Dash + Next.js use this for `/chat`, `/job/{id}/status`, `/ml/*`. Local: `http://127.0.0.1:8000`. |
 | `ML_MODEL_DIR` | `/app/models` | Path to directory containing `gru_model.pt`, `normalizer.pkl`, `model_config.json`. Defaults to `../../models` relative to `agent_service.py`. |
@@ -1460,7 +1573,7 @@ AWS_REGION=eu-west-2
 EXOMOON_BUCKET=exomoon-prod-bucket
 STATE_MACHINE_ARN=arn:aws:states:eu-west-2:123456789:stateMachine:ExomoonProductionSM
 ANTHROPIC_API_KEY=sk-ant-...
-ANTHROPIC_MODEL=claude-sonnet-4-20250514
+ANTHROPIC_MODEL=claude-sonnet-4-6
 CLAUDE_ENABLED=1
 AGENT_SERVICE_URL=http://exomoon-agent-nlb-production.elb.eu-west-2.amazonaws.com:8000
 ML_MODEL_DIR=/app/models

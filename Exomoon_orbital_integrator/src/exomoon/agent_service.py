@@ -7,6 +7,8 @@ import signal
 import pathlib
 import threading
 import traceback
+import hashlib
+import requests as _requests
 from contextlib import asynccontextmanager
 from typing import Any, Dict, Optional
 
@@ -95,7 +97,7 @@ if ANTHROPIC_API_KEY_RAW.startswith("{"):
 else:
     ANTHROPIC_API_KEY = ANTHROPIC_API_KEY_RAW
 
-ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-20250514")
+ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-6")
 
 CLAUDE_ENABLED = os.getenv("CLAUDE_ENABLED", "0") == "1"
 
@@ -105,18 +107,37 @@ claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY) if CLAUDE_ENABLED else N
 print(f"[STARTUP] CLAUDE_ENABLED={CLAUDE_ENABLED}, AWS_ENABLED={AWS_ENABLED}", flush=True)
 print(f"[STARTUP] anthropic available={anthropic is not None}, client created={claude is not None}", flush=True)
 
-# NumPy version guard — Numba 0.60 requires NumPy ≤ 2.0
+# NumPy version guard — Numba 0.60 requires NumPy 1.26.x (not 2.x).
+# NumPy 2.0+ causes Numba's LLVM compilation path to hang on Windows when
+# the cache is cold (i.e. after __pycache__ is deleted or first install).
 _np_ver = tuple(int(x) for x in np.__version__.split(".")[:2])
-if _np_ver > (2, 0):
+if _np_ver >= (2, 0):
     print(
-        f"[STARTUP] WARNING: NumPy {np.__version__} may be incompatible with Numba 0.60 "
-        f"(requires ≤ 2.0). Local simulations will likely crash. "
-        f"Fix: pip install 'numpy<2.1' then delete __pycache__ dirs and restart.",
+        f"[STARTUP] WARNING: NumPy {np.__version__} is incompatible with Numba 0.60 on Windows — "
+        f"Numba JIT will hang on cold cache. "
+        f"Fix: pip install 'numpy==1.26.4' then delete __pycache__ dirs and restart.",
         flush=True,
     )
 
 s3 = boto3.client("s3", region_name=AWS_REGION) if AWS_ENABLED and BUCKET else None
 sf = boto3.client("stepfunctions", region_name=AWS_REGION) if AWS_ENABLED and STATE_MACHINE_ARN else None
+
+# ── GPU trajectory-preview service (EC2 g4dn.xlarge, hnn_gpu_service.py) ──────
+GPU_SERVICE_URL       = os.getenv("GPU_SERVICE_URL", "http://52.56.252.104:8001")
+GPU_SERVICE_TIMEOUT_S = int(os.getenv("GPU_SERVICE_TIMEOUT_S", "1200"))
+# Inference cache — separate S3 bucket so existing nbody-time-series-storage is untouched
+INFERENCE_CACHE_BUCKET = os.getenv("INFERENCE_CACHE_BUCKET", "exomoon-ml-inference-cache")
+# Bump MODEL_VERSION when HNN weights are updated; old cache entries are automatically orphaned
+HNN_MODEL_VERSION = os.getenv("HNN_MODEL_VERSION", "hinge4_v1")
+# S3 client for inference cache (may differ from BUCKET region; reuse same region)
+_s3_cache = boto3.client("s3", region_name=AWS_REGION) if AWS_ENABLED else None
+
+# ── In-RAM trajectory cache — keeps full (N, n_out, 3) arrays after each batch run ──────────
+# Keyed by the same cache key as _inference_cache_key(). LRU-capped at _MAX_TRAJ_RAM entries.
+# Populated after every successful _forward_to_gpu call; looked up by /trajectory/cell_preview.
+_traj_ram_cache: Dict[str, dict] = {}
+_traj_ram_lock  = threading.Lock()
+_MAX_TRAJ_RAM   = 3   # keep at most 3 batch results in RAM (~90 MB each)
 
 
 # NEW: Session cache to track last job + simdata across multiple chat messages
@@ -605,6 +626,21 @@ def _tool_specs() -> list[dict]:
                     "t_sim": {"type": "number", "description": "Prediction horizon in simulated years (default 10)"},
                     "mm_resolution": {"type": "integer", "description": "Moon mass grid points (default 50)"},
                     "am_resolution": {"type": "integer", "description": "Moon orbit grid points (default 50)"},
+                    "rnn_type": {"type": "string", "description": "'gru' or 'lstm' — which trained model to use (default 'gru')"},
+                },
+                "required": [],
+            },
+        },
+        {
+            "name": "trajectory_preview",
+            "description": "Run a GPU batch trajectory preview over a moon mass × semi-major axis grid. Returns how many cells are stable+habitable. Use when the user asks for a physics-based trajectory sweep or wants to validate the ML prediction with actual dynamics.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "mode": {"type": "string", "description": "'gt_leapfrog' (Numba CUDA, ~2.3s) or 'hnn_hinge4' (HNN ML model, ~470s+S3 cached)"},
+                    "mm_resolution": {"type": "integer", "description": "Moon mass grid points — 30 or 50 (default 30)"},
+                    "am_resolution": {"type": "integer", "description": "Moon orbit grid points — 30 or 50 (default 30)"},
+                    "t_sim": {"type": "number", "description": "Simulation duration in years (default 10)"},
                 },
                 "required": [],
             },
@@ -631,8 +667,8 @@ def _tool_specs() -> list[dict]:
             "description": (
                 "Generate a PNG plot for ML model results. "
                 "plot_type options: "
-                "'loss_curves' — training + validation loss over epochs from training_history.json; "
-                "'flag_accuracy' — stable/habitable flag accuracy over epochs from training_history.json; "
+                "'loss_curves' — training + validation loss over epochs; "
+                "'flag_accuracy' — stable/habitable flag accuracy over epochs; "
                 "'heatmap' — 50×50 moon mass × orbit stability map from the last ML prediction. "
                 "Use when the user asks to visualise ML model performance or the stability heatmap."
             ),
@@ -642,6 +678,10 @@ def _tool_specs() -> list[dict]:
                     "plot_type": {
                         "type": "string",
                         "description": "'loss_curves', 'flag_accuracy', or 'heatmap'",
+                    },
+                    "rnn_type": {
+                        "type": "string",
+                        "description": "'gru' or 'lstm' — which model's history to plot for loss_curves/flag_accuracy (default 'gru')",
                     },
                 },
                 "required": ["plot_type"],
@@ -985,8 +1025,6 @@ def _execute_tool(tool_name: str, tool_input: Dict[str, Any], req: ChatRequest) 
 
         if tool_name == "ml_predict":
             try:
-                from exomoon.ml.inference import predict_stability_map as _predict_map
-
                 raw_params = req.params or {}
                 system_params = {
                     "ms_solar": float(raw_params.get("ms_solar", 1.0)),
@@ -997,20 +1035,19 @@ def _execute_tool(tool_name: str, tool_input: Dict[str, Any], req: ChatRequest) 
                     "ap_AU":    float(raw_params.get("ap_AU",    1.0)),
                     "ep":       float(raw_params.get("ep",       0.0)),
                 }
-                t_sim        = float(tool_input.get("t_sim",         req.years or 10.0))
-                mm_res       = int(tool_input.get("mm_resolution",   50))
-                am_res       = int(tool_input.get("am_resolution",   50))
-                moon_retro   = bool(raw_params.get("moon_retrograde", False))
-                em           = float(raw_params.get("em",            0.0))
+                t_sim      = float(tool_input.get("t_sim",        req.years or 10.0))
+                mm_res     = int(tool_input.get("mm_resolution",  50))
+                am_res     = int(tool_input.get("am_resolution",  50))
+                moon_retro = bool(raw_params.get("moon_retrograde", False))
+                em         = float(raw_params.get("em",           0.0))
 
-                result = _predict_map(
+                result = _predict_stability_map_mlp(
                     system_params   = system_params,
                     t_sim           = t_sim,
                     moon_retrograde = moon_retro,
                     em              = em,
                     mm_resolution   = mm_res,
                     am_resolution   = am_res,
-                    model_dir       = ML_MODEL_DIR,
                 )
                 if not result.get("ok"):
                     return result
@@ -1045,6 +1082,62 @@ def _execute_tool(tool_name: str, tool_input: Dict[str, Any], req: ChatRequest) 
                 }
             except Exception as e:
                 return {"ok": False, "message": f"ML prediction failed: {str(e)}"}
+
+        if tool_name == "trajectory_preview":
+            try:
+                raw_params = req.params or {}
+                system_params = {
+                    "ms_solar": float(raw_params.get("ms_solar", 1.0)),
+                    "rs_solar": float(raw_params.get("rs_solar", 1.0)),
+                    "Ts":       float(raw_params.get("Ts",       5772.0)),
+                    "mp_earth": float(raw_params.get("mp_earth", 1.0)),
+                    "dp_cgs":   float(raw_params.get("dp_cgs",   5.5)),
+                    "ap_AU":    float(raw_params.get("ap_AU",    1.0)),
+                    "ep":       float(raw_params.get("ep",       0.0)),
+                }
+                mode       = str(tool_input.get("mode",          "gt_leapfrog"))
+                mm_res     = int(tool_input.get("mm_resolution", 30))
+                am_res     = int(tool_input.get("am_resolution", 30))
+                t_sim      = float(tool_input.get("t_sim",       req.years or 10.0))
+                moon_retro = bool(raw_params.get("moon_retrograde", False))
+                em         = float(raw_params.get("em",          0.0))
+
+                traj_req = TrajectoryPreviewRequest(
+                    system_params   = system_params,
+                    t_sim           = t_sim,
+                    moon_retrograde = moon_retro,
+                    em              = em,
+                    mm_resolution   = mm_res,
+                    am_resolution   = am_res,
+                    mode            = mode,
+                )
+                result      = trajectory_preview(traj_req)
+                mm_grid     = result.get("mm_grid", [])
+                am_grid     = result.get("am_grid", [])
+                map_both    = result.get("map_both", [])
+                n_stable    = sum(v for row in map_both for v in row)
+                total       = len(mm_grid) * len(am_grid)
+                wall_s      = result.get("wall_s", 0)
+                from_cache  = result.get("from_cache", False)
+                return {
+                    "ok":            True,
+                    "mode":          mode,
+                    "n_stable_both": n_stable,
+                    "total_cells":   total,
+                    "wall_s":        wall_s,
+                    "from_cache":    from_cache,
+                    "message": (
+                        f"Trajectory preview ({mode}) complete in {wall_s:.1f}s"
+                        f"{' (from cache)' if from_cache else ''}. "
+                        f"{n_stable}/{total} cells stable+habitable. "
+                        f"Grid: {len(mm_grid)}×{len(am_grid)}, "
+                        f"{mm_grid[0]:.3f}–{mm_grid[-1]:.3f} M⊕ × "
+                        f"{am_grid[0]:.3f}–{am_grid[-1]:.3f} Hill radii."
+                        if mm_grid else "Trajectory preview complete."
+                    ),
+                }
+            except Exception as e:
+                return {"ok": False, "message": f"trajectory_preview failed: {str(e)}"}
 
         if tool_name == "ml_train":
             global _train_job
@@ -1083,13 +1176,16 @@ def _execute_tool(tool_name: str, tool_input: Dict[str, Any], req: ChatRequest) 
             import matplotlib.pyplot as _plt
 
             plot_type = str(tool_input.get("plot_type", "loss_curves")).strip().lower()
+            rnn_type_plot = str(tool_input.get("rnn_type", "gru")).lower().strip()
             _OUTPUTS_DIR.mkdir(exist_ok=True)
 
             try:
                 if plot_type in ("loss_curves", "flag_accuracy"):
-                    hist_path = pathlib.Path(ML_MODEL_DIR) / "training_history.json"
+                    hist_path = pathlib.Path(ML_MODEL_DIR) / f"{rnn_type_plot}_training_history.json"
                     if not hist_path.exists():
-                        return {"ok": False, "message": "No training_history.json found. Train the model first via ml_train."}
+                        hist_path = pathlib.Path(ML_MODEL_DIR) / "training_history.json"  # backward compat
+                    if not hist_path.exists():
+                        return {"ok": False, "message": f"No training history found for {rnn_type_plot.upper()} model. Train the model first via ml_train."}
                     import json as _json
                     with open(hist_path) as _fh:
                         hist = _json.load(_fh)
@@ -1520,12 +1616,13 @@ def _chat_with_claude(req: ChatRequest) -> Dict[str, Any]:
         "AND include a download link `[Download PNG](figure_url)` on the next line.\n"
         "- Dash URL: call `dash_url(planet, autorun)` to generate a shareable URL encoding current system parameters.\n"
         "- Environment debug: call `env_info()` when diagnosing Python import or module path issues.\n"
-        "- ML stability map: call `ml_predict(t_sim, mm_resolution, am_resolution)` to run GRU stability sweep (requires trained model).\n"
-        "- ML training: call `ml_train(data_path, epochs, ...)` to start background model training.\n"
-        "- ML plots: call `ml_plot(plot_type)` to generate a PNG. "
+        "- ML stability map: call `ml_predict(t_sim, mm_resolution, am_resolution, rnn_type)` to run stability sweep (rnn_type='gru' or 'lstm'; default 'gru'). Requires a trained model of that type.\n"
+        "- ML training: call `ml_train(data_path, rnn_type, epochs, ...)` to start background model training for the specified model type.\n"
+        "- ML plots: call `ml_plot(plot_type, rnn_type)` to generate a PNG. "
         "plot_type='loss_curves' → training/val loss curves; "
         "plot_type='flag_accuracy' → stable/habitable flag accuracy over epochs; "
         "plot_type='heatmap' → 50×50 stability map from last ml_predict run. "
+        "Pass rnn_type to select which model's history to plot (default 'gru'). "
         "Embed the returned `figure_url` as `![ML Plot](figure_url)` AND `[Download PNG](figure_url)` on the next line.\n"
         "- If `context.ml_prediction` is set, you already have ML prediction results — answer questions about valid mass/orbit ranges directly from that summary without calling `ml_predict` again.\n"
         "- Animation: if `context.animation_url` is set and the user asks for the animation, return `[Download Animation](url)` as a link. Do NOT call any tool for this — the URL is already in context.\n"
@@ -1549,11 +1646,15 @@ def _chat_with_claude(req: ChatRequest) -> Dict[str, Any]:
             
             resp = claude.messages.create(
                 model=ANTHROPIC_MODEL,
-                max_tokens=4096,
-                temperature=0,
+                max_tokens=16000,   # must exceed budget_tokens; accommodates 8k thinking + 8k response
+                thinking={
+                    "type": "enabled",
+                    "budget_tokens": 8000,
+                },
                 system=system_prompt,
                 tools=_tool_specs(),
                 messages=messages,
+                # temperature omitted — extended thinking requires default (1.0); 0 is not permitted
             )
 
             assistant_content = []
@@ -1562,7 +1663,16 @@ def _chat_with_claude(req: ChatRequest) -> Dict[str, Any]:
 
             # Process Claude's response
             for block in resp.content:
-                if block.type == "text":
+                if block.type == "thinking":
+                    # Preserve thinking blocks in assistant context for multi-turn consistency;
+                    # never surfaced to the user — excluded from final_text_parts.
+                    # signature is required by the API to verify the block wasn't tampered with.
+                    assistant_content.append({
+                        "type": "thinking",
+                        "thinking": block.thinking,
+                        "signature": block.signature,
+                    })
+                elif block.type == "text":
                     txt = getattr(block, "text", "")
                     final_text_parts.append(txt)
                     assistant_content.append({"type": "text", "text": txt})
@@ -2088,9 +2198,20 @@ def _format_claude_response(text: str) -> str:
 ML_MODEL_DIR = os.getenv("ML_MODEL_DIR", os.path.join(os.path.dirname(__file__), "..", "models"))
 ML_MODEL_DIR = os.path.abspath(ML_MODEL_DIR)
 
-# Lazy-loaded model: populated on first /ml/predict call, reloaded after training
-_ml_model      = None
-_ml_model_lock = threading.Lock()
+# Lazy-loaded model cache keyed by rnn_type ("gru" / "lstm")
+_ml_model_cache: Dict[str, Any] = {}
+_ml_model_lock  = threading.Lock()
+
+# AuxMLPBinary binary classifier cache
+_mlp_binary_cache: Optional[dict] = None
+_mlp_binary_lock  = threading.Lock()
+
+# Absolute path to src/ (one level above exomoon/)
+_SRC_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+# AuxMLPBinary model directory
+_MLP_DIR = os.path.join(_SRC_DIR, "models_mlp")
+# HNN hinge4 model directory
+_HNN_DIR = os.path.join(_SRC_DIR, "models_hnn_hill_hinge4")
 
 # Training job state (single training job at a time)
 _train_job: Dict[str, Any] = {}
@@ -2103,6 +2224,7 @@ class MlPredictRequest(BaseModel):
     em:              float   = 0.0
     mm_resolution:   int     = 50
     am_resolution:   int     = 50
+    model_type:      str     = "gru"      # "gru" or "lstm"
 
 
 class MlTrainRequest(BaseModel):
@@ -2114,53 +2236,190 @@ class MlTrainRequest(BaseModel):
     hidden:     int   = 256
     layers:     int   = 2
     rnn_type:   str   = "gru"
+    input_noise_scale: float = 0.0   # 0.0 disables; 1.0 = noise std matches measured per-column MAE
 
 
-def _load_ml_model():
+def _load_ml_model(rnn_type: str = "gru"):
     """Lazy-load the trained MoonRNN from ML_MODEL_DIR. Returns None if not found."""
-    global _ml_model
-    model_pt = os.path.join(ML_MODEL_DIR, "gru_model.pt")
-    cfg_pt   = os.path.join(ML_MODEL_DIR, "model_config.json")
+    global _ml_model_cache
+    model_pt = os.path.join(ML_MODEL_DIR, f"{rnn_type}_model.pt")
+    cfg_pt   = os.path.join(ML_MODEL_DIR, f"{rnn_type}_model_config.json")
+    # backward compat: also accept legacy model_config.json for gru
+    if not os.path.exists(cfg_pt) and rnn_type == "gru":
+        cfg_pt = os.path.join(ML_MODEL_DIR, "model_config.json")
     if not (os.path.exists(model_pt) and os.path.exists(cfg_pt)):
         return None
     try:
         from exomoon.ml.model import MoonRNN
-        _ml_model = MoonRNN.load(ML_MODEL_DIR)
-        print(f"[ML] Loaded model from {ML_MODEL_DIR}", flush=True)
-        return _ml_model
+        model = MoonRNN.load(ML_MODEL_DIR, rnn_type=rnn_type)
+        _ml_model_cache[rnn_type] = model
+        print(f"[ML] Loaded {rnn_type.upper()} model from {ML_MODEL_DIR}", flush=True)
+        return model
     except Exception as e:
-        print(f"[ML] Failed to load model: {e}", flush=True)
+        print(f"[ML] Failed to load {rnn_type} model: {e}", flush=True)
         return None
+
+
+def _load_mlp_binary() -> Optional[dict]:
+    """Lazy-load AuxMLPBinary + scaler from _MLP_DIR. Returns {model, scaler} or None."""
+    global _mlp_binary_cache
+    pt_path = os.path.join(_MLP_DIR, "aux_mlp_binary.pt")
+    sc_path = os.path.join(_MLP_DIR, "aux_mlp_scaler.pkl")
+    if not (os.path.exists(pt_path) and os.path.exists(sc_path)):
+        return None
+    try:
+        import pickle, torch, torch.nn as nn
+
+        class _AuxMLPBinary(nn.Module):
+            def __init__(self, input_dim: int = 14, hidden: int = 64):
+                super().__init__()
+                self.net = nn.Sequential(
+                    nn.Linear(input_dim, hidden), nn.ReLU(),
+                    nn.Linear(hidden, hidden),    nn.ReLU(),
+                    nn.Linear(hidden, hidden),    nn.ReLU(),
+                    nn.Linear(hidden, 2),
+                )
+            def forward(self, x):  # type: ignore[override]
+                return self.net(x)
+
+        model = _AuxMLPBinary()
+        model.load_state_dict(torch.load(pt_path, map_location="cpu", weights_only=True))
+        model.eval()
+        with open(sc_path, "rb") as fh:
+            scaler = pickle.load(fh)
+        _mlp_binary_cache = {"model": model, "scaler": scaler}
+        print("[ML] Loaded AuxMLPBinary from models_mlp/", flush=True)
+        return _mlp_binary_cache
+    except Exception as e:
+        print(f"[ML] Failed to load AuxMLPBinary: {e}", flush=True)
+        return None
+
+
+def _predict_stability_map_mlp(
+    system_params:   dict,
+    t_sim:           float,
+    moon_retrograde: bool,
+    em:              float,
+    mm_resolution:   int,
+    am_resolution:   int,
+) -> dict:
+    """AuxMLPBinary grid sweep — replaces GRU predict_stability_map for /ml/predict."""
+    import torch
+    from exomoon.ml.dataset   import SYS_COLS, LOG_SYS_COLS
+    from exomoon.habitable_zone import hz_bounds_au
+    from exomoon.constants      import merth, msun, rsun, au
+
+    # Load cached model + scaler
+    with _mlp_binary_lock:
+        cached = _mlp_binary_cache if _mlp_binary_cache is not None else _load_mlp_binary()
+    if cached is None:
+        return {"ok": False, "error": "no_model",
+                "message": "No AuxMLPBinary model found in models_mlp/. "
+                           "Run eval_aux_mlp.py --mode cls first."}
+
+    model  = cached["model"]
+    scaler = cached["scaler"]
+
+    mp  = float(system_params.get("mp_earth", 1.0))
+    ms  = float(system_params.get("ms_solar",  1.0))
+    rs  = float(system_params.get("rs_solar",  1.0))
+    Ts  = float(system_params.get("Ts",        5772.0))
+    ap  = float(system_params.get("ap_AU",     1.0))
+    ep  = float(system_params.get("ep",        0.0))
+    dp  = float(system_params.get("dp_cgs",    5.5))
+
+    # Derived physical quantities
+    mp_kg    = mp * merth
+    ms_kg    = ms * msun
+    rs_m     = rs * rsun
+    rhill_AU = ap * (1.0 - ep) * (mp_kg / (3.0 * ms_kg)) ** (1.0 / 3.0)
+    a_inner_au, a_outer_au = hz_bounds_au(Ts, rs_m)
+
+    # Roche limit (fluid-body; rocky moon assumption)
+    _MOON_DENSITY_CGS = 3.0
+    rp_m       = (0.75 * mp_kg / (np.pi * (dp * 1e3))) ** (1.0 / 3.0)
+    a_roche_AU = (2.456 * rp_m * (dp / _MOON_DENSITY_CGS) ** (1.0 / 3.0)) / au
+
+    # Build grids (identical to GRU inference.py construction)
+    _MARS_MASS = 0.107
+    mm_min  = _MARS_MASS
+    mm_max  = max(min(mp, 3.0), mm_min * 1.01)
+    mm_grid = np.exp(np.linspace(np.log(mm_min), np.log(mm_max), mm_resolution))
+
+    am_min  = max(a_roche_AU / rhill_AU, 1e-3) if rhill_AU > 1e-6 else 1e-3
+    am_grid = np.linspace(am_min, 1.0, am_resolution)
+
+    # Build feature matrix [mm_res × am_res, 14]
+    retro = float(int(moon_retrograde))
+    vecs: list = []
+    for mm in mm_grid:
+        for am_ in am_grid:
+            vecs.append([ms, rs, Ts, mp, ap, ep,
+                         float(mm), float(am_), em, retro,
+                         t_sim, rhill_AU, a_inner_au, a_outer_au])
+
+    X = np.array(vecs, dtype=np.float32)
+
+    # Log-transform LOG_SYS_COLS before scaling (matches training preprocessing)
+    log_idx = [SYS_COLS.index(c) for c in LOG_SYS_COLS if c in SYS_COLS]
+    X_log   = X.copy()
+    X_log[:, log_idx] = np.log(np.clip(X_log[:, log_idx], 1e-10, None))
+    X_sc = scaler.transform(X_log).astype(np.float32)
+
+    # Forward pass
+    model.eval()
+    with torch.no_grad():
+        probs = torch.sigmoid(model(torch.from_numpy(X_sc))).numpy()
+
+    _THRESH = 0.5
+    stable    = (probs[:, 0] >= _THRESH).reshape(mm_resolution, am_resolution)
+    habitable = (probs[:, 1] >= _THRESH).reshape(mm_resolution, am_resolution)
+    both      = stable & habitable
+
+    # Compute valid ranges
+    valid_am_per_mm: list = []
+    valid_mm_idx:    list = []
+    for i, row in enumerate(both):
+        cols = np.where(row)[0]
+        if len(cols) == 0:
+            valid_am_per_mm.append(None)
+        else:
+            valid_am_per_mm.append([float(am_grid[cols[0]]), float(am_grid[cols[-1]])])
+            valid_mm_idx.append(i)
+
+    valid_mm_range = (
+        [float(mm_grid[valid_mm_idx[0]]), float(mm_grid[valid_mm_idx[-1]])]
+        if valid_mm_idx else None
+    )
+
+    return {
+        "ok":             True,
+        "map_stable":     stable.tolist(),
+        "map_habitable":  habitable.tolist(),
+        "map_both":       both.tolist(),
+        "mm_grid":        mm_grid.tolist(),
+        "am_grid":        am_grid.tolist(),
+        "valid_mm_range": valid_mm_range,
+        "valid_am_per_mm": valid_am_per_mm,
+    }
 
 
 @app.post("/ml/predict")
 def ml_predict(req: MlPredictRequest):
     """
     Run stability-habitability map inference over a mm_earth × am_hill grid.
-    Lazy-loads the trained MoonRNN on first call.
-    Returns {"ok": False, "error": "no_model"} if no trained model exists yet.
+    Uses AuxMLPBinary (fast, ~ms); lazy-loads on first call.
+    Returns {"ok": False, "error": "no_model"} if model weights are missing.
     """
-    global _ml_model
-    with _ml_model_lock:
-        if _ml_model is None:
-            _ml_model = _load_ml_model()
-        if _ml_model is None:
-            return {"ok": False, "error": "no_model",
-                    "message": f"No trained model found in {ML_MODEL_DIR}. "
-                               "Train one first using the ML window."}
-
     try:
-        from exomoon.ml.inference import predict_stability_map
-        result = predict_stability_map(
+        return _predict_stability_map_mlp(
             system_params   = req.system_params,
             t_sim           = req.t_sim,
             moon_retrograde = req.moon_retrograde,
             em              = req.em,
             mm_resolution   = req.mm_resolution,
             am_resolution   = req.am_resolution,
-            model_dir       = ML_MODEL_DIR,
         )
-        return result
     except Exception as e:
         print(f"[ML] Predict error: {e}", flush=True)
         traceback.print_exc()
@@ -2197,6 +2456,7 @@ def _run_training_thread(req: MlTrainRequest) -> None:
             rnn_type   = req.rnn_type,
             verbose    = True,
             status_cb  = _status_cb,
+            input_noise_scale = req.input_noise_scale,
         )
         _train_job.update({
             "status": "complete",
@@ -2205,9 +2465,9 @@ def _run_training_thread(req: MlTrainRequest) -> None:
             "train_loss": history["train_loss"][-1] if history["train_loss"] else None,
             "val_loss":   history["val_loss"][-1]   if history["val_loss"]   else None,
         })
-        # Invalidate cached model so next /ml/predict reloads the freshly-trained weights
+        # Invalidate this model type's cache so next /ml/predict reloads fresh weights
         with _ml_model_lock:
-            _ml_model = None
+            _ml_model_cache.pop(req.rnn_type, None)
         print(f"[ML] Training complete. Model saved to {out_dir}", flush=True)
     except Exception as e:
         _train_job.update({"status": "failed", "error": str(e)})
@@ -2263,17 +2523,396 @@ def ml_train_status():
 
 
 @app.get("/ml/train/history")
-def ml_train_history():
+def ml_train_history(model_type: str = "gru"):
     """
-    Return training_history.json (loss curves, hyperparams, flag accuracy).
+    Return training history JSON for the requested model type.
+    model_type="hnn"  → models_hnn_hill_hinge4/hnn_hill_training_history.json
+    model_type="gru"  → {ML_MODEL_DIR}/training_history.json (legacy fallback)
     Returns {"ok": False} if no history file exists yet.
     """
-    hist_file = os.path.join(ML_MODEL_DIR, "training_history.json")
-    if not os.path.exists(hist_file):
-        return {"ok": False, "message": "No training history found. Train a model first."}
+    rnn_type = model_type.lower().strip()
+
+    # HNN hinge4 lives in its own directory outside ML_MODEL_DIR
+    if rnn_type == "hnn":
+        hist_file = os.path.join(_HNN_DIR, "hnn_hill_training_history.json")
+        if not os.path.exists(hist_file):
+            return {"ok": False, "message": "No HNN training history found."}
+        try:
+            with open(hist_file) as f:
+                history = json.load(f)
+            return {"ok": True, **history}
+        except Exception as e:
+            return {"ok": False, "message": f"Error reading HNN history: {e}"}
+
+    # MLP binary model has its own directory; check there first
+    if rnn_type == "mlp":
+        for candidate in [
+            os.path.join(_MLP_DIR, "mlp_training_history.json"),
+            os.path.join(_MLP_DIR, "aux_mlp_binary_training_history.json"),
+            os.path.join(ML_MODEL_DIR, "mlp_training_history.json"),
+        ]:
+            if os.path.exists(candidate):
+                hist_file = candidate
+                break
+        else:
+            return {"ok": False, "message": "No MLP training history found. Train a model first."}
+    else:
+        # GRU / LSTM path
+        hist_file = os.path.join(ML_MODEL_DIR, f"{rnn_type}_training_history.json")
+        if not os.path.exists(hist_file):
+            # backward compat: legacy filename for gru
+            if rnn_type == "gru":
+                hist_file = os.path.join(ML_MODEL_DIR, "training_history.json")
+            if not os.path.exists(hist_file):
+                return {"ok": False, "message": f"No {rnn_type.upper()} training history found. Train a model first."}
     try:
         with open(hist_file) as f:
             history = json.load(f)
         return {"ok": True, **history}
     except Exception as e:
         return {"ok": False, "message": f"Error reading history: {e}"}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Trajectory preview endpoints — GPU HNN hinge4 + GPU GT batch leapfrog
+# Both proxy to hnn_gpu_service.py on EC2, with S3 read-through caching.
+# Cache bucket: exomoon-ml-inference-cache (separate from nbody-time-series-storage)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TrajectoryPreviewRequest(BaseModel):
+    system_params:   Dict[str, Any]
+    t_sim:           float = 10.0
+    moon_retrograde: bool  = False
+    em:              float = 0.0
+    mm_resolution:   int   = 30
+    am_resolution:   int   = 30
+    escape_factor:   float = 1.0
+    mode:            str   = "hnn_hinge4"    # "hnn_hinge4" or "gt_leapfrog"
+    model_version:   str   = HNN_MODEL_VERSION
+    force_refresh:   bool  = False           # bypass S3 cache and force a fresh EC2 call
+
+
+# Large array fields returned by the GPU inference functions that are never consumed
+# by the frontend — strip them before caching and before sending the HTTP response.
+# This keeps the response JSON < 100 KB instead of 200+ MB.
+_STRIP_KEYS = frozenset({
+    "traj_planet", "traj_star", "traj_moon",
+    "t_grid", "moon_planet_dist",
+    "stop_step", "initially_habitable",
+})
+
+
+def _strip_heavy(result: Dict) -> Dict:
+    return {k: v for k, v in result.items() if k not in _STRIP_KEYS}
+
+
+def _inference_cache_key(req: TrajectoryPreviewRequest) -> str:
+    """SHA-256 of canonical JSON over all request fields (floats rounded to 6dp)."""
+    key_dict = {
+        "params":        {k: round(float(v), 6) for k, v in req.system_params.items()},
+        "t_sim":         round(req.t_sim, 4),
+        "moon_retrograde": bool(req.moon_retrograde),
+        "em":            round(req.em, 6),
+        "mm_res":        req.mm_resolution,
+        "am_res":        req.am_resolution,
+        "escape_factor": round(req.escape_factor, 4),
+        "mode":          req.mode,
+        "model_version": req.model_version,
+    }
+    return hashlib.sha256(
+        json.dumps(key_dict, sort_keys=True).encode()
+    ).hexdigest()[:16]
+
+
+def _cache_s3_key(mode: str, key: str) -> str:
+    return f"ml_inference_cache/{mode}/{key}.json"
+
+
+def _read_cache(mode: str, key: str) -> Optional[Dict]:
+    """Return cached result dict if present in S3, else None."""
+    if _s3_cache is None:
+        return None
+    try:
+        obj = _s3_cache.get_object(Bucket=INFERENCE_CACHE_BUCKET, Key=_cache_s3_key(mode, key))
+        data = json.loads(obj["Body"].read().decode())
+        data["from_cache"] = True
+        return data
+    except _s3_cache.exceptions.NoSuchKey:
+        return None
+    except botocore.exceptions.ClientError as e:
+        if e.response["Error"]["Code"] in ("NoSuchKey", "404"):
+            return None
+        print(f"[CACHE] S3 read error: {e}", flush=True)
+        return None
+    except Exception as e:
+        print(f"[CACHE] Unexpected read error: {e}", flush=True)
+        return None
+
+
+def _write_cache(mode: str, key: str, result: Dict) -> None:
+    """Upload result JSON to S3 cache (best-effort, never blocks the response)."""
+    if _s3_cache is None:
+        return
+    try:
+        payload = dict(result)
+        payload["from_cache"] = False
+        _s3_cache.put_object(
+            Bucket=INFERENCE_CACHE_BUCKET,
+            Key=_cache_s3_key(mode, key),
+            Body=json.dumps(payload).encode(),
+            ContentType="application/json",
+        )
+        print(f"[CACHE] Written {mode}/{key} ({len(json.dumps(payload))} bytes)", flush=True)
+    except Exception as e:
+        print(f"[CACHE] Write failed (non-fatal): {e}", flush=True)
+
+
+def _store_traj_ram_cache(key: str, result: Dict, mm_resolution: int, am_resolution: int) -> None:
+    """Store full trajectory arrays in RAM as numpy float32 arrays for instant per-cell access."""
+    import numpy as np
+    missing = [k for k in ("traj_planet", "traj_star", "traj_moon", "t_grid") if k not in result]
+    if missing:
+        print(f"[TRAJ_RAM] Skipping store — missing keys: {missing}", flush=True)
+        return
+    try:
+        tp = result["traj_planet"]
+        ts = result["traj_star"]
+        tm = result["traj_moon"]
+        tg = result["t_grid"]
+        print(f"[TRAJ_RAM] Converting arrays: traj_planet N={len(tp) if tp else 0}, "
+              f"n_out={len(tp[0]) if tp and tp[0] else 0}", flush=True)
+        entry = {
+            "traj_planet":   np.array(tp, dtype=np.float32),  # (N, n_out, 3)
+            "traj_star":     np.array(ts, dtype=np.float32),
+            "traj_moon":     np.array(tm, dtype=np.float32),
+            "t_grid":        np.array(tg, dtype=np.float32),  # (n_out,)
+            "mm_resolution": mm_resolution,
+            "am_resolution": am_resolution,
+        }
+        # Verify shape before storing
+        assert entry["traj_planet"].ndim == 3, f"traj_planet ndim={entry['traj_planet'].ndim}, expected 3"
+        with _traj_ram_lock:
+            _traj_ram_cache[key] = entry
+            while len(_traj_ram_cache) > _MAX_TRAJ_RAM:
+                _traj_ram_cache.pop(next(iter(_traj_ram_cache)))
+        n_out = entry["t_grid"].shape[0]
+        mb = (entry["traj_planet"].nbytes + entry["traj_star"].nbytes +
+              entry["traj_moon"].nbytes) / 1e6
+        print(f"[TRAJ_RAM] Stored key={key} shape=({mm_resolution}×{am_resolution}, {n_out}) "
+              f"size={mb:.1f}MB cache_size={len(_traj_ram_cache)}", flush=True)
+    except Exception as e:
+        print(f"[TRAJ_RAM] Store FAILED: {type(e).__name__}: {e}", flush=True)
+
+
+def _forward_to_gpu(mode: str, req: TrajectoryPreviewRequest) -> Dict:
+    """Forward batch request to EC2 hnn_gpu_service.py and return parsed JSON result."""
+    endpoint = "/hnn/predict" if mode == "hnn_hinge4" else "/gt/predict"
+    url = GPU_SERVICE_URL.rstrip("/") + endpoint
+    body = {
+        "system_params":   req.system_params,
+        "t_sim":           req.t_sim,
+        "moon_retrograde": req.moon_retrograde,
+        "em":              req.em,
+        "mm_resolution":   req.mm_resolution,
+        "am_resolution":   req.am_resolution,
+        "escape_factor":   req.escape_factor,
+        "n_steps":         5000,
+    }
+    resp = _requests.post(url, json=body, timeout=GPU_SERVICE_TIMEOUT_S)
+    resp.raise_for_status()
+    return resp.json()
+
+
+@app.post("/trajectory/preview")
+def trajectory_preview(req: TrajectoryPreviewRequest):
+    """
+    GPU trajectory preview with S3 read-through cache.
+
+    mode="hnn_hinge4"  → EC2 /hnn/predict (HNN hinge4 on T4 GPU, ~44–474s)
+    mode="gt_leapfrog" → EC2 /gt/predict  (GT batch leapfrog on T4 GPU, ~193–250s)
+
+    On cache HIT:  returns stored result with from_cache=true  (~10ms)
+    On cache MISS: runs GPU inference, stores result, returns with from_cache=false
+    """
+    mode = req.mode
+    if mode not in ("hnn_hinge4", "gt_leapfrog"):
+        raise HTTPException(status_code=400, detail=f"Unknown mode '{mode}'. Use 'hnn_hinge4' or 'gt_leapfrog'.")
+
+    key = _inference_cache_key(req)
+    print(f"[TRAJECTORY] mode={mode} key={key} mm={req.mm_resolution}x{req.am_resolution} force_refresh={req.force_refresh}", flush=True)
+
+    # ── Cache read (skipped when force_refresh=True) ───────────────────────────
+    if not req.force_refresh:
+        cached = _read_cache(mode, key)
+        if cached is not None:
+            with _traj_ram_lock:
+                ram_hit = key in _traj_ram_cache
+            if ram_hit:
+                # S3 hit + RAM hit: everything ready, return instantly
+                print(f"[TRAJECTORY] S3+RAM cache HIT for {mode}/{key}", flush=True)
+                r = _strip_heavy(cached)
+                r["cache_key"] = key
+                return r
+            # S3 hit but RAM empty (agent restarted, or first session with this key).
+            # S3 entries are stripped — trajectory arrays not inside.
+            # Must call EC2 to repopulate RAM so cell clicks can slice from it.
+            print(f"[TRAJECTORY] S3 HIT but RAM empty for {mode}/{key} — calling EC2 to populate RAM", flush=True)
+
+    # ── Cache miss → GPU inference ─────────────────────────────────────────────
+    print(f"[TRAJECTORY] Cache MISS — forwarding to GPU service at {GPU_SERVICE_URL}", flush=True)
+    try:
+        result = _forward_to_gpu(mode, req)
+    except _requests.exceptions.Timeout:
+        raise HTTPException(status_code=504,
+                            detail=f"GPU service timed out after {GPU_SERVICE_TIMEOUT_S}s")
+    except _requests.exceptions.ConnectionError as e:
+        raise HTTPException(status_code=502,
+                            detail=f"Cannot reach GPU service at {GPU_SERVICE_URL}: {e}")
+    except _requests.exceptions.HTTPError as e:
+        raise HTTPException(status_code=502,
+                            detail=f"GPU service returned error: {e}")
+
+    # Store full trajectory arrays in RAM BEFORE stripping — cell clicks read from here
+    _store_traj_ram_cache(key, result, req.mm_resolution, req.am_resolution)
+
+    # Strip large trajectory arrays — frontend only needs classification maps.
+    # This keeps the response and cache entry < 100 KB instead of 200+ MB.
+    result = _strip_heavy(result)
+    result["mode"]          = mode
+    result["model_version"] = req.model_version
+    result["from_cache"]    = False
+    result["cache_key"]     = key   # sent back to frontend so cell clicks can use it directly
+
+    # ── Cache write (background thread — never delays the response) ────────────
+    threading.Thread(
+        target=_write_cache, args=(mode, key, result), daemon=True
+    ).start()
+
+    return result
+
+
+def _traj_to_frames(planet_arr, star_arr, moon_arr, t_grid) -> list:
+    """Convert (n_out, 3) numpy/list arrays → TrajectoryFrame dicts."""
+    frames = []
+    for i in range(len(t_grid)):
+        px, py, pz = float(planet_arr[i][0]), float(planet_arr[i][1]), float(planet_arr[i][2])
+        sx, sy, sz = float(star_arr[i][0]),   float(star_arr[i][1]),   float(star_arr[i][2])
+        mx, my, mz = float(moon_arr[i][0]),   float(moon_arr[i][1]),   float(moon_arr[i][2])
+        mpd = ((mx - px) ** 2 + (my - py) ** 2 + (mz - pz) ** 2) ** 0.5
+        psd = ((px - sx) ** 2 + (py - sy) ** 2 + (pz - sz) ** 2) ** 0.5
+        msd = ((mx - sx) ** 2 + (my - sy) ** 2 + (mz - sz) ** 2) ** 0.5
+        frames.append({
+            "t_years":          float(t_grid[i]),
+            "star_x":           sx,  "star_y":   sy,  "star_z":   sz,
+            "planet_x":         px,  "planet_y": py,  "planet_z": pz,
+            "moon_x":           mx,  "moon_y":   my,  "moon_z":   mz,
+            "star_vx":          0.0, "star_vy":  0.0, "star_vz":  0.0,
+            "planet_vx":        0.0, "planet_vy":0.0, "planet_vz":0.0,
+            "moon_vx":          0.0, "moon_vy":  0.0, "moon_vz":  0.0,
+            "moon_planet_dist": mpd,
+            "planet_star_dist": psd,
+            "moon_star_dist":   msd,
+            "moon_speed":       0.0,
+            "planet_speed":     0.0,
+            "star_speed":       0.0,
+        })
+    return frames
+
+
+class CellPreviewRequest(BaseModel):
+    system_params:   Dict[str, Any]
+    mm_idx:          int             # grid indices — primary lookup key
+    am_idx:          int
+    mm_earth:        float           # physical values — EC2 fallback only
+    am_hill:         float
+    t_sim:           float = 10.0
+    moon_retrograde: bool  = False
+    em:              float = 0.0
+    mm_resolution:   int   = 50
+    am_resolution:   int   = 50
+    escape_factor:   float = 1.0
+    mode:            str   = "gt_leapfrog"
+    model_version:   str   = HNN_MODEL_VERSION
+    cache_key:       Optional[str] = None  # exact key from batch response — skips reconstruction
+
+
+@app.post("/trajectory/cell_preview")
+def trajectory_cell_preview(req: CellPreviewRequest):
+    """
+    Return trajectory frames for a single grid cell from the RAM cache populated by /trajectory/preview.
+
+    The batch runs at n_steps=5000, so the RAM cache holds smooth ~50-frames/orbit trajectories.
+    Cell clicks read from RAM instantly — no per-click EC2 call.
+    If the batch hasn't been run yet (RAM empty), returns 503.
+    """
+    if req.mode not in ("hnn_hinge4", "gt_leapfrog"):
+        raise HTTPException(status_code=400, detail=f"Unknown mode '{req.mode}'")
+
+    key = req.cache_key
+    if not key:
+        raise HTTPException(status_code=400, detail="cache_key is required — send the key returned by /trajectory/preview")
+
+    with _traj_ram_lock:
+        entry = _traj_ram_cache.get(key)
+
+    if entry is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Batch trajectory not in RAM cache. Run 'Run Trajectory Batch' first.",
+        )
+
+    mm_resolution = entry.get("mm_resolution", req.mm_resolution)
+    am_resolution = entry.get("am_resolution", req.am_resolution)
+
+    if req.mm_idx < 0 or req.mm_idx >= mm_resolution:
+        raise HTTPException(status_code=400, detail=f"mm_idx {req.mm_idx} out of range [0, {mm_resolution})")
+    if req.am_idx < 0 or req.am_idx >= am_resolution:
+        raise HTTPException(status_code=400, detail=f"am_idx {req.am_idx} out of range [0, {am_resolution})")
+
+    cell_idx = req.mm_idx * am_resolution + req.am_idx
+    traj_planet = entry["traj_planet"]
+    traj_star   = entry["traj_star"]
+    traj_moon   = entry["traj_moon"]
+    t_grid      = entry["t_grid"]
+
+    frames = _traj_to_frames(traj_planet[cell_idx], traj_star[cell_idx], traj_moon[cell_idx], t_grid)
+    print(f"[CELL_PREVIEW] RAM hit key={key} cell=({req.mm_idx},{req.am_idx}) idx={cell_idx} n_frames={len(frames)}", flush=True)
+    return {"ok": True, "frames": frames, "n_frames": len(frames),
+            "from_ram_cache": True, "mode": req.mode}
+
+
+@app.get("/trajectory/preview/cache/invalidate")
+@app.get("/trajectory/ram_cache/debug")
+def ram_cache_debug():
+    """Show current RAM cache state — keys stored, shapes, sizes."""
+    with _traj_ram_lock:
+        entries = {}
+        for k, v in _traj_ram_cache.items():
+            try:
+                import numpy as np
+                tp = v["traj_planet"]
+                entries[k] = {
+                    "shape": list(tp.shape) if hasattr(tp, "shape") else f"list[{len(tp)}]",
+                    "mm_resolution": v.get("mm_resolution"),
+                    "am_resolution": v.get("am_resolution"),
+                    "n_out": int(v["t_grid"].shape[0]) if hasattr(v["t_grid"], "shape") else len(v["t_grid"]),
+                    "mb": round((tp.nbytes + v["traj_star"].nbytes + v["traj_moon"].nbytes) / 1e6, 1) if hasattr(tp, "nbytes") else "unknown",
+                }
+            except Exception as e:
+                entries[k] = {"error": str(e)}
+    return {"cache_size": len(_traj_ram_cache), "max": _MAX_TRAJ_RAM, "entries": entries}
+
+
+def invalidate_cache(mode: str = "hnn_hinge4", key: str = ""):
+    """
+    Delete one cache entry (for testing / after model weight update).
+    Pass key= from the cache key computed at request time, or leave blank to see usage.
+    """
+    if not key:
+        return {"ok": False, "message": "Provide ?key=<16-char-hex> to delete a specific entry."}
+    s3_key = _cache_s3_key(mode, key)
+    try:
+        _s3_cache.delete_object(Bucket=INFERENCE_CACHE_BUCKET, Key=s3_key)
+        return {"ok": True, "deleted": s3_key}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))

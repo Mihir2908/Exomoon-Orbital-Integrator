@@ -1,0 +1,7 @@
+{
+  "q_dim": 9,
+  "sys_dim": 6,
+  "hidden": 64,
+  "layers": 2,
+  "layer_sizes": null
+}

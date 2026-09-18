@@ -15,6 +15,8 @@ const Plot = dynamic(() => import('react-plotly.js'), {
 });
 
 const AGENT_URL = process.env.NEXT_PUBLIC_AGENT_URL ?? 'http://127.0.0.1:8000';
+// Heavy GPU calls (trajectory preview) go direct to avoid Next.js proxy timeout (~30s vs GPU ~150s+)
+const AGENT_DIRECT = process.env.NEXT_PUBLIC_AGENT_DIRECT_URL ?? 'http://127.0.0.1:8000';
 
 const CELL_PX       = 40;  // pixels per grid cell in trajectory preview canvas
 const LEFT_LABEL_PX = 38;  // width of am (y-axis) label strip drawn on canvas left
@@ -315,7 +317,7 @@ export function MlMapOverlay({ onClose, containerRef, onApplyAndRun, frameIndex 
     setSelectedCellFrames(null);
     setPreviewCellFrames(null, null);
     try {
-      const res = await fetch(`${AGENT_URL}/trajectory/preview`, {
+      const res = await fetch(`${AGENT_DIRECT}/trajectory/preview`, {
         method:  'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -340,7 +342,13 @@ export function MlMapOverlay({ onClose, containerRef, onApplyAndRun, frameIndex 
           force_refresh:   forceRefresh,
         }),
       });
-      const data = await res.json();
+      const rawText = await res.text();
+      let data: Record<string, unknown>;
+      try {
+        data = JSON.parse(rawText) as Record<string, unknown>;
+      } catch {
+        throw new Error(`Server error (HTTP ${res.status}): ${rawText.slice(0, 300)}`);
+      }
       if (data.ok || data.map_both) {
         const result = data as TrajResult;
         // Compute confidence_map client-side for HNN mode:
@@ -473,9 +481,8 @@ export function MlMapOverlay({ onClose, containerRef, onApplyAndRun, frameIndex 
         }),
       });
       if (res.status === 503) {
-        // RAM cache empty — S3 hit returned maps but trajectory arrays weren't stored.
-        // User needs to force a fresh EC2 compute to populate RAM cache.
-        setCellTrajError('Click "↺ Re-run (bypass cache)" to load cell trajectories');
+        const errData = await res.json().catch(() => ({})) as Record<string, unknown>;
+        setCellTrajError(String(errData.detail ?? 'GPU service unavailable — try again shortly'));
         return;
       }
       if (!res.ok) throw new Error(`HTTP ${res.status}`);

@@ -44,6 +44,13 @@ export interface JobStatus {
   status: 'RUNNING' | 'SUCCEEDED' | 'FAILED' | 'TIMED_OUT' | 'UNKNOWN';
   elapsed_seconds: number;
   urls: Record<string, string>;
+  meta?: {
+    a_inner_au?: number;
+    a_outer_au?: number;
+    rhill_AU?: number;
+    t_end?: number;
+    dt?: number;
+  };
   error?: string;
 }
 

@@ -328,8 +328,23 @@ export default function HomePage() {
     moon:   bodyRadiusAU(params.mm_earth, dmCgs),
   };
 
+  // Compute HZ from stellar params directly (same formula as habitable_zone.py).
+  // This is the authoritative source — never rely on summary.json or CSV fallbacks.
+  const hzMeta = React.useMemo(() => {
+    const rs_m      = params.rs_solar * 6.957e8;
+    const stefboltz = 5.670374419e-8;
+    const F_earth   = 1361.0;
+    const au        = 1.496e11;
+    const L_star    = 4 * Math.PI * rs_m * rs_m * stefboltz * Math.pow(params.Ts, 4);
+    const a_inner   = Math.sqrt(L_star / (4 * Math.PI * 1.1 * F_earth)) / au;
+    const a_outer   = Math.sqrt(L_star / (4 * Math.PI * 0.5 * F_earth)) / au;
+    return simMeta
+      ? { ...simMeta, a_inner_au: a_inner, a_outer_au: a_outer }
+      : null;
+  }, [params.Ts, params.rs_solar, simMeta]);
+
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const sceneControls = useOrbitScene(canvasRef, trajectoryFrames, simMeta, bodyRadii);
+  const sceneControls = useOrbitScene(canvasRef, trajectoryFrames, hzMeta, bodyRadii);
 
   const currentFrame = trajectoryFrames
     ? trajectoryFrames[sceneControls.frameIndex] ?? null
@@ -459,7 +474,7 @@ export default function HomePage() {
               frame={currentFrame}
               frameIndex={sceneControls.frameIndex}
               totalFrames={sceneControls.totalFrames}
-              meta={simMeta}
+              meta={hzMeta}
             />
           </div>
 
@@ -617,8 +632,8 @@ export default function HomePage() {
       {showFullscreen && (
         <>
           {/* Stability + habitability badges — top-left */}
-          {currentFrame && simMeta && (
-            <FullscreenBadges frame={currentFrame} meta={simMeta} />
+          {currentFrame && hzMeta && (
+            <FullscreenBadges frame={currentFrame} meta={hzMeta} />
           )}
 
           {/* Exit button — top-right */}

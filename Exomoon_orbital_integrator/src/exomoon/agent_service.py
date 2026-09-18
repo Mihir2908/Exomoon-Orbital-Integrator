@@ -71,6 +71,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Chrome Private Network Access — allows simple GET requests from localhost:3000 to 127.0.0.1:8000
+@app.middleware("http")
+async def add_pna_header(request, call_next):
+    response = await call_next(request)
+    response.headers["Access-Control-Allow-Private-Network"] = "true"
+    return response
+
 # Serve static outputs (EDA PNGs, animation.html) at GET /outputs/<filename>
 _OUTPUTS_DIR = pathlib.Path("outputs")
 _OUTPUTS_DIR.mkdir(exist_ok=True)
@@ -124,13 +131,14 @@ sf = boto3.client("stepfunctions", region_name=AWS_REGION) if AWS_ENABLED and ST
 
 # ── GPU trajectory-preview service (EC2 g4dn.xlarge, hnn_gpu_service.py) ──────
 GPU_SERVICE_URL       = os.getenv("GPU_SERVICE_URL", "http://52.56.252.104:8001")
-GPU_SERVICE_TIMEOUT_S = int(os.getenv("GPU_SERVICE_TIMEOUT_S", "1200"))
+GPU_SERVICE_TIMEOUT_S = int(os.getenv("GPU_SERVICE_TIMEOUT_S", "2400"))
 # Inference cache — separate S3 bucket so existing nbody-time-series-storage is untouched
 INFERENCE_CACHE_BUCKET = os.getenv("INFERENCE_CACHE_BUCKET", "exomoon-ml-inference-cache")
 # Bump MODEL_VERSION when HNN weights are updated; old cache entries are automatically orphaned
 HNN_MODEL_VERSION = os.getenv("HNN_MODEL_VERSION", "hinge4_v1")
-# S3 client for inference cache (may differ from BUCKET region; reuse same region)
-_s3_cache = boto3.client("s3", region_name=AWS_REGION) if AWS_ENABLED else None
+# S3 client for inference cache — independent of AWS_ENABLED so cache works even in local mode
+# (credentials still required; _read_cache/_write_cache catch ClientError if unavailable)
+_s3_cache = boto3.client("s3", region_name=AWS_REGION)
 
 # ── In-RAM trajectory cache — keeps full (N, n_out, 3) arrays after each batch run ──────────
 # Keyed by the same cache key as _inference_cache_key(). LRU-capped at _MAX_TRAJ_RAM entries.
@@ -1965,7 +1973,7 @@ def get_job_status(job_id: str):
             "elapsed_seconds": elapsed,
         }
         
-        # If succeeded, fetch presigned URLs from S3
+        # If succeeded, fetch presigned URLs from S3 and embed summary metadata
         if status == "SUCCEEDED":
             try:
                 urls = {}
@@ -1981,6 +1989,21 @@ def get_job_status(job_id: str):
                     except Exception:
                         pass
                 result["urls"] = urls
+
+                # Embed summary.json fields directly so the browser never needs to
+                # fetch them from S3 (avoids presigned-URL CORS edge cases).
+                try:
+                    summary_obj = s3.get_object(Bucket=BUCKET, Key=f"{output_prefix}/summary.json")
+                    summary_data = json.loads(summary_obj["Body"].read().decode())
+                    result["meta"] = {
+                        "a_inner_au": summary_data.get("a_inner_au"),
+                        "a_outer_au": summary_data.get("a_outer_au"),
+                        "rhill_AU":   summary_data.get("rhill_AU"),
+                        "t_end":      summary_data.get("t_end"),
+                        "dt":         summary_data.get("dt"),
+                    }
+                except Exception as e:
+                    print(f"[JOB] Could not embed summary metadata: {e}", flush=True)
             except Exception as e:
                 print(f"[JOB] Error generating presigned URLs: {e}", flush=True)
         
@@ -2734,6 +2757,16 @@ def trajectory_preview(req: TrajectoryPreviewRequest):
     On cache HIT:  returns stored result with from_cache=true  (~10ms)
     On cache MISS: runs GPU inference, stores result, returns with from_cache=false
     """
+    try:
+        return _trajectory_preview_inner(req)
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[TRAJECTORY] Unhandled exception: {type(e).__name__}: {e}", flush=True)
+        raise HTTPException(status_code=500, detail=f"Trajectory preview error: {type(e).__name__}: {e}")
+
+
+def _trajectory_preview_inner(req: TrajectoryPreviewRequest):
     mode = req.mode
     if mode not in ("hnn_hinge4", "gt_leapfrog"):
         raise HTTPException(status_code=400, detail=f"Unknown mode '{mode}'. Use 'hnn_hinge4' or 'gt_leapfrog'.")
@@ -2750,13 +2783,14 @@ def trajectory_preview(req: TrajectoryPreviewRequest):
             if ram_hit:
                 # S3 hit + RAM hit: everything ready, return instantly
                 print(f"[TRAJECTORY] S3+RAM cache HIT for {mode}/{key}", flush=True)
-                r = _strip_heavy(cached)
-                r["cache_key"] = key
-                return r
-            # S3 hit but RAM empty (agent restarted, or first session with this key).
-            # S3 entries are stripped — trajectory arrays not inside.
-            # Must call EC2 to repopulate RAM so cell clicks can slice from it.
-            print(f"[TRAJECTORY] S3 HIT but RAM empty for {mode}/{key} — calling EC2 to populate RAM", flush=True)
+            else:
+                # S3 HIT but RAM empty (agent restarted). Populate RAM directly from
+                # S3 data — full trajectory arrays are stored in S3 so no EC2 call needed.
+                print(f"[TRAJECTORY] S3 HIT, RAM empty — populating RAM from S3 data", flush=True)
+                _store_traj_ram_cache(key, cached, req.mm_resolution, req.am_resolution)
+            r = _strip_heavy(cached)
+            r["cache_key"] = key
+            return r
 
     # ── Cache miss → GPU inference ─────────────────────────────────────────────
     print(f"[TRAJECTORY] Cache MISS — forwarding to GPU service at {GPU_SERVICE_URL}", flush=True)
@@ -2771,23 +2805,30 @@ def trajectory_preview(req: TrajectoryPreviewRequest):
     except _requests.exceptions.HTTPError as e:
         raise HTTPException(status_code=502,
                             detail=f"GPU service returned error: {e}")
+    except Exception as e:
+        raise HTTPException(status_code=502,
+                            detail=f"GPU service unexpected error: {type(e).__name__}: {e}")
 
-    # Store full trajectory arrays in RAM BEFORE stripping — cell clicks read from here
+    # Store full trajectory arrays in RAM — cell clicks read from here
     _store_traj_ram_cache(key, result, req.mm_resolution, req.am_resolution)
 
-    # Strip large trajectory arrays — frontend only needs classification maps.
-    # This keeps the response and cache entry < 100 KB instead of 200+ MB.
+    # Write FULL result (with trajectory arrays) to S3 so subsequent runs after
+    # agent restarts can populate RAM directly from S3, with no EC2 call needed.
+    full_for_s3 = dict(result)
+    full_for_s3["mode"]          = mode
+    full_for_s3["model_version"] = req.model_version
+    full_for_s3["from_cache"]    = False
+    full_for_s3["cache_key"]     = key
+    threading.Thread(
+        target=_write_cache, args=(mode, key, full_for_s3), daemon=True
+    ).start()
+
+    # Strip heavy arrays for the HTTP response — frontend only needs the maps/grids
     result = _strip_heavy(result)
     result["mode"]          = mode
     result["model_version"] = req.model_version
     result["from_cache"]    = False
-    result["cache_key"]     = key   # sent back to frontend so cell clicks can use it directly
-
-    # ── Cache write (background thread — never delays the response) ────────────
-    threading.Thread(
-        target=_write_cache, args=(mode, key, result), daemon=True
-    ).start()
-
+    result["cache_key"]     = key
     return result
 
 
@@ -2856,9 +2897,10 @@ def trajectory_cell_preview(req: CellPreviewRequest):
         entry = _traj_ram_cache.get(key)
 
     if entry is None:
+        print(f"[CELL_PREVIEW] RAM empty for key={key} — batch not yet complete or agent restarted without a cache hit", flush=True)
         raise HTTPException(
             status_code=503,
-            detail="Batch trajectory not in RAM cache. Run 'Run Trajectory Batch' first.",
+            detail="Trajectory batch not yet loaded. Run 'Run Trajectory Previews' first and wait for it to complete."
         )
 
     mm_resolution = entry.get("mm_resolution", req.mm_resolution)

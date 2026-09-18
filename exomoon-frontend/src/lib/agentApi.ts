@@ -2,7 +2,7 @@ import type { SystemParams, JobStatus, AgentHealthResponse, ChatRequest } from '
 
 const AGENT_URL =
   process.env.NEXT_PUBLIC_AGENT_URL ??
-  'http://127.0.0.1:8000';
+  '/api/agent';
 
 // Convert SystemParams to the flat dict the agent expects
 export function paramsToAgentFormat(p: SystemParams): Record<string, unknown> {

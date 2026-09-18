@@ -32,17 +32,11 @@ export function useJobPoller() {
           clearInterval(intervalRef.current!);
           intervalRef.current = null;
 
+          // meta comes directly from the agent service status response (no S3 fetch needed)
+          const summaryJson: Record<string, unknown> = (data.meta ?? {}) as Record<string, unknown>;
+
           // Fetch traj.csv → parse → update Three.js scene
           const csvUrl = data.urls?.['traj.csv'];
-          const summaryUrl = data.urls?.['summary.json'];
-
-          let summaryJson: Record<string, unknown> = {};
-          if (summaryUrl) {
-            try {
-              const sr = await fetch(summaryUrl);
-              summaryJson = await sr.json();
-            } catch { /* ignore */ }
-          }
 
           if (csvUrl) {
             try {
@@ -63,7 +57,7 @@ export function useJobPoller() {
         }
       } catch (e) {
         if (e instanceof TypeError && String(e).includes('fetch')) {
-          console.warn(`[JobPoller] Cannot reach agent at http://127.0.0.1:8000 — is Terminal 2 still running?`, e);
+          console.warn(`[JobPoller] Cannot reach agent service via /api/agent — is the agent service running on port 8000?`, e);
         } else {
           console.warn('[JobPoller] poll error:', e);
         }

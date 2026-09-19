@@ -15,6 +15,7 @@ export function useJobPoller() {
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   useEffect(() => {
+    console.log(`[JobPoller] effect fired — jobId=${jobId} jobStatus=${jobStatus}`);
     if (!jobId || jobStatus !== 'running') {
       if (intervalRef.current) {
         clearInterval(intervalRef.current);
@@ -25,7 +26,9 @@ export function useJobPoller() {
 
     const poll = async () => {
       try {
+        console.log(`[JobPoller] polling ${jobId}...`);
         const data = await agentApi.getJobStatus(jobId);
+        console.log(`[JobPoller] status=${data.status} urls=`, data.urls);
         updateJobStatus(data.status, data.elapsed_seconds, data.urls);
 
         if (data.status === 'SUCCEEDED') {
@@ -37,15 +40,21 @@ export function useJobPoller() {
 
           // Fetch traj.csv → parse → update Three.js scene
           const csvUrl = data.urls?.['traj.csv'];
+          console.log(`[JobPoller] SUCCEEDED — csvUrl=${csvUrl}`);
 
           if (csvUrl) {
             try {
               const csvText = await fetch(csvUrl).then(r => r.text());
+              console.log(`[JobPoller] CSV fetched — ${csvText.length} chars, parsing...`);
               const { frames, meta } = parseTrajectoryCsv(csvText, summaryJson);
+              console.log(`[JobPoller] parsed ${frames.length} frames, calling setTrajectoryData`);
               setTrajectoryData(frames, meta);
+              console.log(`[JobPoller] setTrajectoryData done`);
             } catch (e) {
               console.error('[JobPoller] CSV parse error:', e);
             }
+          } else {
+            console.warn('[JobPoller] SUCCEEDED but no traj.csv URL in response');
           }
 
           // Cache simdata in agent service session for follow-up chat queries

@@ -78,6 +78,12 @@ interface SimulationStore {
   previewRhillAU: number | null;                // Hill sphere radius in AU for that cell's system
   setPreviewCellFrames: (frames: TrajectoryFrame[] | null, rocheFrac: number | null, rhillAU?: number | null) => void;
 
+  // ── Chat-pushed cell trajectory (from trajectory_cell_query chatbot tool) ────
+  chatCellFrames: TrajectoryFrame[] | null;
+  chatCellRhillAU: number | null;
+  chatCellRocheFrac: number | null;
+  setChatCellFrames: (frames: TrajectoryFrame[] | null, rhillAU: number | null, rocheFrac: number | null) => void;
+
   // ── Chat ─────────────────────────────────────────────────────────────────────
   chatMessages: ChatMessage[];
   addChatMessage: (msg: Omit<ChatMessage, 'timestamp'> & { id: string }) => void;
@@ -182,6 +188,13 @@ export const useSimulationStore = create<SimulationStore>()(
       previewRhillAU: null,
       setPreviewCellFrames: (frames, rocheFrac, rhillAU = null) =>
         set({ previewCellFrames: frames, previewRocheFrac: rocheFrac, previewRhillAU: rhillAU }),
+
+      // ── Chat-pushed cell trajectory ───────────────────────────────────────────
+      chatCellFrames: null,
+      chatCellRhillAU: null,
+      chatCellRocheFrac: null,
+      setChatCellFrames: (frames, rhillAU, rocheFrac) =>
+        set({ chatCellFrames: frames, chatCellRhillAU: rhillAU, chatCellRocheFrac: rocheFrac }),
 
       // ── Chat ──────────────────────────────────────────────────────────────────
       chatMessages: [],

@@ -141,6 +141,7 @@ export function MlMapOverlay({ onClose, containerRef, onApplyAndRun, frameIndex 
     setParam,
     setPreviewCellFrames,
     setTrajectoryData,
+    chatCellFrames,
   } = useSimulationStore();
 
   // ── Drag ───────────────────────────────────────────────────────────────────
@@ -197,6 +198,14 @@ export function MlMapOverlay({ onClose, containerRef, onApplyAndRun, frameIndex 
   const [selectedCellFrames, setSelectedCellFrames] = useState<TrajectoryFrame[] | null>(null);
   const [cellTrajLoading,   setCellTrajLoading]    = useState(false);
   const [cellTrajError,     setCellTrajError]      = useState<string | null>(null);
+
+  // When chatbot calls trajectory_cell_query, push frames into the cell details panel
+  useEffect(() => {
+    if (chatCellFrames && chatCellFrames.length > 0) {
+      setSelectedCellFrames(chatCellFrames);
+      setCellTrajError(null);
+    }
+  }, [chatCellFrames]);
 
   // ── Section 3: Model Performance ──────────────────────────────────────────
   const [perfLayer, setPerfLayer] = useState<'mlp' | 'hnn'>('mlp');

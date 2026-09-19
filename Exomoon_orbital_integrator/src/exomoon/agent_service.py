@@ -71,12 +71,42 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Chrome Private Network Access — allows simple GET requests from localhost:3000 to 127.0.0.1:8000
-@app.middleware("http")
-async def add_pna_header(request, call_next):
-    response = await call_next(request)
-    response.headers["Access-Control-Allow-Private-Network"] = "true"
-    return response
+# Chrome Private Network Access — pure ASGI middleware (avoids BaseHTTPMiddleware +
+# StreamingResponse interaction that can bubble streaming body exceptions up as HTTP 500).
+from starlette.types import ASGIApp as _ASGIApp, Receive as _Receive, Scope as _Scope, Send as _Send
+
+class _PNAMiddleware:
+    def __init__(self, app: _ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: _Scope, receive: _Receive, send: _Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        async def _send_with_pna(message: dict) -> None:
+            if message["type"] == "http.response.start":
+                headers = list(message.get("headers", []))
+                headers.append((b"access-control-allow-private-network", b"true"))
+                message = {**message, "headers": headers}
+            await send(message)
+
+        await self.app(scope, receive, _send_with_pna)
+
+app.add_middleware(_PNAMiddleware)
+
+# Global exception handler — logs the full traceback for ANY unhandled exception
+# that reaches FastAPI's default 500 handler, so we can see exactly what escaped.
+from fastapi import Request as _Request
+from fastapi.responses import JSONResponse as _JSONResponse
+import traceback as _tb_global
+
+@app.exception_handler(Exception)
+async def _global_exception_handler(_req: _Request, exc: Exception) -> _JSONResponse:
+    _tb_str = _tb_global.format_exc()
+    print(f"[GLOBAL_EXC] Unhandled exception on {_req.method} {_req.url.path}: {exc}", flush=True)
+    print(_tb_str, flush=True)
+    return _JSONResponse(status_code=500, content={"detail": str(exc), "type": type(exc).__name__})
 
 # Serve static outputs (EDA PNGs, animation.html) at GET /outputs/<filename>
 _OUTPUTS_DIR = pathlib.Path("outputs")
@@ -159,6 +189,17 @@ class SessionCache:
         self.last_animation_url: Optional[str] = None
         self.last_ml_prediction: Optional[Dict[str, Any]] = None
         self._ml_fresh: bool = False  # True only for the turn in which ml_predict was called
+        # Trajectory batch state — populated when trajectory_preview tool hits cache
+        self.last_traj_key: Optional[str] = None
+        self.last_traj_mm_grid: list = []
+        self.last_traj_am_grid: list = []
+        # Per-cell trajectory frames — populated when trajectory_cell_query tool is called
+        self.last_cell_frames: Optional[list] = None
+        self.last_cell_rhill_au: Optional[float] = None
+        self.last_cell_roche_frac: Optional[float] = None
+        self._cell_frames_fresh: bool = False
+        self.last_effective_params: Optional[Dict[str, Any]] = None  # params used for last chat-triggered job
+        self._job_fresh: bool = False  # True only for the turn in which start_backend_job was called
 
     def update_job(self, job_id: str, output_prefix: str):
         """Called when a new job is started."""
@@ -536,13 +577,23 @@ def _tool_specs() -> list[dict]:
         },
         {
             "name": "start_backend_job",
-            "description": "Start a Step Functions job to run a new simulation (with optional stability check).",
+            "description": (
+                "Start a Step Functions job to run a new simulation (with optional stability check). "
+                "Pass `params` to override any system parameters the user requested — e.g. if the user says "
+                "'change moon mass to 0.1 and run', pass {\"mm_earth\": 0.1} and the job runs with that value. "
+                "Any key not included in `params` inherits from the current UI configuration. "
+                "Valid keys: Ts, rs_solar, ms_solar, mp_earth, dp_cgs, ap_AU, ep, mm_earth, am_hill, em, moon_retrograde."
+            ),
             "input_schema": {
                 "type": "object",
                 "properties": {
                     "years": {"type": "number", "description": "Simulation duration (years)"},
                     "check_stability": {"type": "boolean", "description": "Include stability check in job (default true)"},
                     "escape_factor": {"type": "number", "description": "Escape threshold multiplier (default 1.0)"},
+                    "params": {
+                        "type": "object",
+                        "description": "Parameter overrides — any subset of system params to change from current UI values. E.g. {\"mm_earth\": 0.5, \"am_hill\": 0.3}.",
+                    },
                 },
                 "required": [],
             },
@@ -671,6 +722,24 @@ def _tool_specs() -> list[dict]:
             },
         },
         {
+            "name": "trajectory_cell_query",
+            "description": (
+                "Retrieve the trajectory animation for a specific moon mass and orbit radius from the last cached "
+                "trajectory batch. Use when the user asks to see the orbit animation for a specific (moon mass, "
+                "semi-major axis) combination, e.g. 'show me the trajectory for 0.2 M⊕ at 0.4 Hill radii'. "
+                "Requires that a trajectory batch has already been run for the current system (call "
+                "trajectory_preview first if unsure). Returns the animation directly to the frontend."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "mm_earth": {"type": "number", "description": "Moon mass in Earth masses (M⊕)"},
+                    "am_hill":  {"type": "number", "description": "Moon semi-major axis in Hill radii"},
+                },
+                "required": ["mm_earth", "am_hill"],
+            },
+        },
+        {
             "name": "ml_plot",
             "description": (
                 "Generate a PNG plot for ML model results. "
@@ -739,13 +808,19 @@ def _execute_tool(tool_name: str, tool_input: Dict[str, Any], req: ChatRequest) 
             years = tool_input.get("years", req.years)
             check_stability = bool(tool_input.get("check_stability", True))
             escape_factor = float(tool_input.get("escape_factor", req.escape_factor))
-            result = _start_backend_job(req.params, years, check_stability=check_stability, escape_factor=escape_factor)
-            
-            # NEW: If job started successfully, attempt to retrieve results later
-            # The session cache will try_retrieve_job_results() on next request
+            # Merge any param overrides Claude requested onto the current UI params
+            param_overrides = tool_input.get("params") or {}
+            effective_params = {**(req.params or {}), **param_overrides}
+            print(f"[TOOL] start_backend_job: tool_input_params={param_overrides} req_params_keys={list((req.params or {}).keys())} effective_mm_earth={effective_params.get('mm_earth')}", flush=True)
+            result = _start_backend_job(effective_params, years, check_stability=check_stability, escape_factor=escape_factor)
+
             if result.get("ok"):
                 print(f"[AGENT] Job started: {result['job_id']}, session will monitor for results", flush=True)
-            
+                # Store effective params so chat_stream can push them back to the frontend
+                _session.last_effective_params = effective_params
+                result["effective_params"] = effective_params
+                _session._job_fresh = True  # signal final result to include job_id
+
             return result
 
 
@@ -1119,33 +1194,164 @@ def _execute_tool(tool_name: str, tool_input: Dict[str, Any], req: ChatRequest) 
                     am_resolution   = am_res,
                     mode            = mode,
                 )
-                result      = trajectory_preview(traj_req)
-                mm_grid     = result.get("mm_grid", [])
-                am_grid     = result.get("am_grid", [])
+
+                # Check S3 cache before calling trajectory_preview.
+                # If MISS: the EC2 call would take 8-10 min and block the SSE stream — not viable
+                # over chat. Guide the user to run it from the UI instead.
+                key = _inference_cache_key(traj_req)
+                cached = _read_cache(mode, key)
+                if cached is None:
+                    return {
+                        "ok": False,
+                        "cached": False,
+                        "message": (
+                            f"No cached trajectory batch found for this system in {mode} mode "
+                            f"({mm_res}×{am_res} grid). Running the batch takes 8–10 minutes on the GPU "
+                            "and cannot be done inline in chat. To generate it:\n"
+                            "1. Open the ML overlay (brain icon, top-right).\n"
+                            "2. Go to Layer 2 — Trajectory Previews.\n"
+                            "3. Select the mode and grid size, then click 'Run Trajectory Previews'.\n"
+                            "Once the batch completes (progress shown in the overlay), come back and ask "
+                            "again — I will read the cached result instantly."
+                        ),
+                    }
+
+                # S3 HIT — trajectory_preview returns in seconds from S3/RAM
+                result  = trajectory_preview(traj_req)
+                mm_grid = result.get("mm_grid", [])
+                am_grid = result.get("am_grid", [])
                 map_both    = result.get("map_both", [])
+                map_stable  = result.get("map_stable", [])
+                map_habitable = result.get("map_habitable", [])
+                valid_mm    = result.get("valid_mm_range")
+                valid_am    = result.get("valid_am_per_mm", [])
                 n_stable    = sum(v for row in map_both for v in row)
                 total       = len(mm_grid) * len(am_grid)
                 wall_s      = result.get("wall_s", 0)
-                from_cache  = result.get("from_cache", False)
+
+                # Cache batch metadata in session so trajectory_cell_query can look up cells
+                _session.last_traj_key     = result.get("cache_key", key)
+                _session.last_traj_mm_grid = mm_grid
+                _session.last_traj_am_grid = am_grid
+
+                # Push the heatmap to the frontend via the done event (same path as ml_predict)
+                _session.last_ml_prediction = {
+                    "ok":            True,
+                    "mm_grid":       mm_grid,
+                    "am_grid":       am_grid,
+                    "map_stable":    map_stable,
+                    "map_habitable": map_habitable,
+                    "map_both":      map_both,
+                    "valid_mm_range":  valid_mm,
+                    "valid_am_per_mm": valid_am,
+                }
+                _session._ml_fresh = True
+
                 return {
                     "ok":            True,
                     "mode":          mode,
+                    "cached":        True,
                     "n_stable_both": n_stable,
                     "total_cells":   total,
                     "wall_s":        wall_s,
-                    "from_cache":    from_cache,
                     "message": (
-                        f"Trajectory preview ({mode}) complete in {wall_s:.1f}s"
-                        f"{' (from cache)' if from_cache else ''}. "
+                        f"Trajectory preview ({mode}) loaded from cache in {wall_s:.1f}s. "
                         f"{n_stable}/{total} cells stable+habitable. "
                         f"Grid: {len(mm_grid)}×{len(am_grid)}, "
                         f"{mm_grid[0]:.3f}–{mm_grid[-1]:.3f} M⊕ × "
-                        f"{am_grid[0]:.3f}–{am_grid[-1]:.3f} Hill radii."
-                        if mm_grid else "Trajectory preview complete."
+                        f"{am_grid[0]:.3f}–{am_grid[-1]:.3f} Hill radii. "
+                        "The heatmap has been pushed to the ML overlay."
+                        if mm_grid else "Trajectory preview loaded from cache."
                     ),
                 }
             except Exception as e:
                 return {"ok": False, "message": f"trajectory_preview failed: {str(e)}"}
+
+        if tool_name == "trajectory_cell_query":
+            try:
+                mm_earth_req = float(tool_input.get("mm_earth", 0.0))
+                am_hill_req  = float(tool_input.get("am_hill",  0.0))
+
+                if not _session.last_traj_key or not _session.last_traj_mm_grid or not _session.last_traj_am_grid:
+                    return {
+                        "ok": False,
+                        "message": (
+                            "No trajectory batch is loaded in this session yet. "
+                            "Call trajectory_preview first to load the batch from cache, "
+                            "or ask the user to run a trajectory batch from the ML overlay."
+                        ),
+                    }
+
+                import numpy as _np
+                mm_grid = _np.array(_session.last_traj_mm_grid)
+                am_grid = _np.array(_session.last_traj_am_grid)
+
+                # Find nearest grid cell to the requested (mm_earth, am_hill)
+                mm_idx = int(_np.argmin(_np.abs(mm_grid - mm_earth_req)))
+                am_idx = int(_np.argmin(_np.abs(am_grid - am_hill_req)))
+                mm_actual = float(mm_grid[mm_idx])
+                am_actual = float(am_grid[am_idx])
+
+                # Check RAM cache for trajectory data
+                key = _session.last_traj_key
+                with _traj_ram_lock:
+                    entry = _traj_ram_cache.get(key)
+
+                if entry is None:
+                    return {
+                        "ok": False,
+                        "message": (
+                            "Trajectory data is not in RAM (agent may have restarted). "
+                            "Call trajectory_preview again to reload from S3 cache, then retry."
+                        ),
+                    }
+
+                mm_resolution = entry.get("mm_resolution", len(mm_grid))
+                am_resolution = entry.get("am_resolution", len(am_grid))
+                cell_idx = mm_idx * am_resolution + am_idx
+
+                frames = _traj_to_frames(
+                    entry["traj_planet"][cell_idx],
+                    entry["traj_star"][cell_idx],
+                    entry["traj_moon"][cell_idx],
+                    entry["t_grid"],
+                )
+
+                # Compute rhill_AU for this system so the frontend can size the Hill sphere ring
+                raw_params = req.params or {}
+                M_EARTH_MSUN = 3.003e-6
+                ap_AU   = float(raw_params.get("ap_AU",    1.0))
+                ep      = float(raw_params.get("ep",       0.0))
+                mp_e    = float(raw_params.get("mp_earth", 1.0))
+                ms_sol  = float(raw_params.get("ms_solar", 1.0))
+                rhill_au = ap_AU * (1.0 - ep) * (mp_e * M_EARTH_MSUN / (3.0 * ms_sol)) ** (1.0 / 3.0)
+                roche_frac = float(am_grid[0])  # smallest am_hill value = approximate Roche limit fraction
+
+                # Store in session for the done event to pick up
+                _session.last_cell_frames      = frames
+                _session.last_cell_rhill_au    = rhill_au
+                _session.last_cell_roche_frac  = roche_frac
+                _session._cell_frames_fresh    = True
+
+                print(f"[TOOL] trajectory_cell_query cell=({mm_idx},{am_idx}) "
+                      f"mm={mm_actual:.4f}M⊕ am={am_actual:.3f}H n_frames={len(frames)}", flush=True)
+                return {
+                    "ok":        True,
+                    "mm_idx":    mm_idx,
+                    "am_idx":    am_idx,
+                    "mm_earth":  mm_actual,
+                    "am_hill":   am_actual,
+                    "n_frames":  len(frames),
+                    "rhill_au":  rhill_au,
+                    "message": (
+                        f"Trajectory retrieved for moon mass {mm_actual:.4f} M⊕ at "
+                        f"{am_actual:.3f} Hill radii (nearest grid cell [{mm_idx},{am_idx}]). "
+                        f"{len(frames)} trajectory frames sent to the mini orbit view."
+                    ),
+                }
+            except Exception as e:
+                import traceback as _tb3; print(_tb3.format_exc(), flush=True)
+                return {"ok": False, "message": f"trajectory_cell_query failed: {str(e)}"}
 
         if tool_name == "ml_train":
             global _train_job
@@ -1414,17 +1620,18 @@ def _chat_with_claude(req: ChatRequest) -> Dict[str, Any]:
         print("[AGENT] Claude not enabled, using rule-based fallback.", flush=True)
         return _chat_rule_based(req)
 
-    # NEW: Check for cached simdata if not provided in request
-    effective_simdata = req.simdata
-    if not effective_simdata:
-        cached_sim, cached_par = _session.get_cached()
-        if cached_sim:
-            effective_simdata = cached_sim
-            # Update req object for tool execution
-            req.simdata = cached_sim
-            if not req.params:
-                req.params = cached_par
-            print(f"[AGENT] Using cached simdata from previous job", flush=True)
+    # Session-cached simdata (most recently completed job) always takes priority over
+    # req.simdata (which the frontend sends from its local store and may be stale).
+    # This ensures follow-up queries after a chatbot-triggered job use the new simulation.
+    cached_sim, cached_par = _session.get_cached()
+    effective_simdata = cached_sim or req.simdata
+    if cached_sim:
+        req.simdata = cached_sim  # keep req in sync for tool execution
+        if not req.params:
+            req.params = cached_par
+        print(f"[AGENT] Using session-cached simdata ({len(cached_sim)} chars) over req.simdata", flush=True)
+    elif req.simdata:
+        print(f"[AGENT] Using req.simdata ({len(req.simdata)} chars) — no session cache", flush=True)
     
     # ── Build context for Claude ──────────────────────────────────────────────
     # Include all configured system parameters so Claude can reason about
@@ -1616,6 +1823,8 @@ def _chat_with_claude(req: ChatRequest) -> Dict[str, Any]:
 
         "## Tool usage\n"
         "- Stability queries: use `stability_from_simdata` if simdata available; otherwise call `start_backend_job`.\n"
+        "- **Parameter changes**: if the user asks to change any system parameter and run, pass those changes in `start_backend_job`'s `params` field (e.g. `{\"mm_earth\": 0.5, \"ap_AU\": 1.2}`). Do NOT tell the user to adjust sliders manually — apply the changes yourself via `params`.\n"
+        "- **CRITICAL — after `start_backend_job`**: return your response to the user IMMEDIATELY after the job submission tool call. Do NOT call any data-query tools (`stability_from_simdata`, `get_trajectory_at_time`, `get_trajectory_range`, `export_csv`, `eda_plot`) in the same turn — the AWS simulation takes 30–120 seconds and no data will be available yet. Tell the user the job is running and they will be notified when results are ready.\n"
         "- Trajectory at specific times: call `get_trajectory_at_time()` (multiple calls allowed).\n"
         "- Trajectory over a range: call `get_trajectory_range(t_start, t_end, step)` for time-series snapshots.\n"
         "- CSV exports: call `export_csv` — returns a presigned URL; include as `[Download CSV](url)` in response.\n"
@@ -1640,10 +1849,22 @@ def _chat_with_claude(req: ChatRequest) -> Dict[str, Any]:
         "AU → km: ×149,597,870.7. AU/yr → km/s: ×4.74. Hill fraction: divide by rhill_AU."
     )
 
+    try:
+        ctx_json = json.dumps(ctx)
+    except Exception as _ctx_err:
+        print(f"[AGENT] ctx serialization failed ({_ctx_err}), stripping ml_prediction", flush=True)
+        ctx["ml_prediction"] = None
+        ctx["params"] = {}
+        ctx["derived"] = {}
+        try:
+            ctx_json = json.dumps(ctx)
+        except Exception:
+            ctx_json = "{}"
+
     messages = [
         {
             "role": "user",
-            "content": f"User request: {req.message}\n\nContext: {json.dumps(ctx)}",
+            "content": f"User request: {req.message}\n\nContext: {ctx_json}",
         }
     ]
 
@@ -1726,10 +1947,24 @@ def _chat_with_claude(req: ChatRequest) -> Dict[str, Any]:
                         result["simdata"] = final_attempt
                         print(f"[AGENT] Returning retrieved simdata ({len(final_attempt)} chars)", flush=True)
 
-                # Include ML prediction result only when ml_predict was called this turn
+                # Include job_id in final result when start_backend_job ran this turn
+                # (meta SSE event uses this so the frontend can register with useJobPoller)
+                if _session._job_fresh and _session.last_job_id:
+                    result["job_id"] = _session.last_job_id
+                    result["effective_params"] = _session.last_effective_params
+                    _session._job_fresh = False  # consume
+
+                # Include ML prediction / heatmap when ml_predict or trajectory_preview ran this turn
                 if _session._ml_fresh and _session.last_ml_prediction:
                     result["ml_prediction"] = _session.last_ml_prediction
                     _session._ml_fresh = False  # consume — won't re-send on next turn
+
+                # Include cell trajectory frames when trajectory_cell_query ran this turn
+                if _session._cell_frames_fresh and _session.last_cell_frames:
+                    result["cell_frames"]       = _session.last_cell_frames
+                    result["cell_rhill_au"]     = _session.last_cell_rhill_au
+                    result["cell_roche_frac"]   = _session.last_cell_roche_frac
+                    _session._cell_frames_fresh = False  # consume
 
                 return result
 
@@ -1857,30 +2092,67 @@ def chat_stream(req: ChatRequest):
     """
     Streaming variant of /chat. Yields tokens as SSE (Server-Sent Events)
     for real-time chatbot UX in Dash.
-    
+
     Consumes /chat result and streams tokens word-by-word.
     """
-    result = _chat_with_claude(req)
+    print(f"[CHAT_STREAM] Entered — msg={req.message[:60]!r} simdata={bool(req.simdata)} params_keys={list((req.params or {}).keys())[:6]}", flush=True)
+    try:
+        result = _chat_with_claude(req)
+    except BaseException as _e:
+        import traceback as _tb_cs
+        print(f"[CHAT_STREAM] Unhandled exception in _chat_with_claude: {_e}", flush=True)
+        print(_tb_cs.format_exc(), flush=True)
+        result = {"ok": False, "mode": "error", "message": f"Agent error: {str(_e)}"}
     text = result.get("message", "")
 
     def gen():
-        # Metadata event — carries job_id if a backend job was started
-        meta_evt = {"type": "meta", "mode": result.get("mode"), "job_id": result.get("job_id")}
-        yield f"data: {json.dumps(meta_evt)}\n\n"
-        # Token-by-token streaming of the markdown response
-        for tok in text.split(" "):
-            yield f"data: {json.dumps({'type': 'token', 'token': tok + ' '})}\n\n"
-        # Done event — carries simdata, presigned URLs, and ML prediction for the frontend to cache
-        done_evt = {
-            "type":          "done",
-            "simdata":       result.get("simdata"),
-            "urls":          result.get("urls", {}),
-            "job_id":        result.get("job_id"),
-            "ml_prediction": result.get("ml_prediction"),
-        }
-        yield f"data: {json.dumps(done_evt)}\n\n"
+        try:
+            # Metadata event — carries job_id if a backend job was started
+            meta_evt = {"type": "meta", "mode": result.get("mode"), "job_id": result.get("job_id")}
+            yield f"data: {json.dumps(meta_evt)}\n\n"
+            # Token-by-token streaming of the markdown response
+            for tok in text.split(" "):
+                yield f"data: {json.dumps({'type': 'token', 'token': tok + ' '})}\n\n"
+            # Done event — carries simdata, presigned URLs, and ML prediction for the frontend to cache
+            done_evt = {
+                "type":             "done",
+                "simdata":          result.get("simdata"),
+                "urls":             result.get("urls", {}),
+                "job_id":           result.get("job_id"),
+                "ml_prediction":    result.get("ml_prediction"),
+                "cell_frames":      result.get("cell_frames"),
+                "cell_rhill_au":    result.get("cell_rhill_au"),
+                "cell_roche_frac":  result.get("cell_roche_frac"),
+                "effective_params": result.get("effective_params"),
+            }
+            # Catch non-JSON-serializable values in done_evt (e.g. numpy scalars from ml_prediction)
+            try:
+                done_payload = json.dumps(done_evt)
+            except Exception as _je:
+                print(f"[GEN] done_evt serialization failed ({_je}), stripping heavy fields", flush=True)
+                done_evt["ml_prediction"] = None
+                done_evt["cell_frames"] = None
+                done_evt["simdata"] = None
+                done_payload = json.dumps(done_evt)
+            yield f"data: {done_payload}\n\n"
+        except Exception as _gen_err:
+            import traceback as _tb_gen
+            print(f"[GEN] Streaming generator error: {_gen_err}", flush=True)
+            print(_tb_gen.format_exc(), flush=True)
+            try:
+                yield f"data: {json.dumps({'type': 'done', 'error': str(_gen_err)})}\n\n"
+            except Exception:
+                pass
 
-    return StreamingResponse(gen(), media_type="text/event-stream")
+    return StreamingResponse(
+        gen(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control":    "no-cache",
+            "X-Accel-Buffering": "no",   # disable nginx/proxy response buffering
+            "Connection":       "close",  # don't reuse — fixes Next.js proxy ECONNRESET on second request
+        },
+    )
 
 @app.get("/job/{job_id}/traj.csv")
 def local_traj_csv(job_id: str):

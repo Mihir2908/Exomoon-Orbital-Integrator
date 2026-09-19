@@ -3,16 +3,20 @@ import { useCallback, useRef } from 'react';
 import { useSimulationStore } from './useSimulationStore';
 import type { MlPrediction } from '@/lib/types';
 
+// Chat stream is long-running (Claude tool loops + extended thinking can take 60-180s).
+// Use the direct agent URL to bypass the Next.js rewrite proxy's ~30s timeout.
 const AGENT_URL =
+  process.env.NEXT_PUBLIC_AGENT_DIRECT_URL ??
   process.env.NEXT_PUBLIC_AGENT_URL ??
-  (typeof window !== 'undefined' ? window.location.origin : 'http://127.0.0.1:8000');
+  'http://127.0.0.1:8000';
 
 export function useChatStream() {
   const {
     params, simYears, simdataB64, dmCgs,
     mlPrediction,
     addChatMessage, appendToLastAssistant, finalizeChatMessage,
-    setSimdataB64, setMlPrediction, updateJobStatus,
+    setSimdataB64, setMlPrediction, updateJobStatus, setJob, setParams,
+    setPreviewCellFrames, setChatCellFrames,
   } = useSimulationStore();
 
   const abortRef = useRef<AbortController | null>(null);
@@ -90,6 +94,7 @@ export function useChatStream() {
               urls?: Record<string, string>;
               status?: string;
               elapsed_seconds?: number;
+              effective_params?: Record<string, number | boolean> | null;
               ml_prediction?: {
                 mm_grid: number[];
                 am_grid: number[];
@@ -99,16 +104,25 @@ export function useChatStream() {
                 valid_mm_range: [number, number] | null;
                 valid_am_per_mm: ([number, number] | null)[];
               } | null;
+              cell_frames?: import('@/lib/types').TrajectoryFrame[] | null;
+              cell_rhill_au?: number | null;
+              cell_roche_frac?: number | null;
             };
 
             if (payload.type === 'token' && payload.token) {
               appendToLastAssistant(payload.token);
-            } else if (payload.type === 'meta' && payload.job_id) {
-              // Job started — store job ID so poller picks it up
-              updateJobStatus('running', 0, {});
+            } else if (payload.type === 'meta') {
+              console.log(`[ChatStream] meta event — job_id=${payload.job_id}`);
+              if (payload.job_id) {
+                // Job started — register with store so useJobPoller polls and updates orbit view
+                setJob(payload.job_id);
+                console.log(`[ChatStream] setJob(${payload.job_id}) called`);
+              }
             } else if (payload.type === 'done') {
               if (payload.simdata) setSimdataB64(payload.simdata);
-              // If the agent ran ml_predict, populate the ML overlay with the result
+              // Sync sliders with whatever params the agent actually ran the simulation with
+              if (payload.effective_params) setParams(payload.effective_params);
+              // If the agent ran ml_predict or trajectory_preview (cached), update the heatmap
               if (payload.ml_prediction) {
                 const p = payload.ml_prediction;
                 const mlPred: MlPrediction = {
@@ -122,6 +136,15 @@ export function useChatStream() {
                 };
                 setMlPrediction(mlPred);
               }
+              // If the agent ran trajectory_cell_query, push frames to both mini orbit views
+              if (payload.cell_frames && payload.cell_frames.length > 0) {
+                const rhillAU   = payload.cell_rhill_au   ?? null;
+                const rocheFrac = payload.cell_roche_frac ?? null;
+                // External MiniOrbitView (previewCellFrames in store)
+                setPreviewCellFrames(payload.cell_frames, rocheFrac, rhillAU);
+                // Cell details panel inside MlMapOverlay (chatCellFrames in store)
+                setChatCellFrames(payload.cell_frames, rhillAU, rocheFrac);
+              }
               finalizeChatMessage(assistantId);
             }
           } catch {
@@ -133,7 +156,7 @@ export function useChatStream() {
       if (err instanceof Error && err.name === 'AbortError') return;
       finalizeChatMessage(assistantId, 'Connection error. Is the agent service running?');
     }
-  }, [params, simYears, simdataB64, dmCgs, mlPrediction, addChatMessage, appendToLastAssistant, finalizeChatMessage, setSimdataB64, setMlPrediction, updateJobStatus]);
+  }, [params, simYears, simdataB64, dmCgs, mlPrediction, addChatMessage, appendToLastAssistant, finalizeChatMessage, setSimdataB64, setMlPrediction, updateJobStatus, setJob, setParams, setPreviewCellFrames, setChatCellFrames]);
 
   const abort = useCallback(() => abortRef.current?.abort(), []);
 

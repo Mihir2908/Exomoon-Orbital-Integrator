@@ -86,7 +86,9 @@ interface SimulationStore {
   chatCellFrames: TrajectoryFrame[] | null;
   chatCellRhillAU: number | null;
   chatCellRocheFrac: number | null;
-  setChatCellFrames: (frames: TrajectoryFrame[] | null, rhillAU: number | null, rocheFrac: number | null) => void;
+  chatCellMmEarth: number | null;   // actual mm_earth of the queried cell (M⊕)
+  chatCellAmHill: number | null;    // actual am_hill of the queried cell (Hill radii)
+  setChatCellFrames: (frames: TrajectoryFrame[] | null, rhillAU: number | null, rocheFrac: number | null, mmEarth?: number | null, amHill?: number | null) => void;
 
   // ── Chat ─────────────────────────────────────────────────────────────────────
   chatMessages: ChatMessage[];
@@ -201,8 +203,11 @@ export const useSimulationStore = create<SimulationStore>()(
       chatCellFrames: null,
       chatCellRhillAU: null,
       chatCellRocheFrac: null,
-      setChatCellFrames: (frames, rhillAU, rocheFrac) =>
-        set({ chatCellFrames: frames, chatCellRhillAU: rhillAU, chatCellRocheFrac: rocheFrac }),
+      chatCellMmEarth: null,
+      chatCellAmHill: null,
+      setChatCellFrames: (frames, rhillAU, rocheFrac, mmEarth = null, amHill = null) =>
+        set({ chatCellFrames: frames, chatCellRhillAU: rhillAU, chatCellRocheFrac: rocheFrac,
+              chatCellMmEarth: mmEarth, chatCellAmHill: amHill }),
 
       // ── Chat ──────────────────────────────────────────────────────────────────
       chatMessages: [],

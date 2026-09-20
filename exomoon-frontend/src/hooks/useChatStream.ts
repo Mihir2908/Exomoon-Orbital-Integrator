@@ -13,7 +13,7 @@ const AGENT_URL =
 export function useChatStream() {
   const {
     params, simYears, simdataB64, dmCgs,
-    mlPrediction,
+    mlPrediction, trajPreview,
     addChatMessage, appendToLastAssistant, finalizeChatMessage,
     setSimdataB64, setMlPrediction, setTrajPreview, updateJobStatus, setJob, setParams,
     setPreviewCellFrames, setChatCellFrames,
@@ -46,12 +46,17 @@ export function useChatStream() {
       } : null;
 
       const body = {
-        message:       userText,
-        simdata:       simdataB64,
-        params:        { ...params, dm_cgs: dmCgs },
-        years:         simYears,
-        escape_factor: 1.0,
-        ml_prediction: mlPredSummary,
+        message:          userText,
+        simdata:          simdataB64,
+        params:           { ...params, dm_cgs: dmCgs },
+        years:            simYears,
+        escape_factor:    1.0,
+        ml_prediction:    mlPredSummary,
+        // Send traj preview key + grid arrays so trajectory_cell_query works even when
+        // the batch was run from the panel (not via a chatbot trajectory_preview call).
+        traj_preview_key: trajPreview?.cache_key ?? null,
+        traj_mm_grid:     trajPreview?.mm_grid    ?? null,
+        traj_am_grid:     trajPreview?.am_grid    ?? null,
       };
 
       const response = await fetch(`${AGENT_URL}/chat/stream`, {
@@ -107,6 +112,10 @@ export function useChatStream() {
               cell_frames?: import('@/lib/types').TrajectoryFrame[] | null;
               cell_rhill_au?: number | null;
               cell_roche_frac?: number | null;
+              cell_html_2d_url?: string | null;
+              cell_html_3d_url?: string | null;
+              cell_mm_earth?: number | null;
+              cell_am_hill?: number | null;
               traj_preview?: {
                 ok: boolean;
                 map_stable: boolean[][];
@@ -159,10 +168,12 @@ export function useChatStream() {
               if (payload.cell_frames && payload.cell_frames.length > 0) {
                 const rhillAU   = payload.cell_rhill_au   ?? null;
                 const rocheFrac = payload.cell_roche_frac ?? null;
-                // External MiniOrbitView (previewCellFrames in store)
+                const mmEarth   = payload.cell_mm_earth   ?? null;
+                const amHill    = payload.cell_am_hill    ?? null;
+                // External MiniOrbitView + 3D canvas (previewCellFrames in store)
                 setPreviewCellFrames(payload.cell_frames, rocheFrac, rhillAU);
                 // Cell details panel inside MlMapOverlay (chatCellFrames in store)
-                setChatCellFrames(payload.cell_frames, rhillAU, rocheFrac);
+                setChatCellFrames(payload.cell_frames, rhillAU, rocheFrac, mmEarth, amHill);
               }
               finalizeChatMessage(assistantId);
             }
@@ -175,7 +186,7 @@ export function useChatStream() {
       if (err instanceof Error && err.name === 'AbortError') return;
       finalizeChatMessage(assistantId, 'Connection error. Is the agent service running?');
     }
-  }, [params, simYears, simdataB64, dmCgs, mlPrediction, addChatMessage, appendToLastAssistant, finalizeChatMessage, setSimdataB64, setMlPrediction, setTrajPreview, updateJobStatus, setJob, setParams, setPreviewCellFrames, setChatCellFrames]);
+  }, [params, simYears, simdataB64, dmCgs, mlPrediction, trajPreview, addChatMessage, appendToLastAssistant, finalizeChatMessage, setSimdataB64, setMlPrediction, setTrajPreview, updateJobStatus, setJob, setParams, setPreviewCellFrames, setChatCellFrames]);
 
   const abort = useCallback(() => abortRef.current?.abort(), []);
 

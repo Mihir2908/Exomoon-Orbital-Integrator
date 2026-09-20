@@ -344,10 +344,13 @@ export default function HomePage() {
   }, [params.Ts, params.rs_solar, simMeta]);
 
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const sceneControls = useOrbitScene(canvasRef, trajectoryFrames, hzMeta, bodyRadii);
+  // When a chatbot cell query arrives, show those frames in the 3D canvas and mini orbit
+  // view instead of the simulation frames so the user can see the cell trajectory live.
+  const activeFrames = previewCellFrames ?? trajectoryFrames;
+  const sceneControls = useOrbitScene(canvasRef, activeFrames, hzMeta, bodyRadii);
 
-  const currentFrame = trajectoryFrames
-    ? trajectoryFrames[sceneControls.frameIndex] ?? null
+  const currentFrame = activeFrames
+    ? activeFrames[sceneControls.frameIndex] ?? null
     : null;
 
   // ── Esc to exit fullscreen ───────────────────────────────────────────────
@@ -653,7 +656,7 @@ export default function HomePage() {
 
       {/* ── Always-visible: MiniOrbitView + playback ────────────────────────── */}
       <MiniOrbitView
-        frames={trajectoryFrames}
+        frames={activeFrames}
         frameIndex={sceneControls.frameIndex}
         showHillSphereRings={!!previewCellFrames}
         rocheInnerFrac={previewRocheFrac ?? undefined}

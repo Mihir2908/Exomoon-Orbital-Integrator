@@ -142,6 +142,8 @@ export function MlMapOverlay({ onClose, containerRef, onApplyAndRun, frameIndex 
     setPreviewCellFrames,
     setTrajectoryData,
     chatCellFrames,
+    chatCellMmEarth,
+    chatCellAmHill,
     trajPreview,
   } = useSimulationStore();
 
@@ -200,13 +202,24 @@ export function MlMapOverlay({ onClose, containerRef, onApplyAndRun, frameIndex 
   const [cellTrajLoading,   setCellTrajLoading]    = useState(false);
   const [cellTrajError,     setCellTrajError]      = useState<string | null>(null);
 
-  // When chatbot calls trajectory_cell_query, push frames into the cell details panel
+  // When chatbot calls trajectory_cell_query, push frames + cell coordinates into the
+  // cell details panel so mm/am labels update without requiring an explicit grid click.
   useEffect(() => {
-    if (chatCellFrames && chatCellFrames.length > 0) {
-      setSelectedCellFrames(chatCellFrames);
-      setCellTrajError(null);
+    if (!chatCellFrames || chatCellFrames.length === 0) return;
+    setSelectedCellFrames(chatCellFrames);
+    setCellTrajError(null);
+    // Find the nearest grid indices for the mm/am values the chatbot returned,
+    // so the cell detail labels (mm, am, confidence) update automatically.
+    if (trajResult && chatCellMmEarth != null && chatCellAmHill != null) {
+      const mmGrid = trajResult.mm_grid;
+      const amGrid = trajResult.am_grid;
+      let mmIdx = 0, amIdx = 0;
+      let bestMm = Infinity, bestAm = Infinity;
+      mmGrid.forEach((v, i) => { const d = Math.abs(v - chatCellMmEarth!); if (d < bestMm) { bestMm = d; mmIdx = i; } });
+      amGrid.forEach((v, i) => { const d = Math.abs(v - chatCellAmHill!);  if (d < bestAm) { bestAm = d; amIdx = i; } });
+      setSelectedCell({ mmIdx, amIdx });
     }
-  }, [chatCellFrames]);
+  }, [chatCellFrames, chatCellMmEarth, chatCellAmHill, trajResult]);
 
   // When chatbot calls trajectory_preview and it hits cache, push the result to Layer 2.
   // trajPreview comes via the traj_preview SSE field (separate from ml_prediction) so

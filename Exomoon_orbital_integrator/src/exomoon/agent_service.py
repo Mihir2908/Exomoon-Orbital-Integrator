@@ -200,6 +200,10 @@ class SessionCache:
         self.last_cell_frames: Optional[list] = None
         self.last_cell_rhill_au: Optional[float] = None
         self.last_cell_roche_frac: Optional[float] = None
+        self.last_cell_html_2d_url: Optional[str] = None
+        self.last_cell_html_3d_url: Optional[str] = None
+        self.last_cell_mm_earth: Optional[float] = None
+        self.last_cell_am_hill: Optional[float] = None
         self._cell_frames_fresh: bool = False
         self.last_effective_params: Optional[Dict[str, Any]] = None  # params used for last chat-triggered job
         self._job_fresh: bool = False  # True only for the turn in which start_backend_job was called
@@ -319,6 +323,11 @@ class ChatRequest(BaseModel):
     years: Optional[float] = None
     escape_factor: float = 1.0
     ml_prediction: Optional[Dict[str, Any]] = None  # summary from frontend ML predictor (no full arrays)
+    # Layer 2 trajectory preview state — sent from frontend so trajectory_cell_query works
+    # even when the batch was run from the panel (not from a chatbot trajectory_preview call).
+    traj_preview_key: Optional[str] = None       # cache_key from TrajPreview in Zustand store
+    traj_mm_grid: Optional[list] = None          # mm_grid from TrajPreview (small array, ~30 floats)
+    traj_am_grid: Optional[list] = None          # am_grid from TrajPreview
 
 
 class StabilityRequest(BaseModel):
@@ -1424,20 +1433,50 @@ def _execute_tool(tool_name: str, tool_input: Dict[str, Any], req: ChatRequest) 
                 _session.last_cell_roche_frac  = roche_frac
                 _session._cell_frames_fresh    = True
 
+                # Generate standalone HTML exports (2D canvas + Three.js 3D)
+                cell_label = f"{mm_actual:.4f}M⊕ @ {am_actual:.3f}H"
+                _OUTPUTS_DIR.mkdir(exist_ok=True)
+                _cell_slug = f"cell_{mm_idx}_{am_idx}"
+                try:
+                    _html2d = _generate_cell_html_2d(frames, rhill_au, roche_frac, cell_label)
+                    _path2d = _OUTPUTS_DIR / f"{_cell_slug}_2d.html"
+                    _path2d.write_text(_html2d, encoding="utf-8")
+                    _url2d = f"{_LOCAL_AGENT_BASE}/outputs/{_cell_slug}_2d.html"
+                except Exception as _he:
+                    print(f"[TOOL] 2D HTML gen failed: {_he}", flush=True)
+                    _url2d = None
+                try:
+                    _html3d = _generate_cell_html_3d(frames, rhill_au, cell_label)
+                    _path3d = _OUTPUTS_DIR / f"{_cell_slug}_3d.html"
+                    _path3d.write_text(_html3d, encoding="utf-8")
+                    _url3d = f"{_LOCAL_AGENT_BASE}/outputs/{_cell_slug}_3d.html"
+                except Exception as _he:
+                    print(f"[TOOL] 3D HTML gen failed: {_he}", flush=True)
+                    _url3d = None
+
+                _session.last_cell_html_2d_url = _url2d
+                _session.last_cell_html_3d_url = _url3d
+                _session.last_cell_mm_earth    = mm_actual
+                _session.last_cell_am_hill     = am_actual
+
                 print(f"[TOOL] trajectory_cell_query cell=({mm_idx},{am_idx}) "
                       f"mm={mm_actual:.4f}M⊕ am={am_actual:.3f}H n_frames={len(frames)}", flush=True)
                 return {
-                    "ok":        True,
-                    "mm_idx":    mm_idx,
-                    "am_idx":    am_idx,
-                    "mm_earth":  mm_actual,
-                    "am_hill":   am_actual,
-                    "n_frames":  len(frames),
-                    "rhill_au":  rhill_au,
+                    "ok":            True,
+                    "mm_idx":        mm_idx,
+                    "am_idx":        am_idx,
+                    "mm_earth":      mm_actual,
+                    "am_hill":       am_actual,
+                    "n_frames":      len(frames),
+                    "rhill_au":      rhill_au,
+                    "html_2d_url":   _url2d,
+                    "html_3d_url":   _url3d,
                     "message": (
                         f"Trajectory retrieved for moon mass {mm_actual:.4f} M⊕ at "
                         f"{am_actual:.3f} Hill radii (nearest grid cell [{mm_idx},{am_idx}]). "
-                        f"{len(frames)} trajectory frames sent to the mini orbit view."
+                        f"{len(frames)} frames sent to the orbit view. "
+                        + (f"2D export: {_url2d}. " if _url2d else "")
+                        + (f"3D export: {_url3d}." if _url3d else "")
                     ),
                 }
             except Exception as e:
@@ -1613,24 +1652,80 @@ def _execute_tool(tool_name: str, tool_input: Dict[str, Any], req: ChatRequest) 
                     if not traj or not traj.get("ok"):
                         return {"ok": False, "message": "No trajectory preview cached. Call trajectory_preview first, then request this plot."}
                     import numpy as _np2
-                    mm_grid = _np2.array(traj["mm_grid"])
-                    am_grid = _np2.array(traj["am_grid"])
-                    map_both = _np2.array(traj["map_both"], dtype=float)
-                    mfig, ax = _plt.subplots(figsize=(6, 5), facecolor="#111827")
-                    ax.set_facecolor("#1f2937")
-                    ax.tick_params(colors="#9ca3af"); ax.xaxis.label.set_color("#9ca3af"); ax.yaxis.label.set_color("#9ca3af")
-                    for spine in ax.spines.values(): spine.set_edgecolor("#374151")
-                    import matplotlib.colors as _mcolors
-                    ax.pcolormesh(am_grid, mm_grid, map_both,
-                                  cmap=_mcolors.ListedColormap(["#374151", "#0e7490"]),
-                                  vmin=0, vmax=1)
-                    ax.set_xlabel("Moon Semi-Major Axis (Hill radii)")
-                    ax.set_ylabel("Moon Mass (M⊕)")
-                    ax.set_yscale("log")
-                    ax.set_title("Trajectory Preview — Stable+Habitable Grid", color="#e5e7eb")
+                    import matplotlib.colors as _mcolors2
+                    import matplotlib.patches as _mpatches
+                    _tm_grid = _np2.array(traj["mm_grid"])
+                    _ta_grid = _np2.array(traj["am_grid"])
+                    _traj_both = _np2.array(traj["map_both"], dtype=bool)  # [mm_res][am_res]
+                    _mm_res = len(_tm_grid)
+                    _am_res = len(_ta_grid)
+
+                    # Get MLP map_both at the same resolution as the trajectory grid.
+                    # Panel-sourced last_ml_prediction has empty map_both — run fresh inference
+                    # at the traj grid resolution so the 3-color confidence map matches exactly.
+                    _mlp_pred = _session.last_ml_prediction
+                    _mlp_both = None
+                    if _mlp_pred and _mlp_pred.get("map_both") and len(_mlp_pred["map_both"]) == _mm_res:
+                        _mlp_both = _np2.array(_mlp_pred["map_both"], dtype=bool)
+                    else:
+                        # Run fresh MLP at traj grid resolution
+                        _raw_p = req.params or {}
+                        _sp = {
+                            "ms_solar": float(_raw_p.get("ms_solar", 1.0)),
+                            "rs_solar": float(_raw_p.get("rs_solar", 1.0)),
+                            "Ts":       float(_raw_p.get("Ts",       5772.0)),
+                            "mp_earth": float(_raw_p.get("mp_earth", 1.0)),
+                            "dp_cgs":   float(_raw_p.get("dp_cgs",   5.5)),
+                            "ap_AU":    float(_raw_p.get("ap_AU",    1.0)),
+                            "ep":       float(_raw_p.get("ep",       0.0)),
+                        }
+                        _fresh = _predict_stability_map_mlp(
+                            system_params=_sp,
+                            t_sim=float(req.years or 10.0),
+                            moon_retrograde=bool(_raw_p.get("moon_retrograde", False)),
+                            em=float(_raw_p.get("em", 0.0)),
+                            mm_resolution=_mm_res,
+                            am_resolution=_am_res,
+                        )
+                        if _fresh.get("ok") and _fresh.get("map_both"):
+                            _mlp_both = _np2.array(_fresh["map_both"], dtype=bool)
+                            _session.last_ml_prediction = _fresh
+                        else:
+                            # Fall back: treat all traj valid cells as HIGH (no MLP comparison)
+                            _mlp_both = _np2.ones((_mm_res, _am_res), dtype=bool)
+
+                    # 3-color confidence map: [mm_res][am_res]
+                    # 0 = grey  (MLP invalid)
+                    # 1 = red   (MLP valid, traj invalid — LOW confidence)
+                    # 2 = green (MLP valid AND traj valid — HIGH confidence)
+                    _conf = _np2.zeros((_mm_res, _am_res), dtype=int)
+                    _conf[_mlp_both & ~_traj_both] = 1  # LOW: MLP says yes, traj says no
+                    _conf[_mlp_both & _traj_both]  = 2  # HIGH: both agree
+
+                    _cmap3 = _mcolors2.ListedColormap(["#374151", "#dc2626", "#0e7490"])
+                    mfig, ax = _plt.subplots(figsize=(7, 5), facecolor="#0d1117")
+                    ax.set_facecolor("#0d1117")
+                    ax.tick_params(colors="#9ca3af")
+                    ax.xaxis.label.set_color("#9ca3af"); ax.yaxis.label.set_color("#9ca3af")
+                    for spine in ax.spines.values(): spine.set_edgecolor("#1f2937")
+                    ax.pcolormesh(_tm_grid, _ta_grid, _conf.T, cmap=_cmap3, vmin=0, vmax=2)
+                    ax.set_xscale("log")
+                    ax.set_xlabel("Moon Mass (M⊕)")
+                    ax.set_ylabel("Moon Semi-Major Axis (Hill radii)")
+                    ax.set_title(f"Trajectory Preview — Confidence Map ({_mm_res}×{_am_res})", color="#9ca3af", fontsize=10)
+                    ax.grid(color="#1f2937", linewidth=0.4)
+                    _legend = [
+                        _mpatches.Patch(color="#374151", label="MLP invalid"),
+                        _mpatches.Patch(color="#0e7490", label="HIGH — both agree stable+habitable"),
+                        _mpatches.Patch(color="#dc2626", label="LOW  — MLP valid, physics disagrees"),
+                    ]
+                    ax.legend(handles=_legend, loc="upper right", fontsize=7,
+                              framealpha=0.5, facecolor="#111827", labelcolor="#e5e7eb")
                     mfig.tight_layout()
                     fname = "ml_traj_heatmap.png"
                     fpath = _OUTPUTS_DIR / fname
+                    if fpath.exists():
+                        fpath.unlink()
                     mfig.savefig(str(fpath), dpi=130, bbox_inches="tight", facecolor=mfig.get_facecolor())
                     _plt.close(mfig)
 
@@ -1945,6 +2040,15 @@ def _chat_with_claude(req: ChatRequest) -> Dict[str, Any]:
         except Exception:
             ml_pred_summary = {"available": True, "source": "agent_run"}
 
+    # Restore traj preview session state from frontend (panel-run batches populate the
+    # RAM cache but don't set _session.last_traj_key — restoring here lets
+    # trajectory_cell_query work even when the user ran the grid from the panel).
+    if req.traj_preview_key and req.traj_preview_key != _session.last_traj_key:
+        _session.last_traj_key      = req.traj_preview_key
+        _session.last_traj_mm_grid  = req.traj_mm_grid or []
+        _session.last_traj_am_grid  = req.traj_am_grid or []
+        print(f"[AGENT] traj_preview_key restored from frontend: {req.traj_preview_key}", flush=True)
+
     ctx = {
         "has_simdata":    bool(effective_simdata),
         "years_hint":     req.years,
@@ -2045,13 +2149,21 @@ def _chat_with_claude(req: ChatRequest) -> Dict[str, Any]:
         "plot_type='heatmap' → MLP stability map from last ml_predict run; "
         "plot_type='trajectory_heatmap' → physics-based trajectory stable+habitable grid from last trajectory_preview run. "
         "Embed the returned `figure_url` as `![ML Plot](figure_url)` AND `[Download PNG](figure_url)` on the next line.\n"
+        "- CRITICAL heatmap consistency rule: the `ml_plot(plot_type='heatmap')` figure MUST match the text table you generate from `ml_predict`. "
+        "They must show the same number of mass bands, the same band boundary values, and the same orbit ranges. "
+        "If you are unsure of the resolution used, state it in the caption (e.g. '30×30 grid'). "
+        "Never present a figure with different band counts or values from the table in the same response.\n"
         "- CRITICAL trajectory rules:\n"
         "  • When `trajectory_preview` is called, do NOT call `ml_plot` afterwards — the grid updates the Layer 2 tab automatically. Describe the summary in text only.\n"
         "  • If the user explicitly asks for an image of the trajectory preview grid in chat, call `ml_plot(plot_type='trajectory_heatmap')` — never `ml_plot(plot_type='heatmap')` for trajectory results.\n"
         "  • When `trajectory_cell_query` is called, do NOT call `ml_plot`. Describe the result verbally.\n"
         "- If `context.ml_prediction` is set, you already have ML prediction results — answer questions about valid mass/orbit ranges directly from that summary without calling `ml_predict` again.\n"
         "- Animation: if `context.animation_url` is set and the user asks for the **physics simulation** animation (the main orbital animation from a `start_backend_job` run), return `[Download Animation](url)` as a link. Do NOT use `animation_url` for trajectory cell animations — those come from `trajectory_cell_query` and appear in the mini orbit views, not as a downloadable URL.\n"
-        "- Trajectory cell animations: call `trajectory_cell_query(mm_earth, am_hill)` — the result is pushed to the main orbit canvas and mini orbit view automatically. After calling, tell the user to look at the main orbit canvas and mini orbit view on the page, NOT any 'ML overlay'.\n"
+        "- Trajectory cell animations: call `trajectory_cell_query(mm_earth, am_hill)` — the result is pushed to the main orbit canvas and mini orbit view automatically. "
+        "After calling, tell the user the orbit views have updated. "
+        "If the tool result contains `html_2d_url` or `html_3d_url`, include them as download links: "
+        "`[Open 2D Orbit Animation](html_2d_url)` and `[Open 3D Orbit Animation](html_3d_url)` "
+        "(open in a new browser tab for the interactive standalone animation).\n"
         "- Trajectory preview modes: when describing trajectory preview modes to users, say 'physics simulation mode' for gt_leapfrog and 'neural model mode' for hnn_hinge4. Do not expose the raw mode strings to users.\n"
         "- Do NOT ask the user to run simulations manually — trigger them yourself.\n\n"
 
@@ -2128,7 +2240,7 @@ def _chat_with_claude(req: ChatRequest) -> Dict[str, Any]:
                     # Execute the tool
                     result = _execute_tool(tool_name, tool_input, req)
                     print(f"[AGENT] Tool result: {result}", flush=True)
-                    
+
                     tool_results_for_next_turn.append(
                         {
                             "type": "tool_result",
@@ -2178,10 +2290,14 @@ def _chat_with_claude(req: ChatRequest) -> Dict[str, Any]:
 
                 # Include cell trajectory frames when trajectory_cell_query ran this turn
                 if _session._cell_frames_fresh and _session.last_cell_frames:
-                    result["cell_frames"]       = _session.last_cell_frames
-                    result["cell_rhill_au"]     = _session.last_cell_rhill_au
-                    result["cell_roche_frac"]   = _session.last_cell_roche_frac
-                    _session._cell_frames_fresh = False  # consume
+                    result["cell_frames"]        = _session.last_cell_frames
+                    result["cell_rhill_au"]      = _session.last_cell_rhill_au
+                    result["cell_roche_frac"]    = _session.last_cell_roche_frac
+                    result["cell_html_2d_url"]   = _session.last_cell_html_2d_url
+                    result["cell_html_3d_url"]   = _session.last_cell_html_3d_url
+                    result["cell_mm_earth"]      = _session.last_cell_mm_earth
+                    result["cell_am_hill"]       = _session.last_cell_am_hill
+                    _session._cell_frames_fresh  = False  # consume
 
                 return result
 
@@ -2335,16 +2451,20 @@ def chat_stream(req: ChatRequest):
             print(f"[DONE_EVT] ml_prediction={'SET (ok=' + str(_ml_p.get('ok')) + ', mm_res=' + str(len(_ml_p.get('mm_grid',[]))) + ')' if _ml_p else 'NULL'}", flush=True)
             print(f"[DONE_EVT] traj_preview={'SET' if result.get('traj_preview') else 'NULL'}, cell_frames={'SET' if result.get('cell_frames') else 'NULL'}", flush=True)
             done_evt = {
-                "type":             "done",
-                "simdata":          result.get("simdata"),
-                "urls":             result.get("urls", {}),
-                "job_id":           result.get("job_id"),
-                "ml_prediction":    _ml_p,
-                "traj_preview":     result.get("traj_preview"),
-                "cell_frames":      result.get("cell_frames"),
-                "cell_rhill_au":    result.get("cell_rhill_au"),
-                "cell_roche_frac":  result.get("cell_roche_frac"),
-                "effective_params": result.get("effective_params"),
+                "type":              "done",
+                "simdata":           result.get("simdata"),
+                "urls":              result.get("urls", {}),
+                "job_id":            result.get("job_id"),
+                "ml_prediction":     _ml_p,
+                "traj_preview":      result.get("traj_preview"),
+                "cell_frames":       result.get("cell_frames"),
+                "cell_rhill_au":     result.get("cell_rhill_au"),
+                "cell_roche_frac":   result.get("cell_roche_frac"),
+                "cell_html_2d_url":  result.get("cell_html_2d_url"),
+                "cell_html_3d_url":  result.get("cell_html_3d_url"),
+                "cell_mm_earth":     result.get("cell_mm_earth"),
+                "cell_am_hill":      result.get("cell_am_hill"),
+                "effective_params":  result.get("effective_params"),
             }
             # Catch non-JSON-serializable values in done_evt (e.g. numpy scalars).
             # Strip fields individually so a bad field doesn't silently null unrelated ones.
@@ -3297,6 +3417,251 @@ def _trajectory_preview_inner(req: TrajectoryPreviewRequest):
     result["from_cache"]    = False
     result["cache_key"]     = key
     return result
+
+
+def _generate_cell_html_2d(frames: list, rhill_au: float, roche_frac: float, label: str) -> str:
+    """Standalone 2D canvas animation with play/pause, scrub slider and speed control."""
+    moon_rel = [[f["moon_x"] - f["planet_x"], f["moon_y"] - f["planet_y"]] for f in frames]
+    max_r = max((abs(x) for p in moon_rel for x in p), default=rhill_au) or rhill_au
+    data = json.dumps({"rel": moon_rel, "rhill": rhill_au, "roche": roche_frac, "maxR": max_r * 1.15})
+    safe = label.replace('"', "'")
+    return f"""<!DOCTYPE html><html><head><meta charset="utf-8">
+<title>Mini Orbit — {safe}</title>
+<style>
+*{{box-sizing:border-box;margin:0;padding:0}}
+body{{background:#0d1117;display:flex;flex-direction:column;align-items:center;
+  justify-content:center;min-height:100vh;font:12px/1.4 monospace;color:#9ca3af;gap:8px;padding:12px}}
+h2{{color:#e5e7eb;font-size:13px}}
+canvas{{border-radius:8px;display:block}}
+#lbl{{font-size:11px;text-align:center;min-height:1.4em}}
+#controls{{display:flex;align-items:center;gap:10px;flex-wrap:wrap;justify-content:center;width:420px}}
+#scrub{{flex:1;min-width:120px;accent-color:#3b82f6;cursor:pointer}}
+button{{background:#1f2937;border:1px solid #374151;color:#d1d5db;border-radius:5px;
+  padding:3px 10px;cursor:pointer;font:inherit;transition:background .15s}}
+button:hover{{background:#374151}}
+button.active{{background:#3b82f6;border-color:#3b82f6;color:#fff}}
+select{{background:#1f2937;border:1px solid #374151;color:#d1d5db;border-radius:5px;
+  padding:3px 6px;font:inherit;cursor:pointer}}
+</style></head><body>
+<h2>Moon Orbit — {safe}</h2>
+<canvas id="c" width="420" height="420"></canvas>
+<div id="lbl"></div>
+<div id="controls">
+  <button id="btn">⏸ Pause</button>
+  <input id="scrub" type="range" min="0" value="0">
+  <select id="spd">
+    <option value="0.25">0.25×</option>
+    <option value="0.5">0.5×</option>
+    <option value="1" selected>1×</option>
+    <option value="2">2×</option>
+    <option value="4">4×</option>
+  </select>
+</div>
+<script>
+const D={data};
+const rel=D.rel,rh=D.rhill,ro=D.roche,mr=D.maxR,N=rel.length;
+const cv=document.getElementById('c'),ctx=cv.getContext('2d');
+const W=cv.width,H=cv.height,cx=W/2,cy=H/2,sc=(W/2-22)/mr;
+const scrub=document.getElementById('scrub'),btn=document.getElementById('btn');
+const spdSel=document.getElementById('spd'),lbl=document.getElementById('lbl');
+scrub.max=N-1;
+const TRAIL=100;
+let fi=0,playing=true,speed=1.0,acc=0,trail=[];
+
+btn.onclick=()=>{{playing=!playing;btn.textContent=playing?'⏸ Pause':'▶ Play';}};
+scrub.addEventListener('mousedown',()=>{{playing=false;btn.textContent='▶ Play';}});
+scrub.addEventListener('input',()=>{{fi=+scrub.value;trail=[];drawFrame();}});
+spdSel.onchange=()=>{{speed=+spdSel.value;}};
+
+function drawFrame(){{
+  ctx.clearRect(0,0,W,H);
+  [0.25,0.5,0.75,1.0].forEach(f=>{{
+    ctx.beginPath();ctx.arc(cx,cy,rh*f*sc,0,Math.PI*2);
+    ctx.strokeStyle=f===1.0?'rgba(239,68,68,0.5)':'rgba(31,41,55,0.9)';
+    ctx.lineWidth=f===1.0?1.5:0.6;ctx.stroke();
+  }});
+  if(ro>0){{
+    ctx.beginPath();ctx.arc(cx,cy,ro*rh*sc,0,Math.PI*2);
+    ctx.strokeStyle='rgba(220,38,38,0.65)';ctx.setLineDash([4,3]);
+    ctx.lineWidth=1;ctx.stroke();ctx.setLineDash([]);
+  }}
+  trail.push([...rel[fi]]);
+  if(trail.length>TRAIL)trail.shift();
+  for(let i=1;i<trail.length;i++){{
+    const a=i/trail.length;
+    ctx.beginPath();
+    ctx.moveTo(cx+trail[i-1][0]*sc,cy-trail[i-1][1]*sc);
+    ctx.lineTo(cx+trail[i][0]*sc,  cy-trail[i][1]*sc);
+    ctx.strokeStyle=`rgba(99,179,237,${{a*0.78}})`;ctx.lineWidth=1.5;ctx.stroke();
+  }}
+  ctx.beginPath();ctx.arc(cx,cy,6,0,Math.PI*2);ctx.fillStyle='#3b82f6';ctx.fill();
+  const mx=cx+rel[fi][0]*sc,my=cy-rel[fi][1]*sc;
+  ctx.beginPath();ctx.arc(mx,my,4,0,Math.PI*2);ctx.fillStyle='#94a3b8';ctx.fill();
+  const dist=Math.hypot(rel[fi][0],rel[fi][1]);
+  lbl.textContent=`Frame ${{fi+1}}/${{N}} · dist ${{dist.toFixed(4)}} AU · Hill ${{rh.toFixed(4)}} AU`;
+  scrub.value=fi;
+}}
+
+let last=null;
+(function loop(ts){{
+  requestAnimationFrame(loop);
+  if(!last){{last=ts;drawFrame();return;}}
+  const dt=(ts-last)/1000;last=ts;
+  if(playing){{
+    acc+=speed*60*dt;
+    const steps=Math.floor(acc);acc-=steps;
+    if(steps>0){{fi=(fi+steps)%N;drawFrame();}}
+  }}
+}})();
+</script></body></html>"""
+
+
+def _generate_cell_html_3d(frames: list, rhill_au: float, label: str) -> str:
+    """Standalone Three.js 3D orbit animation using importmap for reliable CDN loading."""
+    sp = [[f["star_x"],   f["star_y"],   f["star_z"]]   for f in frames]
+    pp = [[f["planet_x"], f["planet_y"], f["planet_z"]] for f in frames]
+    mp = [[f["moon_x"],   f["moon_y"],   f["moon_z"]]   for f in frames]
+    max_psd = max(
+        ((pp[i][0]-sp[i][0])**2 + (pp[i][1]-sp[i][1])**2 + (pp[i][2]-sp[i][2])**2)**0.5
+        for i in range(len(frames))
+    ) or 1.0
+    scale = 5.0 / max_psd
+    data = json.dumps({"s": sp, "p": pp, "m": mp, "rhill": rhill_au, "scale": scale})
+    safe = label.replace('"', "'")
+    return f"""<!DOCTYPE html><html><head><meta charset="utf-8">
+<title>3D Orbit — {safe}</title>
+<style>
+*{{margin:0;padding:0;box-sizing:border-box}}
+body{{background:#0d1117;overflow:hidden}}
+#hud{{position:absolute;top:12px;left:14px;color:#9ca3af;font:11px/1.6 monospace;pointer-events:none;
+  background:rgba(13,17,23,0.7);padding:6px 10px;border-radius:6px}}
+#controls{{position:absolute;bottom:14px;left:50%;transform:translateX(-50%);
+  display:flex;align-items:center;gap:8px;background:rgba(13,17,23,0.8);
+  padding:6px 14px;border-radius:8px;font:11px monospace}}
+button{{background:#1f2937;border:1px solid #374151;color:#d1d5db;border-radius:5px;
+  padding:3px 10px;cursor:pointer;font:inherit}}
+button:hover{{background:#374151}}
+#scrub3d{{accent-color:#3b82f6;width:180px;cursor:pointer}}
+select{{background:#1f2937;border:1px solid #374151;color:#d1d5db;border-radius:5px;
+  padding:2px 5px;font:inherit;cursor:pointer}}
+</style>
+<script type="importmap">
+{{"imports":{{"three":"https://cdn.jsdelivr.net/npm/three@0.163.0/build/three.module.js","three/addons/":"https://cdn.jsdelivr.net/npm/three@0.163.0/examples/jsm/"}}}}
+</script>
+</head><body>
+<div id="hud">3D Orbit — {safe}<br>Drag to rotate · Scroll to zoom</div>
+<div id="controls">
+  <button id="btn3">⏸ Pause</button>
+  <input id="scrub3d" type="range" min="0" value="0">
+  <select id="spd3">
+    <option value="0.25">0.25×</option>
+    <option value="0.5">0.5×</option>
+    <option value="1" selected>1×</option>
+    <option value="2">2×</option>
+    <option value="4">4×</option>
+  </select>
+  <span id="lbl3" style="color:#6b7280"></span>
+</div>
+<script type="module">
+import * as THREE from 'three';
+import {{ OrbitControls }} from 'three/addons/controls/OrbitControls.js';
+
+const D={data},SC=D.scale,N=D.s.length,RH=D.rhill*SC;
+// Swap Y↔Z so the orbital plane is horizontal in Three.js (Y-up)
+function v(arr,i){{return new THREE.Vector3(arr[i][0]*SC,arr[i][2]*SC,-arr[i][1]*SC);}}
+
+const renderer=new THREE.WebGLRenderer({{antialias:true}});
+renderer.setPixelRatio(Math.min(devicePixelRatio,2));
+renderer.setSize(innerWidth,innerHeight);
+renderer.setClearColor(0x0d1117);
+document.body.insertBefore(renderer.domElement,document.body.firstChild);
+
+const scene=new THREE.Scene();
+const cam=new THREE.PerspectiveCamera(55,innerWidth/innerHeight,0.01,500);
+cam.position.set(0,5,9);
+const ctrl=new OrbitControls(cam,renderer.domElement);
+ctrl.enableDamping=true;ctrl.dampingFactor=0.08;
+
+scene.add(new THREE.AmbientLight(0xffffff,0.4));
+const ptLight=new THREE.PointLight(0xfff8e1,2.5,80);scene.add(ptLight);
+
+function mkMesh(r,c,basic=false){{
+  return new THREE.Mesh(
+    new THREE.SphereGeometry(r,24,14),
+    basic?new THREE.MeshBasicMaterial({{color:c}}):new THREE.MeshPhongMaterial({{color:c,shininess:70}}));
+}}
+const starM=mkMesh(0.18,0xfde68a,true);
+const planM=mkMesh(0.065,0x3b82f6);
+const moonM=mkMesh(0.028,0x94a3b8);
+// Glow ring around star
+const glowM=new THREE.Mesh(new THREE.SphereGeometry(0.22,24,14),
+  new THREE.MeshBasicMaterial({{color:0xfde68a,transparent:true,opacity:0.08}}));
+starM.add(glowM);
+scene.add(starM,planM,moonM);
+
+// Hill sphere wireframe around planet
+const hillM=new THREE.Mesh(new THREE.SphereGeometry(RH,32,16),
+  new THREE.MeshBasicMaterial({{color:0xef4444,wireframe:true,transparent:true,opacity:0.07}}));
+scene.add(hillM);
+
+// Trail lines (circular buffer)
+const MAX_T=200;
+function mkTrail(c){{
+  const g=new THREE.BufferGeometry();
+  const pos=new Float32Array(MAX_T*3);
+  g.setAttribute('position',new THREE.BufferAttribute(pos,3));
+  g.setDrawRange(0,0);
+  const line=new THREE.Line(g,new THREE.LineBasicMaterial({{color:c,transparent:true,opacity:0.55}}));
+  return {{line,pos,buf:g}};
+}}
+const tS=mkTrail(0xfde68a),tP=mkTrail(0x3b82f6),tM=mkTrail(0x94a3b8);
+scene.add(tS.line,tP.line,tM.line);
+
+// Playback state
+let fi=0,playing=true,speed=1.0,acc=0,tc=0;
+const scrub=document.getElementById('scrub3d');
+const btn=document.getElementById('btn3');
+const spdSel=document.getElementById('spd3');
+const lbl3=document.getElementById('lbl3');
+scrub.max=N-1;
+btn.onclick=()=>{{playing=!playing;btn.textContent=playing?'⏸ Pause':'▶ Play';}};
+scrub.addEventListener('mousedown',()=>{{playing=false;btn.textContent='▶ Play';}});
+scrub.addEventListener('input',()=>{{fi=+scrub.value;tc=0;tS.buf.setDrawRange(0,0);tP.buf.setDrawRange(0,0);tM.buf.setDrawRange(0,0);}});
+spdSel.onchange=()=>{{speed=+spdSel.value;}};
+
+function updateTrail(t,pt){{
+  const ti=(tc%MAX_T)*3;
+  t.pos[ti]=pt.x;t.pos[ti+1]=pt.y;t.pos[ti+2]=pt.z;
+  t.buf.setDrawRange(0,Math.min(tc+1,MAX_T));
+  t.buf.attributes.position.needsUpdate=true;
+}}
+
+let last=null;
+function animate(ts){{
+  requestAnimationFrame(animate);
+  if(!last){{last=ts;}}
+  const dt=(ts-last)/1000;last=ts;
+  if(playing){{
+    acc+=speed*60*dt;
+    const steps=Math.floor(acc);acc-=steps;
+    if(steps>0){{fi=(fi+steps)%N;tc+=steps;}}
+  }}
+  ctrl.update();
+  const s=v(D.s,fi),p=v(D.p,fi),m=v(D.m,fi);
+  starM.position.copy(s);planM.position.copy(p);moonM.position.copy(m);
+  ptLight.position.copy(s);hillM.position.copy(p);
+  if(playing){{updateTrail(tS,s);updateTrail(tP,p);updateTrail(tM,m);}}
+  scrub.value=fi;
+  lbl3.textContent=`frame ${{fi+1}}/${{N}}`;
+  renderer.render(scene,cam);
+}}
+animate(0);
+
+window.addEventListener('resize',()=>{{
+  cam.aspect=innerWidth/innerHeight;cam.updateProjectionMatrix();
+  renderer.setSize(innerWidth,innerHeight);
+}});
+</script></body></html>"""
 
 
 def _traj_to_frames(planet_arr, star_arr, moon_arr, t_grid) -> list:

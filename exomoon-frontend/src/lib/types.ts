@@ -80,6 +80,22 @@ export interface AgentHealthResponse {
 
 export type JobStatusState = 'idle' | 'running' | 'succeeded' | 'failed';
 
+// Layer 2 trajectory batch result pushed from chatbot via traj_preview SSE field.
+// Uses server snake_case to match TrajResult in MlMapOverlay directly.
+export interface TrajPreview {
+  ok:              boolean;
+  map_stable:      boolean[][];
+  map_habitable:   boolean[][];
+  map_both:        boolean[][];
+  mm_grid:         number[];
+  am_grid:         number[];
+  wall_s?:         number;
+  from_cache?:     boolean;
+  cache_key?:      string;
+  valid_mm_range?: [number, number] | null;
+  valid_am_per_mm?: ([number, number] | null)[];
+}
+
 export interface MlPrediction {
   mmGrid: number[];                          // mm_earth values [M_earth], log-spaced
   amGrid: number[];                          // am_hill values [Hill radii], linear-spaced

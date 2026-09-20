@@ -177,6 +177,9 @@ _traj_ram_cache: Dict[str, dict] = {}
 _traj_ram_lock  = threading.Lock()
 _MAX_TRAJ_RAM   = 3   # keep at most 3 batch results in RAM (~90 MB each)
 
+# Developer/user mode flag — toggled by keyword in chat messages (never exposed to user)
+_developer_mode: bool = False
+
 
 # NEW: Session cache to track last job + simdata across multiple chat messages
 class SessionCache:
@@ -200,6 +203,8 @@ class SessionCache:
         self._cell_frames_fresh: bool = False
         self.last_effective_params: Optional[Dict[str, Any]] = None  # params used for last chat-triggered job
         self._job_fresh: bool = False  # True only for the turn in which start_backend_job was called
+        self.last_traj_preview: Optional[Dict[str, Any]] = None  # Layer 2 trajectory batch result (separate from Layer 1 MLP)
+        self._traj_preview_fresh: bool = False  # True for the turn trajectory_preview hits cache
 
     def update_job(self, job_id: str, output_prefix: str):
         """Called when a new job is started."""
@@ -678,25 +683,45 @@ def _tool_specs() -> list[dict]:
         },
         {
             "name": "ml_predict",
-            "description": "Run ML stability-habitability prediction: sweeps a moon mass × semi-major axis grid and returns valid stable+habitable orbit ranges. Requires a trained model. Use when the user asks about optimal moon parameters or ML-predicted stability.",
+            "description": (
+                "Run ML stability-habitability prediction using a trained binary MLP classifier (NOT GRU/LSTM/HNN). "
+                "Sweeps a grid of moon mass × moon semi-major axis combinations and classifies each as stable+habitable or not. "
+                "Default grid is 50×50; pass mm_resolution=30 and am_resolution=30 for a 30×30 grid, or any other size. "
+                "Result fields `valid_mm_range_earth` and `valid_am_range_hill` are the RECOMMENDED ranges — "
+                "report ONLY these to the user, never the full grid extents. "
+                "The heatmap is pushed to the ML overlay automatically: teal = stable+habitable, grey = not. "
+                "Use this tool — NOT trajectory_preview — whenever the user asks for an MLP grid, "
+                "ML stability map, or ML-predicted stability regions, regardless of grid size."
+            ),
             "input_schema": {
                 "type": "object",
                 "properties": {
                     "t_sim": {"type": "number", "description": "Prediction horizon in simulated years (default 10)"},
                     "mm_resolution": {"type": "integer", "description": "Moon mass grid points (default 50)"},
                     "am_resolution": {"type": "integer", "description": "Moon orbit grid points (default 50)"},
-                    "rnn_type": {"type": "string", "description": "'gru' or 'lstm' — which trained model to use (default 'gru')"},
                 },
                 "required": [],
             },
         },
         {
             "name": "trajectory_preview",
-            "description": "Run a GPU batch trajectory preview over a moon mass × semi-major axis grid. Returns how many cells are stable+habitable. Use when the user asks for a physics-based trajectory sweep or wants to validate the ML prediction with actual dynamics.",
+            "description": (
+                "Load a physics-based trajectory sweep over a moon mass × semi-major axis grid. "
+                "This is NOT the MLP classifier — it uses a physics integrator or neural trajectory model, "
+                "and is used to VALIDATE or COMPARE with the MLP prediction, not replace it. "
+                "If results for the current system are cached, they are returned instantly. "
+                "If not cached, returns a message telling the user to run it from the ML panel "
+                "(brain icon ⬡, top-right corner), Layer 2 — Trajectory tab "
+                "(takes 8–10 minutes, cannot run inline in chat). "
+                "mode='gt_leapfrog' uses the ground-truth physics integrator. "
+                "mode='hnn_hinge4' uses the neural trajectory model. "
+                "Use ONLY when the user explicitly asks for physics-based trajectory validation "
+                "or to compare with the MLP prediction — do NOT use this for MLP stability map requests."
+            ),
             "input_schema": {
                 "type": "object",
                 "properties": {
-                    "mode": {"type": "string", "description": "'gt_leapfrog' (Numba CUDA, ~2.3s) or 'hnn_hinge4' (HNN ML model, ~470s+S3 cached)"},
+                    "mode": {"type": "string", "description": "'gt_leapfrog' (physics integrator, recommended) or 'hnn_hinge4' (neural model)"},
                     "mm_resolution": {"type": "integer", "description": "Moon mass grid points — 30 or 50 (default 30)"},
                     "am_resolution": {"type": "integer", "description": "Moon orbit grid points — 30 or 50 (default 30)"},
                     "t_sim": {"type": "number", "description": "Simulation duration in years (default 10)"},
@@ -704,31 +729,20 @@ def _tool_specs() -> list[dict]:
                 "required": [],
             },
         },
-        {
-            "name": "ml_train",
-            "description": "Start training the ML stability predictor model in the background. Returns immediately with a job_id. Use when the user asks to train or retrain the ML model.",
-            "input_schema": {
-                "type": "object",
-                "properties": {
-                    "data_path": {"type": "string", "description": "Path to ml_dataset.parquet training file (required)"},
-                    "epochs": {"type": "integer", "description": "Training epochs (default 30)"},
-                    "batch_size": {"type": "integer", "description": "Batch size (default 64)"},
-                    "lr": {"type": "number", "description": "Learning rate (default 0.001)"},
-                    "hidden": {"type": "integer", "description": "GRU hidden size (default 256)"},
-                    "layers": {"type": "integer", "description": "Number of GRU layers (default 2)"},
-                    "rnn_type": {"type": "string", "description": "'gru' or 'lstm' (default 'gru')"},
-                },
-                "required": ["data_path"],
-            },
-        },
+        # ml_train is intentionally omitted from Claude's tool list — model training is a
+        # developer-only operation executed from the CLI or the ML overlay training UI.
+        # Claude can describe training status/history from context but cannot trigger it.
         {
             "name": "trajectory_cell_query",
             "description": (
-                "Retrieve the trajectory animation for a specific moon mass and orbit radius from the last cached "
-                "trajectory batch. Use when the user asks to see the orbit animation for a specific (moon mass, "
-                "semi-major axis) combination, e.g. 'show me the trajectory for 0.2 M⊕ at 0.4 Hill radii'. "
-                "Requires that a trajectory batch has already been run for the current system (call "
-                "trajectory_preview first if unsure). Returns the animation directly to the frontend."
+                "Retrieve the orbit trajectory for a specific (moon mass, semi-major axis) cell from the last "
+                "trajectory batch and push it to the orbit preview panels. Use when the user asks to see the "
+                "orbit animation for a specific combination, e.g. 'show me the trajectory for 0.2 M⊕ at 0.4 Hill radii'. "
+                "Requires that trajectory_preview has already been called for the current system. "
+                "Pass mm_earth and am_hill values that are within the batch grid — use grid values from the "
+                "trajectory_preview result (not arbitrary values). "
+                "After calling, tell the user the orbit animation has been loaded into "
+                "the main orbit canvas and mini orbit view on the page — they can see it there."
             ),
             "input_schema": {
                 "type": "object",
@@ -746,19 +760,17 @@ def _tool_specs() -> list[dict]:
                 "plot_type options: "
                 "'loss_curves' — training + validation loss over epochs; "
                 "'flag_accuracy' — stable/habitable flag accuracy over epochs; "
-                "'heatmap' — 50×50 moon mass × orbit stability map from the last ML prediction. "
-                "Use when the user asks to visualise ML model performance or the stability heatmap."
+                "'heatmap' — MLP moon mass × orbit stability-habitability map from the last ml_predict call; "
+                "'trajectory_heatmap' — physics-based trajectory stable+habitable grid from the last trajectory_preview call. "
+                "Use when the user asks to visualise ML model performance or the stability heatmap. "
+                "IMPORTANT: when trajectory_preview has been called, do NOT use 'heatmap' — use 'trajectory_heatmap' instead."
             ),
             "input_schema": {
                 "type": "object",
                 "properties": {
                     "plot_type": {
                         "type": "string",
-                        "description": "'loss_curves', 'flag_accuracy', or 'heatmap'",
-                    },
-                    "rnn_type": {
-                        "type": "string",
-                        "description": "'gru' or 'lstm' — which model's history to plot for loss_curves/flag_accuracy (default 'gru')",
+                        "description": "'loss_curves', 'flag_accuracy', 'heatmap' (MLP grid), or 'trajectory_heatmap' (physics trajectory grid)",
                     },
                 },
                 "required": ["plot_type"],
@@ -1108,59 +1120,132 @@ def _execute_tool(tool_name: str, tool_input: Dict[str, Any], req: ChatRequest) 
 
         if tool_name == "ml_predict":
             try:
-                raw_params = req.params or {}
-                system_params = {
-                    "ms_solar": float(raw_params.get("ms_solar", 1.0)),
-                    "rs_solar": float(raw_params.get("rs_solar", 1.0)),
-                    "Ts":       float(raw_params.get("Ts",       5772.0)),
-                    "mp_earth": float(raw_params.get("mp_earth", 1.0)),
-                    "dp_cgs":   float(raw_params.get("dp_cgs",   5.5)),
-                    "ap_AU":    float(raw_params.get("ap_AU",    1.0)),
-                    "ep":       float(raw_params.get("ep",       0.0)),
-                }
-                t_sim      = float(tool_input.get("t_sim",        req.years or 10.0))
-                mm_res     = int(tool_input.get("mm_resolution",  50))
-                am_res     = int(tool_input.get("am_resolution",  50))
-                moon_retro = bool(raw_params.get("moon_retrograde", False))
-                em         = float(raw_params.get("em",           0.0))
+                # If the panel's prediction is already in the session (sent with this request),
+                # use it directly — guarantees the chatbot reports the exact same data the panel shows.
+                if (
+                    _session.last_ml_prediction
+                    and _session.last_ml_prediction.get("_from_panel")
+                    and _session.last_ml_prediction.get("mm_grid")
+                    and _session.last_ml_prediction.get("valid_am_per_mm")
+                ):
+                    result = _session.last_ml_prediction
+                    print("[TOOL] ml_predict: using panel prediction from session cache", flush=True)
+                else:
+                    raw_params = req.params or {}
+                    system_params = {
+                        "ms_solar": float(raw_params.get("ms_solar", 1.0)),
+                        "rs_solar": float(raw_params.get("rs_solar", 1.0)),
+                        "Ts":       float(raw_params.get("Ts",       5772.0)),
+                        "mp_earth": float(raw_params.get("mp_earth", 1.0)),
+                        "dp_cgs":   float(raw_params.get("dp_cgs",   5.5)),
+                        "ap_AU":    float(raw_params.get("ap_AU",    1.0)),
+                        "ep":       float(raw_params.get("ep",       0.0)),
+                    }
+                    t_sim      = float(tool_input.get("t_sim",        req.years or 10.0))
+                    mm_res     = int(tool_input.get("mm_resolution",  50))
+                    am_res     = int(tool_input.get("am_resolution",  50))
+                    moon_retro = bool(raw_params.get("moon_retrograde", False))
+                    em         = float(raw_params.get("em",           0.0))
 
-                result = _predict_stability_map_mlp(
-                    system_params   = system_params,
-                    t_sim           = t_sim,
-                    moon_retrograde = moon_retro,
-                    em              = em,
-                    mm_resolution   = mm_res,
-                    am_resolution   = am_res,
-                )
+                    result = _predict_stability_map_mlp(
+                        system_params   = system_params,
+                        t_sim           = t_sim,
+                        moon_retrograde = moon_retro,
+                        em              = em,
+                        mm_resolution   = mm_res,
+                        am_resolution   = am_res,
+                    )
                 if not result.get("ok"):
                     return result
 
-                # Cache full prediction in session so it can be sent to frontend via done event
+                # Cache full prediction in session.
+                # Only mark fresh (→ pushed in done_evt) for real inference runs.
+                # Panel-sourced data lacks map_both/stable/habitable arrays — pushing it
+                # would replace the frontend's correct arrays with empty ones.
                 _session.last_ml_prediction = result
-                _session._ml_fresh = True
+                if not result.get("_from_panel"):
+                    _session._ml_fresh = True
 
                 valid_mm        = result.get("valid_mm_range")
                 valid_am_per_mm = result.get("valid_am_per_mm", [])
                 mm_grid         = result.get("mm_grid", [])
                 am_grid         = result.get("am_grid", [])
                 n_valid         = sum(1 for am in valid_am_per_mm if am is not None)
+                # Derive grid resolution from result — works for both panel and fresh-inference paths
+                mm_res          = len(mm_grid)
+                am_res          = len(am_grid)
 
-                # Return text summary only — full arrays are NOT sent to Claude (too large)
+                # Compute the overall valid orbit range (union across all valid mass bins)
+                valid_am_flat = [am for am in valid_am_per_mm if am is not None]
+                valid_am_overall = (
+                    [round(min(a[0] for a in valid_am_flat), 4),
+                     round(max(a[1] for a in valid_am_flat), 4)]
+                    if valid_am_flat else None
+                )
+
+                # Group consecutive valid mass bins by their orbit outer bound (rounded to 3 dp).
+                # The group boundary is exactly where the maximum valid Hill radius changes in
+                # the MLP grid — these are the cell boundaries the panel would show when scrolling.
+                # Every mass value and orbit value is a direct mm_grid / valid_am_per_mm lookup.
+                valid_indices = [i for i, am in enumerate(valid_am_per_mm) if am is not None]
+                if valid_indices and mm_grid:
+                    groups = []   # (start_grid_idx, end_grid_idx, am_range)
+                    cur_start = valid_indices[0]
+                    cur_key   = round(float(valid_am_per_mm[valid_indices[0]][1]), 3)
+                    cur_am    = valid_am_per_mm[valid_indices[0]]
+                    prev_vi   = valid_indices[0]
+
+                    for vi in valid_indices[1:]:
+                        key = round(float(valid_am_per_mm[vi][1]), 3)
+                        if key != cur_key:
+                            groups.append((cur_start, prev_vi, cur_am))
+                            cur_start = vi
+                            cur_key   = key
+                            cur_am    = valid_am_per_mm[vi]
+                        prev_vi = vi
+                    groups.append((cur_start, valid_indices[-1], cur_am))
+
+                    mm_lo = float(mm_grid[valid_indices[0]])
+                    mm_hi = float(mm_grid[valid_indices[-1]])
+                    band_lines = "\n".join(
+                        f"  • {float(mm_grid[g_start]):.4f}–{float(mm_grid[g_end]):.4f} M⊕: "
+                        f"orbit {float(g_am[0]):.3f}–{float(g_am[1]):.3f} Hill radii"
+                        for g_start, g_end, g_am in groups
+                    )
+                    orbit_section = (
+                        f"\nValid moon mass range: {mm_lo:.4f}–{mm_hi:.4f} M⊕\n"
+                        f"Orbit range by mass band:\n{band_lines}\n"
+                        f"(Full grid visible in the ML panel Layer 1 heatmap.)"
+                    )
+                else:
+                    orbit_section = ""
+
+                # Return text summary only — full arrays are NOT sent to Claude (too large).
+                # mm_grid_sweep / am_grid_sweep are the SAMPLE SIZE of the grid (not valid/recommended).
+                # orbit_section reports valid orbit ranges per sampled mass — both dimensions equally.
+                mm_sweep = [round(float(mm_grid[0]), 4), round(float(mm_grid[-1]), 4)] if mm_grid else None
+                am_sweep = [round(float(am_grid[0]), 4), round(float(am_grid[-1]), 4)] if am_grid else None
+                sweep_str = ""
+                if mm_sweep and am_sweep:
+                    sweep_str = (
+                        f" Grid swept: mass {mm_sweep[0]}–{mm_sweep[1]} M⊕, "
+                        f"orbit {am_sweep[0]}–{am_sweep[1]} Hill radii (sample size)."
+                    )
                 return {
                     "ok": True,
-                    "valid_mm_range_earth":  valid_mm,
-                    "n_valid_mass_bins":     n_valid,
-                    "total_mass_bins":       mm_res,
-                    "mm_grid_range":         [round(mm_grid[0], 4), round(mm_grid[-1], 4)] if mm_grid else None,
-                    "am_grid_range":         [round(am_grid[0], 4), round(am_grid[-1], 4)] if am_grid else None,
+                    "n_valid_mass_bins":   n_valid,
+                    "total_mass_bins":     mm_res,
+                    "grid_size":           f"{mm_res}×{am_res}",
+                    "mm_grid_sweep_earth": mm_sweep,
+                    "am_grid_sweep_hill":  am_sweep,
                     "message": (
-                        f"ML prediction complete. {n_valid}/{mm_res} mass bins have stable+habitable orbits. "
-                        f"Valid mass range: {valid_mm[0]:.4f}–{valid_mm[1]:.4f} M⊕ "
-                        f"(grid: {mm_grid[0]:.4f}–{mm_grid[-1]:.4f} M⊕). "
-                        f"Moon orbit grid spans {am_grid[0]:.3f}–{am_grid[-1]:.3f} Hill radii."
+                        f"MLP prediction complete ({mm_res}×{am_res} grid).{sweep_str} "
+                        f"{n_valid}/{mm_res} mass bins have at least one stable+habitable orbit."
+                        f"{orbit_section}"
                         if valid_mm else
-                        f"ML prediction complete. No stable+habitable orbits found in the {mm_res}×{am_res} grid. "
-                        "Consider adjusting system parameters or training the model on more data."
+                        f"MLP prediction complete ({mm_res}×{am_res} grid).{sweep_str} "
+                        "No stable+habitable orbits found. "
+                        "Consider adjusting system parameters."
                     ),
                 }
             except Exception as e:
@@ -1208,10 +1293,10 @@ def _execute_tool(tool_name: str, tool_input: Dict[str, Any], req: ChatRequest) 
                             f"No cached trajectory batch found for this system in {mode} mode "
                             f"({mm_res}×{am_res} grid). Running the batch takes 8–10 minutes on the GPU "
                             "and cannot be done inline in chat. To generate it:\n"
-                            "1. Open the ML overlay (brain icon, top-right).\n"
-                            "2. Go to Layer 2 — Trajectory Previews.\n"
-                            "3. Select the mode and grid size, then click 'Run Trajectory Previews'.\n"
-                            "Once the batch completes (progress shown in the overlay), come back and ask "
+                            "1. Open the ML panel (brain icon ⬡, top-right corner).\n"
+                            "2. In the Prediction section, select the 'Layer 2 — Trajectory' tab.\n"
+                            "3. Choose the mode and grid size, then click 'Run Trajectory Preview'.\n"
+                            "Once the batch completes (progress shown in the panel), come back and ask "
                             "again — I will read the cached result instantly."
                         ),
                     }
@@ -1234,8 +1319,11 @@ def _execute_tool(tool_name: str, tool_input: Dict[str, Any], req: ChatRequest) 
                 _session.last_traj_mm_grid = mm_grid
                 _session.last_traj_am_grid = am_grid
 
-                # Push the heatmap to the frontend via the done event (same path as ml_predict)
-                _session.last_ml_prediction = {
+                # Push trajectory batch to the frontend via the done event as traj_preview —
+                # NOT as ml_prediction. Keeping them separate is critical: if traj_preview
+                # overwrites the Zustand mlPrediction (Layer 1 MLP), the confidence map
+                # computation in MlMapOverlay compares identical data and never produces LOW cells.
+                _session.last_traj_preview = {
                     "ok":            True,
                     "mm_grid":       mm_grid,
                     "am_grid":       am_grid,
@@ -1244,18 +1332,21 @@ def _execute_tool(tool_name: str, tool_input: Dict[str, Any], req: ChatRequest) 
                     "map_both":      map_both,
                     "valid_mm_range":  valid_mm,
                     "valid_am_per_mm": valid_am,
+                    "wall_s":        wall_s,
+                    "from_cache":    True,
+                    "cache_key":     _session.last_traj_key,
                 }
-                _session._ml_fresh = True
+                _session._traj_preview_fresh = True
 
+                _mode_label = "physics simulation" if mode == "gt_leapfrog" else "neural model"
                 return {
                     "ok":            True,
-                    "mode":          mode,
                     "cached":        True,
                     "n_stable_both": n_stable,
                     "total_cells":   total,
                     "wall_s":        wall_s,
                     "message": (
-                        f"Trajectory preview ({mode}) loaded from cache in {wall_s:.1f}s. "
+                        f"Trajectory preview ({_mode_label} mode) loaded from cache in {wall_s:.1f}s. "
                         f"{n_stable}/{total} cells stable+habitable. "
                         f"Grid: {len(mm_grid)}×{len(am_grid)}, "
                         f"{mm_grid[0]:.3f}–{mm_grid[-1]:.3f} M⊕ × "
@@ -1390,16 +1481,20 @@ def _execute_tool(tool_name: str, tool_input: Dict[str, Any], req: ChatRequest) 
             import matplotlib.pyplot as _plt
 
             plot_type = str(tool_input.get("plot_type", "loss_curves")).strip().lower()
-            rnn_type_plot = str(tool_input.get("rnn_type", "gru")).lower().strip()
             _OUTPUTS_DIR.mkdir(exist_ok=True)
 
             try:
                 if plot_type in ("loss_curves", "flag_accuracy"):
-                    hist_path = pathlib.Path(ML_MODEL_DIR) / f"{rnn_type_plot}_training_history.json"
-                    if not hist_path.exists():
-                        hist_path = pathlib.Path(ML_MODEL_DIR) / "training_history.json"  # backward compat
-                    if not hist_path.exists():
-                        return {"ok": False, "message": f"No training history found for {rnn_type_plot.upper()} model. Train the model first via ml_train."}
+                    # Search for MLP training history in priority order (same as /ml/train/history endpoint)
+                    _candidate_paths = [
+                        pathlib.Path(_MLP_DIR) / "aux_mlp_binary_training_history.json",
+                        pathlib.Path(_MLP_DIR) / "mlp_training_history.json",
+                        pathlib.Path(ML_MODEL_DIR) / "mlp_training_history.json",
+                        pathlib.Path(ML_MODEL_DIR) / "training_history.json",  # legacy fallback
+                    ]
+                    hist_path = next((p for p in _candidate_paths if p.exists()), None)
+                    if not hist_path:
+                        return {"ok": False, "message": "No MLP training history found. Train the model first from the ML overlay."}
                     import json as _json
                     with open(hist_path) as _fh:
                         hist = _json.load(_fh)
@@ -1442,9 +1537,38 @@ def _execute_tool(tool_name: str, tool_input: Dict[str, Any], req: ChatRequest) 
                     _plt.close(mfig)
 
                 elif plot_type == "heatmap":
+                    # Remove any stale heatmap so a failed generation never serves old data
+                    stale = _OUTPUTS_DIR / "ml_heatmap.png"
+                    if stale.exists():
+                        stale.unlink()
                     pred = _session.last_ml_prediction
-                    if not pred or not pred.get("ok"):
-                        return {"ok": False, "message": "No ML prediction available. Run ml_predict first."}
+                    if not pred or not pred.get("ok") or not pred.get("map_both"):
+                        # Auto-run MLP prediction to get map_both for plotting.
+                        # Panel-sourced session data omits map_both (too large to send over HTTP),
+                        # so we always need fresh inference when map data is missing.
+                        raw_params = req.params or {}
+                        system_params = {
+                            "ms_solar": float(raw_params.get("ms_solar", 1.0)),
+                            "rs_solar": float(raw_params.get("rs_solar", 1.0)),
+                            "Ts":       float(raw_params.get("Ts",       5772.0)),
+                            "mp_earth": float(raw_params.get("mp_earth", 1.0)),
+                            "dp_cgs":   float(raw_params.get("dp_cgs",   5.5)),
+                            "ap_AU":    float(raw_params.get("ap_AU",    1.0)),
+                            "ep":       float(raw_params.get("ep",       0.0)),
+                        }
+                        pred = _predict_stability_map_mlp(
+                            system_params   = system_params,
+                            t_sim           = float(req.years or 10.0),
+                            moon_retrograde = bool(raw_params.get("moon_retrograde", False)),
+                            em              = float(raw_params.get("em", 0.0)),
+                            mm_resolution   = 50,
+                            am_resolution   = 50,
+                        )
+                        if pred.get("ok"):
+                            _session.last_ml_prediction = pred
+                            _session._ml_fresh = True
+                        else:
+                            return {"ok": False, "message": f"MLP prediction failed: {pred.get('message', 'unknown error')}"}
 
                     mm_grid = pred.get("mm_grid", [])
                     am_grid = pred.get("am_grid", [])
@@ -1454,38 +1578,66 @@ def _execute_tool(tool_name: str, tool_input: Dict[str, Any], req: ChatRequest) 
                         return {"ok": False, "message": "ML prediction data is incomplete."}
 
                     import numpy as _np
+                    import matplotlib.colors as _mcolors_hm
                     _arr = _np.array(map_both, dtype=float)  # [mm_res][am_res]
+                    _mm  = _np.array(mm_grid)
+                    _am  = _np.array(am_grid)
 
-                    mfig, ax = _plt.subplots(figsize=(8, 6), facecolor="#1a1a2e")
-                    ax.set_facecolor("#0f0f1a")
-                    ax.tick_params(colors="#9ca3af"); ax.xaxis.label.set_color("#9ca3af"); ax.yaxis.label.set_color("#9ca3af")
-                    for spine in ax.spines.values(): spine.set_edgecolor("#374151")
+                    # Match MlMapOverlay.tsx exactly:
+                    # colorscale [[0,'#1a2535'],[1,'#0d9488']], showscale:false,
+                    # plot_bgcolor '#0d1117', xaxis type:'log'
+                    mfig, ax = _plt.subplots(figsize=(8, 6), facecolor="#0d1117")
+                    ax.set_facecolor("#0d1117")
+                    ax.tick_params(colors="#9ca3af")
+                    ax.xaxis.label.set_color("#9ca3af")
+                    ax.yaxis.label.set_color("#9ca3af")
+                    for spine in ax.spines.values(): spine.set_edgecolor("#1f2937")
 
-                    _im = ax.imshow(
-                        _arr.T,
-                        origin="lower",
-                        aspect="auto",
-                        extent=[mm_grid[0], mm_grid[-1], am_grid[0], am_grid[-1]],
-                        cmap="YlGn",
-                        vmin=0, vmax=1,
-                    )
-                    _cb = mfig.colorbar(_im, ax=ax, fraction=0.03, pad=0.04)
-                    _cb.ax.yaxis.label.set_color("#9ca3af"); _cb.ax.tick_params(colors="#9ca3af")
-                    _cb.set_label("Stable + Habitable", color="#9ca3af")
-                    ax.set_xlabel("Moon Mass (M⊕, log scale)")
+                    # pcolormesh correctly maps each cell to its actual grid coordinate on a
+                    # log x-axis. imshow maps pixels linearly across extent regardless of scale.
+                    _cmap_hm = _mcolors_hm.ListedColormap(["#1a2535", "#0d9488"])
+                    ax.pcolormesh(_mm, _am, _arr.T, cmap=_cmap_hm, vmin=0, vmax=1)
                     ax.set_xscale("log")
-                    ax.set_ylabel("Moon Semi-Major Axis (Hill radii)")
-                    ax.set_title("ML Stability–Habitability Map (50×50)", color="#e5e7eb")
+                    ax.set_xlabel("Moon mass (M⊕)", color="#6b7280")
+                    ax.set_ylabel("am (Hill radii)", color="#6b7280")
+                    ax.set_title(f"MLP Stability–Habitability Map ({len(mm_grid)}×{len(am_grid)})", color="#9ca3af", fontsize=10)
+                    ax.grid(color="#1f2937", linewidth=0.5)
                     mfig.tight_layout()
                     fname = "ml_heatmap.png"
                     fpath = _OUTPUTS_DIR / fname
                     mfig.savefig(str(fpath), dpi=130, bbox_inches="tight", facecolor=mfig.get_facecolor())
                     _plt.close(mfig)
 
-                else:
-                    return {"ok": False, "message": f"Unknown plot_type '{plot_type}'. Use 'loss_curves', 'flag_accuracy', or 'heatmap'."}
+                elif plot_type == "trajectory_heatmap":
+                    traj = _session.last_traj_preview
+                    if not traj or not traj.get("ok"):
+                        return {"ok": False, "message": "No trajectory preview cached. Call trajectory_preview first, then request this plot."}
+                    import numpy as _np2
+                    mm_grid = _np2.array(traj["mm_grid"])
+                    am_grid = _np2.array(traj["am_grid"])
+                    map_both = _np2.array(traj["map_both"], dtype=float)
+                    mfig, ax = _plt.subplots(figsize=(6, 5), facecolor="#111827")
+                    ax.set_facecolor("#1f2937")
+                    ax.tick_params(colors="#9ca3af"); ax.xaxis.label.set_color("#9ca3af"); ax.yaxis.label.set_color("#9ca3af")
+                    for spine in ax.spines.values(): spine.set_edgecolor("#374151")
+                    import matplotlib.colors as _mcolors
+                    ax.pcolormesh(am_grid, mm_grid, map_both,
+                                  cmap=_mcolors.ListedColormap(["#374151", "#0e7490"]),
+                                  vmin=0, vmax=1)
+                    ax.set_xlabel("Moon Semi-Major Axis (Hill radii)")
+                    ax.set_ylabel("Moon Mass (M⊕)")
+                    ax.set_yscale("log")
+                    ax.set_title("Trajectory Preview — Stable+Habitable Grid", color="#e5e7eb")
+                    mfig.tight_layout()
+                    fname = "ml_traj_heatmap.png"
+                    fpath = _OUTPUTS_DIR / fname
+                    mfig.savefig(str(fpath), dpi=130, bbox_inches="tight", facecolor=mfig.get_facecolor())
+                    _plt.close(mfig)
 
-                image_url = f"{_LOCAL_AGENT_BASE}/outputs/{fname}"
+                else:
+                    return {"ok": False, "message": f"Unknown plot_type '{plot_type}'. Use 'loss_curves', 'flag_accuracy', 'heatmap', or 'trajectory_heatmap'."}
+
+                image_url = f"{_LOCAL_AGENT_BASE}/outputs/{fname}?t={int(time.time())}"
                 return {
                     "ok": True,
                     "figure_url": image_url,
@@ -1620,6 +1772,17 @@ def _chat_with_claude(req: ChatRequest) -> Dict[str, Any]:
         print("[AGENT] Claude not enabled, using rule-based fallback.", flush=True)
         return _chat_rule_based(req)
 
+    # Developer mode keyword detection — 'mihirrb2908' activates, 'mihirrb2908exit' deactivates.
+    # Logged to agent service logs only; never surfaced in chatbot responses.
+    global _developer_mode
+    msg_lower = req.message
+    if 'mihirrb2908exit' in msg_lower:
+        _developer_mode = False
+        print("[AGENT] Developer mode DEACTIVATED — switching to user mode", flush=True)
+    elif 'mihirrb2908' in msg_lower:
+        _developer_mode = True
+        print("[AGENT] Developer mode ACTIVATED", flush=True)
+
     # Session-cached simdata (most recently completed job) always takes priority over
     # req.simdata (which the frontend sends from its local store and may be stale).
     # This ensures follow-up queries after a chatbot-triggered job use the new simulation.
@@ -1751,6 +1914,20 @@ def _chat_with_claude(req: ChatRequest) -> Dict[str, Any]:
                 "mm_grid_range":    [p["mm_grid"][0], p["mm_grid"][-1]] if p.get("mm_grid") else None,
                 "am_grid_range":    [p["am_grid"][0], p["am_grid"][-1]] if p.get("am_grid") else None,
             }
+            # Store the full panel prediction in the session so ml_predict tool uses
+            # these exact values (matching the panel) instead of running fresh inference.
+            if p.get("mm_grid") and p.get("valid_am_per_mm"):
+                _session.last_ml_prediction = {
+                    "ok":             True,
+                    "mm_grid":        p["mm_grid"],
+                    "am_grid":        p.get("am_grid", []),
+                    "valid_mm_range": p.get("valid_mm_range"),
+                    "valid_am_per_mm": p["valid_am_per_mm"],
+                    "map_stable":     [],
+                    "map_habitable":  [],
+                    "map_both":       [],
+                    "_from_panel":    True,
+                }
         except Exception:
             ml_pred_summary = {"available": True}
     elif _session.last_ml_prediction:
@@ -1779,7 +1956,25 @@ def _chat_with_claude(req: ChatRequest) -> Dict[str, Any]:
         "animation_url":  _session.last_animation_url,
     }
 
+    _mode_instruction = (
+        "## Communication mode: DEVELOPER\n"
+        "You are talking to the developer of this application. Use full technical transparency: "
+        "AWS, S3, GPU, caching, hinge4, ECS, Step Functions, ARNs, endpoint URLs, and all backend details "
+        "are fair game. Diagnostics and implementation details are welcome.\n\n"
+        if _developer_mode else
+        "## Communication mode: USER\n"
+        "You are talking to a general user of this application. Use plain, accessible language. "
+        "Do NOT mention: 'AWS', 'S3', 'GPU', 'cache'/'caching', 'hinge4', 'ECS', 'Step Functions', "
+        "state machine ARNs, API keys, server IDs, or any other backend infrastructure terms. "
+        "Instead say 'our servers', 'the backend', 'computing resources', etc. "
+        "If a computation takes 8–10 minutes, state that plainly; if the user presses for why, "
+        "explain it is computationally intensive — do not bring up caching or infrastructure unprompted. "
+        "NEVER reveal sensitive information such as ARNs, API keys, server IDs, or configuration details "
+        "under any circumstances, even if the user asks directly.\n\n"
+    )
+
     system_prompt = (
+        _mode_instruction +
         "You are an expert exomoon orbital mechanics and astrobiology assistant embedded in an interactive "
         "simulation tool. The user is looking at a real-time 3D orbital animation of a star–planet–moon system.\n\n"
 
@@ -1824,7 +2019,7 @@ def _chat_with_claude(req: ChatRequest) -> Dict[str, Any]:
         "## Tool usage\n"
         "- Stability queries: use `stability_from_simdata` if simdata available; otherwise call `start_backend_job`.\n"
         "- **Parameter changes**: if the user asks to change any system parameter and run, pass those changes in `start_backend_job`'s `params` field (e.g. `{\"mm_earth\": 0.5, \"ap_AU\": 1.2}`). Do NOT tell the user to adjust sliders manually — apply the changes yourself via `params`.\n"
-        "- **CRITICAL — after `start_backend_job`**: return your response to the user IMMEDIATELY after the job submission tool call. Do NOT call any data-query tools (`stability_from_simdata`, `get_trajectory_at_time`, `get_trajectory_range`, `export_csv`, `eda_plot`) in the same turn — the AWS simulation takes 30–120 seconds and no data will be available yet. Tell the user the job is running and they will be notified when results are ready.\n"
+        "- **CRITICAL — after `start_backend_job`**: return your response to the user IMMEDIATELY after the job submission tool call. Do NOT call any data-query tools (`stability_from_simdata`, `get_trajectory_at_time`, `get_trajectory_range`, `export_csv`, `eda_plot`) in the same turn — the simulation takes 30–120 seconds and no data will be available yet. Tell the user the simulation is running and they will be notified when results are ready.\n"
         "- Trajectory at specific times: call `get_trajectory_at_time()` (multiple calls allowed).\n"
         "- Trajectory over a range: call `get_trajectory_range(t_start, t_end, step)` for time-series snapshots.\n"
         "- CSV exports: call `export_csv` — returns a presigned URL; include as `[Download CSV](url)` in response.\n"
@@ -1833,16 +2028,31 @@ def _chat_with_claude(req: ChatRequest) -> Dict[str, Any]:
         "AND include a download link `[Download PNG](figure_url)` on the next line.\n"
         "- Dash URL: call `dash_url(planet, autorun)` to generate a shareable URL encoding current system parameters.\n"
         "- Environment debug: call `env_info()` when diagnosing Python import or module path issues.\n"
-        "- ML stability map: call `ml_predict(t_sim, mm_resolution, am_resolution, rnn_type)` to run stability sweep (rnn_type='gru' or 'lstm'; default 'gru'). Requires a trained model of that type.\n"
-        "- ML training: call `ml_train(data_path, rnn_type, epochs, ...)` to start background model training for the specified model type.\n"
-        "- ML plots: call `ml_plot(plot_type, rnn_type)` to generate a PNG. "
+        "- ML stability map: call `ml_predict(t_sim, mm_resolution, am_resolution)` to run a stability sweep using the trained binary MLP classifier. "
+        "No rnn_type argument — the model type is fixed (it is an MLP, NOT GRU/LSTM/HNN). "
+        "Default grid is 50×50; pass mm_resolution=30, am_resolution=30 for a 30×30 grid. "
+        "ALWAYS use `ml_predict` for any request mentioning 'MLP', 'ML stability', 'ML grid', or 'ML prediction' — "
+        "do NOT use `trajectory_preview` for these requests, regardless of the grid size asked for. "
+        "When reporting results, use the exact numeric values from the `message` field — do NOT recompute or approximate them. "
+        "You may format them neatly (e.g. a table or spaced bullet list) but DO NOT add 'Recommended' headers or labels. "
+        "Report both the valid mass range AND the per-band orbit ranges with equal prominence.\n"
+        "- ML training: model training is a developer-only operation (done from the ML panel, brain icon ⬡, top-right corner). "
+        "You CANNOT trigger training. If asked, describe what the Model Training section in the ML panel shows "
+        "(training progress, loss curves, flag accuracy) but do not attempt to call any training tool.\n"
+        "- ML plots: call `ml_plot(plot_type)` to generate a PNG (no rnn_type argument). "
         "plot_type='loss_curves' → training/val loss curves; "
         "plot_type='flag_accuracy' → stable/habitable flag accuracy over epochs; "
-        "plot_type='heatmap' → 50×50 stability map from last ml_predict run. "
-        "Pass rnn_type to select which model's history to plot (default 'gru'). "
+        "plot_type='heatmap' → MLP stability map from last ml_predict run; "
+        "plot_type='trajectory_heatmap' → physics-based trajectory stable+habitable grid from last trajectory_preview run. "
         "Embed the returned `figure_url` as `![ML Plot](figure_url)` AND `[Download PNG](figure_url)` on the next line.\n"
+        "- CRITICAL trajectory rules:\n"
+        "  • When `trajectory_preview` is called, do NOT call `ml_plot` afterwards — the grid updates the Layer 2 tab automatically. Describe the summary in text only.\n"
+        "  • If the user explicitly asks for an image of the trajectory preview grid in chat, call `ml_plot(plot_type='trajectory_heatmap')` — never `ml_plot(plot_type='heatmap')` for trajectory results.\n"
+        "  • When `trajectory_cell_query` is called, do NOT call `ml_plot`. Describe the result verbally.\n"
         "- If `context.ml_prediction` is set, you already have ML prediction results — answer questions about valid mass/orbit ranges directly from that summary without calling `ml_predict` again.\n"
-        "- Animation: if `context.animation_url` is set and the user asks for the animation, return `[Download Animation](url)` as a link. Do NOT call any tool for this — the URL is already in context.\n"
+        "- Animation: if `context.animation_url` is set and the user asks for the **physics simulation** animation (the main orbital animation from a `start_backend_job` run), return `[Download Animation](url)` as a link. Do NOT use `animation_url` for trajectory cell animations — those come from `trajectory_cell_query` and appear in the mini orbit views, not as a downloadable URL.\n"
+        "- Trajectory cell animations: call `trajectory_cell_query(mm_earth, am_hill)` — the result is pushed to the main orbit canvas and mini orbit view automatically. After calling, tell the user to look at the main orbit canvas and mini orbit view on the page, NOT any 'ML overlay'.\n"
+        "- Trajectory preview modes: when describing trajectory preview modes to users, say 'physics simulation mode' for gt_leapfrog and 'neural model mode' for hnn_hinge4. Do not expose the raw mode strings to users.\n"
         "- Do NOT ask the user to run simulations manually — trigger them yourself.\n\n"
 
         "## Unit conversions\n"
@@ -1954,10 +2164,17 @@ def _chat_with_claude(req: ChatRequest) -> Dict[str, Any]:
                     result["effective_params"] = _session.last_effective_params
                     _session._job_fresh = False  # consume
 
-                # Include ML prediction / heatmap when ml_predict or trajectory_preview ran this turn
+                # Include MLP prediction heatmap (Layer 1) when ml_predict tool ran this turn
                 if _session._ml_fresh and _session.last_ml_prediction:
                     result["ml_prediction"] = _session.last_ml_prediction
                     _session._ml_fresh = False  # consume — won't re-send on next turn
+
+                # Include trajectory batch (Layer 2) separately — MUST NOT go via ml_prediction.
+                # Mixing them breaks the confidence_map computation in MlMapOverlay which compares
+                # mlPrediction (MLP Layer 1) against trajResult (Layer 2) to find LOW-confidence cells.
+                if _session._traj_preview_fresh and _session.last_traj_preview:
+                    result["traj_preview"] = _session.last_traj_preview
+                    _session._traj_preview_fresh = False  # consume
 
                 # Include cell trajectory frames when trajectory_cell_query ran this turn
                 if _session._cell_frames_fresh and _session.last_cell_frames:
@@ -2114,25 +2331,33 @@ def chat_stream(req: ChatRequest):
             for tok in text.split(" "):
                 yield f"data: {json.dumps({'type': 'token', 'token': tok + ' '})}\n\n"
             # Done event — carries simdata, presigned URLs, and ML prediction for the frontend to cache
+            _ml_p = result.get("ml_prediction")
+            print(f"[DONE_EVT] ml_prediction={'SET (ok=' + str(_ml_p.get('ok')) + ', mm_res=' + str(len(_ml_p.get('mm_grid',[]))) + ')' if _ml_p else 'NULL'}", flush=True)
+            print(f"[DONE_EVT] traj_preview={'SET' if result.get('traj_preview') else 'NULL'}, cell_frames={'SET' if result.get('cell_frames') else 'NULL'}", flush=True)
             done_evt = {
                 "type":             "done",
                 "simdata":          result.get("simdata"),
                 "urls":             result.get("urls", {}),
                 "job_id":           result.get("job_id"),
-                "ml_prediction":    result.get("ml_prediction"),
+                "ml_prediction":    _ml_p,
+                "traj_preview":     result.get("traj_preview"),
                 "cell_frames":      result.get("cell_frames"),
                 "cell_rhill_au":    result.get("cell_rhill_au"),
                 "cell_roche_frac":  result.get("cell_roche_frac"),
                 "effective_params": result.get("effective_params"),
             }
-            # Catch non-JSON-serializable values in done_evt (e.g. numpy scalars from ml_prediction)
+            # Catch non-JSON-serializable values in done_evt (e.g. numpy scalars).
+            # Strip fields individually so a bad field doesn't silently null unrelated ones.
             try:
                 done_payload = json.dumps(done_evt)
             except Exception as _je:
-                print(f"[GEN] done_evt serialization failed ({_je}), stripping heavy fields", flush=True)
-                done_evt["ml_prediction"] = None
-                done_evt["cell_frames"] = None
-                done_evt["simdata"] = None
+                print(f"[GEN] done_evt serialization failed: {_je}", flush=True)
+                for _k in ("ml_prediction", "traj_preview", "cell_frames", "simdata"):
+                    try:
+                        json.dumps({_k: done_evt[_k]})
+                    except Exception as _kje:
+                        print(f"[GEN] dropping non-serializable field '{_k}': {_kje}", flush=True)
+                        done_evt[_k] = None
                 done_payload = json.dumps(done_evt)
             yield f"data: {done_payload}\n\n"
         except Exception as _gen_err:
@@ -2493,10 +2718,6 @@ def _format_claude_response(text: str) -> str:
 ML_MODEL_DIR = os.getenv("ML_MODEL_DIR", os.path.join(os.path.dirname(__file__), "..", "models"))
 ML_MODEL_DIR = os.path.abspath(ML_MODEL_DIR)
 
-# Lazy-loaded model cache keyed by rnn_type ("gru" / "lstm")
-_ml_model_cache: Dict[str, Any] = {}
-_ml_model_lock  = threading.Lock()
-
 # AuxMLPBinary binary classifier cache
 _mlp_binary_cache: Optional[dict] = None
 _mlp_binary_lock  = threading.Lock()
@@ -2519,7 +2740,6 @@ class MlPredictRequest(BaseModel):
     em:              float   = 0.0
     mm_resolution:   int     = 50
     am_resolution:   int     = 50
-    model_type:      str     = "gru"      # "gru" or "lstm"
 
 
 class MlTrainRequest(BaseModel):
@@ -2532,27 +2752,6 @@ class MlTrainRequest(BaseModel):
     layers:     int   = 2
     rnn_type:   str   = "gru"
     input_noise_scale: float = 0.0   # 0.0 disables; 1.0 = noise std matches measured per-column MAE
-
-
-def _load_ml_model(rnn_type: str = "gru"):
-    """Lazy-load the trained MoonRNN from ML_MODEL_DIR. Returns None if not found."""
-    global _ml_model_cache
-    model_pt = os.path.join(ML_MODEL_DIR, f"{rnn_type}_model.pt")
-    cfg_pt   = os.path.join(ML_MODEL_DIR, f"{rnn_type}_model_config.json")
-    # backward compat: also accept legacy model_config.json for gru
-    if not os.path.exists(cfg_pt) and rnn_type == "gru":
-        cfg_pt = os.path.join(ML_MODEL_DIR, "model_config.json")
-    if not (os.path.exists(model_pt) and os.path.exists(cfg_pt)):
-        return None
-    try:
-        from exomoon.ml.model import MoonRNN
-        model = MoonRNN.load(ML_MODEL_DIR, rnn_type=rnn_type)
-        _ml_model_cache[rnn_type] = model
-        print(f"[ML] Loaded {rnn_type.upper()} model from {ML_MODEL_DIR}", flush=True)
-        return model
-    except Exception as e:
-        print(f"[ML] Failed to load {rnn_type} model: {e}", flush=True)
-        return None
 
 
 def _load_mlp_binary() -> Optional[dict]:
@@ -2707,7 +2906,7 @@ def ml_predict(req: MlPredictRequest):
     Returns {"ok": False, "error": "no_model"} if model weights are missing.
     """
     try:
-        return _predict_stability_map_mlp(
+        result = _predict_stability_map_mlp(
             system_params   = req.system_params,
             t_sim           = req.t_sim,
             moon_retrograde = req.moon_retrograde,
@@ -2715,6 +2914,10 @@ def ml_predict(req: MlPredictRequest):
             mm_resolution   = req.mm_resolution,
             am_resolution   = req.am_resolution,
         )
+        # Always sync to session so ml_plot(heatmap) works even when called from UI button
+        if result.get("ok"):
+            _session.last_ml_prediction = result
+        return result
     except Exception as e:
         print(f"[ML] Predict error: {e}", flush=True)
         traceback.print_exc()
@@ -2760,9 +2963,10 @@ def _run_training_thread(req: MlTrainRequest) -> None:
             "train_loss": history["train_loss"][-1] if history["train_loss"] else None,
             "val_loss":   history["val_loss"][-1]   if history["val_loss"]   else None,
         })
-        # Invalidate this model type's cache so next /ml/predict reloads fresh weights
-        with _ml_model_lock:
-            _ml_model_cache.pop(req.rnn_type, None)
+        # Invalidate MLP binary cache so next /ml/predict reloads fresh weights
+        global _mlp_binary_cache
+        with _mlp_binary_lock:
+            _mlp_binary_cache = None
         print(f"[ML] Training complete. Model saved to {out_dir}", flush=True)
     except Exception as e:
         _train_job.update({"status": "failed", "error": str(e)})
@@ -2818,17 +3022,16 @@ def ml_train_status():
 
 
 @app.get("/ml/train/history")
-def ml_train_history(model_type: str = "gru"):
+def ml_train_history(model_type: str = "mlp"):
     """
     Return training history JSON for the requested model type.
-    model_type="hnn"  → models_hnn_hill_hinge4/hnn_hill_training_history.json
-    model_type="gru"  → {ML_MODEL_DIR}/training_history.json (legacy fallback)
+    model_type="mlp" → models_mlp/aux_mlp_binary_training_history.json
+    model_type="hnn" → models_hnn_hill_hinge4/hnn_hill_training_history.json
     Returns {"ok": False} if no history file exists yet.
     """
-    rnn_type = model_type.lower().strip()
+    layer = model_type.lower().strip()
 
-    # HNN hinge4 lives in its own directory outside ML_MODEL_DIR
-    if rnn_type == "hnn":
+    if layer == "hnn":
         hist_file = os.path.join(_HNN_DIR, "hnn_hill_training_history.json")
         if not os.path.exists(hist_file):
             return {"ok": False, "message": "No HNN training history found."}
@@ -2839,8 +3042,7 @@ def ml_train_history(model_type: str = "gru"):
         except Exception as e:
             return {"ok": False, "message": f"Error reading HNN history: {e}"}
 
-    # MLP binary model has its own directory; check there first
-    if rnn_type == "mlp":
+    if layer == "mlp":
         for candidate in [
             os.path.join(_MLP_DIR, "mlp_training_history.json"),
             os.path.join(_MLP_DIR, "aux_mlp_binary_training_history.json"),
@@ -2851,21 +3053,14 @@ def ml_train_history(model_type: str = "gru"):
                 break
         else:
             return {"ok": False, "message": "No MLP training history found. Train a model first."}
-    else:
-        # GRU / LSTM path
-        hist_file = os.path.join(ML_MODEL_DIR, f"{rnn_type}_training_history.json")
-        if not os.path.exists(hist_file):
-            # backward compat: legacy filename for gru
-            if rnn_type == "gru":
-                hist_file = os.path.join(ML_MODEL_DIR, "training_history.json")
-            if not os.path.exists(hist_file):
-                return {"ok": False, "message": f"No {rnn_type.upper()} training history found. Train a model first."}
-    try:
-        with open(hist_file) as f:
-            history = json.load(f)
-        return {"ok": True, **history}
-    except Exception as e:
-        return {"ok": False, "message": f"Error reading history: {e}"}
+        try:
+            with open(hist_file) as f:
+                history = json.load(f)
+            return {"ok": True, **history}
+        except Exception as e:
+            return {"ok": False, "message": f"Error reading MLP history: {e}"}
+
+    return {"ok": False, "message": f"Unknown model_type '{model_type}'. Use 'mlp' or 'hnn'."}
 
 
 # ─────────────────────────────────────────────────────────────────────────────

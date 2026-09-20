@@ -142,6 +142,7 @@ export function MlMapOverlay({ onClose, containerRef, onApplyAndRun, frameIndex 
     setPreviewCellFrames,
     setTrajectoryData,
     chatCellFrames,
+    trajPreview,
   } = useSimulationStore();
 
   // ── Drag ───────────────────────────────────────────────────────────────────
@@ -207,6 +208,29 @@ export function MlMapOverlay({ onClose, containerRef, onApplyAndRun, frameIndex 
     }
   }, [chatCellFrames]);
 
+  // When chatbot calls trajectory_preview and it hits cache, push the result to Layer 2.
+  // trajPreview comes via the traj_preview SSE field (separate from ml_prediction) so
+  // mlPrediction (Layer 1 MLP) is never overwritten and confidence_map stays valid.
+  useEffect(() => {
+    if (!trajPreview) return;
+    const result = { ...trajPreview } as unknown as TrajResult;
+    // Compute confidence_map client-side when in HNN mode and MLP prediction is available
+    if (trajEngine === 'hnn_hinge4' && mlPrediction) {
+      const N_MM = result.mm_grid.length;
+      const N_AM = result.am_grid.length;
+      result.confidence_map = Array.from({ length: N_MM }, (_, mi) =>
+        Array.from({ length: N_AM }, (_, ai) => {
+          const mlBoth = mlPrediction.mapBoth[mi]?.[ai] ?? false;
+          if (!mlBoth) return null;
+          return (result.map_both[mi]?.[ai] ?? false) ? 'HIGH' as const : 'LOW' as const;
+        })
+      );
+    }
+    setTrajResult(result);
+    // Switch to trajectory tab so the user sees the pushed result
+    setPredLayer('trajectory');
+  }, [trajPreview]);
+
   // ── Section 3: Model Performance ──────────────────────────────────────────
   const [perfLayer, setPerfLayer] = useState<'mlp' | 'hnn'>('mlp');
   const [history,   setHistory]   = useState<TrainingHistory | null>(null);
@@ -240,7 +264,7 @@ export function MlMapOverlay({ onClose, containerRef, onApplyAndRun, frameIndex 
     try {
       const url = layer === 'hnn'
         ? `${AGENT_URL}/ml/train/history?model_type=hnn`
-        : `${AGENT_URL}/ml/train/history`;
+        : `${AGENT_URL}/ml/train/history?model_type=mlp`;
       const r    = await fetch(url);
       const data = await r.json();
       if (data.ok === false) {
@@ -701,7 +725,7 @@ export function MlMapOverlay({ onClose, containerRef, onApplyAndRun, frameIndex 
   // ── Derived heatmap data ───────────────────────────────────────────────────
   const heatmapZ = mlPrediction
     ? mlPrediction.amGrid.map((_, j) =>
-        mlPrediction.mmGrid.map((_, i) => (mlPrediction.mapBoth[i][j] ? 1 : 0))
+        mlPrediction.mmGrid.map((_, i) => (mlPrediction.mapBoth[i]?.[j] ? 1 : 0))
       )
     : null;
 

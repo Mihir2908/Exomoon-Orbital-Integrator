@@ -1,7 +1,7 @@
 'use client';
 import { useCallback, useRef } from 'react';
 import { useSimulationStore } from './useSimulationStore';
-import type { MlPrediction } from '@/lib/types';
+import type { MlPrediction, TrajPreview } from '@/lib/types';
 
 // Chat stream is long-running (Claude tool loops + extended thinking can take 60-180s).
 // Use the direct agent URL to bypass the Next.js rewrite proxy's ~30s timeout.
@@ -15,7 +15,7 @@ export function useChatStream() {
     params, simYears, simdataB64, dmCgs,
     mlPrediction,
     addChatMessage, appendToLastAssistant, finalizeChatMessage,
-    setSimdataB64, setMlPrediction, updateJobStatus, setJob, setParams,
+    setSimdataB64, setMlPrediction, setTrajPreview, updateJobStatus, setJob, setParams,
     setPreviewCellFrames, setChatCellFrames,
   } = useSimulationStore();
 
@@ -107,6 +107,19 @@ export function useChatStream() {
               cell_frames?: import('@/lib/types').TrajectoryFrame[] | null;
               cell_rhill_au?: number | null;
               cell_roche_frac?: number | null;
+              traj_preview?: {
+                ok: boolean;
+                map_stable: boolean[][];
+                map_habitable: boolean[][];
+                map_both: boolean[][];
+                mm_grid: number[];
+                am_grid: number[];
+                wall_s?: number;
+                from_cache?: boolean;
+                cache_key?: string;
+                valid_mm_range?: [number, number] | null;
+                valid_am_per_mm?: ([number, number] | null)[];
+              } | null;
             };
 
             if (payload.type === 'token' && payload.token) {
@@ -122,7 +135,13 @@ export function useChatStream() {
               if (payload.simdata) setSimdataB64(payload.simdata);
               // Sync sliders with whatever params the agent actually ran the simulation with
               if (payload.effective_params) setParams(payload.effective_params);
-              // If the agent ran ml_predict or trajectory_preview (cached), update the heatmap
+              // Layer 2 trajectory preview — pushed as traj_preview (separate from ml_prediction).
+              // Storing separately keeps mlPrediction (MLP Layer 1) clean so MlMapOverlay's
+              // confidence_map computation remains valid (MLP vs trajectory comparison).
+              if (payload.traj_preview) {
+                setTrajPreview(payload.traj_preview as TrajPreview);
+              }
+              // Layer 1 MLP prediction — only from ml_predict tool calls
               if (payload.ml_prediction) {
                 const p = payload.ml_prediction;
                 const mlPred: MlPrediction = {
@@ -156,7 +175,7 @@ export function useChatStream() {
       if (err instanceof Error && err.name === 'AbortError') return;
       finalizeChatMessage(assistantId, 'Connection error. Is the agent service running?');
     }
-  }, [params, simYears, simdataB64, dmCgs, mlPrediction, addChatMessage, appendToLastAssistant, finalizeChatMessage, setSimdataB64, setMlPrediction, updateJobStatus, setJob, setParams, setPreviewCellFrames, setChatCellFrames]);
+  }, [params, simYears, simdataB64, dmCgs, mlPrediction, addChatMessage, appendToLastAssistant, finalizeChatMessage, setSimdataB64, setMlPrediction, setTrajPreview, updateJobStatus, setJob, setParams, setPreviewCellFrames, setChatCellFrames]);
 
   const abort = useCallback(() => abortRef.current?.abort(), []);
 

@@ -181,6 +181,9 @@ export function MlMapOverlay({ onClose, containerRef, onApplyAndRun, frameIndex 
   const [sec2Open, setSec2Open] = useState(true);    // Prediction (open by default)
   const [sec3Open, setSec3Open] = useState(false);   // Model Performance
 
+  // ── HNN disclaimer modal ───────────────────────────────────────────────────
+  const [hnnDisclaimerOpen, setHnnDisclaimerOpen] = useState(false);
+
   // ── Section 1: Model Training layer tab ───────────────────────────────────
   const [trainLayer, setTrainLayer] = useState<'mlp' | 'hnn'>('mlp');
 
@@ -1025,27 +1028,116 @@ export function MlMapOverlay({ onClose, containerRef, onApplyAndRun, frameIndex 
                     {/* Engine selector */}
                     <div className="space-y-1.5">
                       <span className="text-gray-500 text-[10px] uppercase tracking-wide">Physics engine</span>
-                      {([
-                        { key: 'gt_leapfrog' as const, label: 'Ground Truth Physics Integrator', note: '~2.3s' },
-                        { key: 'hnn_hinge4'  as const, label: 'HNN Physics ML Model',            note: '~470s + cached' },
-                      ]).map(({ key, label, note }) => (
+                      {/* GT option */}
+                      <button
+                        onClick={() => setTrajEngine('gt_leapfrog')}
+                        disabled={trajLoading}
+                        className={cn(
+                          'w-full flex items-center justify-between px-2.5 py-1.5 rounded text-[11px] border transition-colors text-left',
+                          trajEngine === 'gt_leapfrog'
+                            ? 'border-violet-600/60 bg-violet-900/20 text-violet-300'
+                            : 'border-gray-700/60 bg-gray-800/40 text-gray-400 hover:border-gray-600',
+                          trajLoading && 'opacity-50 cursor-not-allowed',
+                        )}
+                      >
+                        <span>Ground Truth Physics Integrator</span>
+                        <span className="text-gray-500 font-mono text-[10px] shrink-0 ml-2">~2.3s</span>
+                      </button>
+                      {/* HNN option — Beta badge + info button */}
+                      <div className="flex items-center gap-1.5">
                         <button
-                          key={key}
-                          onClick={() => setTrajEngine(key)}
+                          onClick={() => setTrajEngine('hnn_hinge4')}
                           disabled={trajLoading}
                           className={cn(
-                            'w-full flex items-center justify-between px-2.5 py-1.5 rounded text-[11px] border transition-colors text-left',
-                            trajEngine === key
+                            'flex-1 flex items-center justify-between px-2.5 py-1.5 rounded text-[11px] border transition-colors text-left',
+                            trajEngine === 'hnn_hinge4'
                               ? 'border-violet-600/60 bg-violet-900/20 text-violet-300'
                               : 'border-gray-700/60 bg-gray-800/40 text-gray-400 hover:border-gray-600',
                             trajLoading && 'opacity-50 cursor-not-allowed',
                           )}
                         >
-                          <span>{label}</span>
-                          <span className="text-gray-500 font-mono text-[10px] shrink-0 ml-2">{note}</span>
+                          <span className="flex items-center gap-1.5">
+                            HNN Physics ML Model
+                            <span className="px-1 py-0.5 rounded text-[9px] font-semibold bg-amber-500/20 text-amber-400 border border-amber-500/30 leading-none">
+                              Beta
+                            </span>
+                          </span>
+                          <span className="text-gray-500 font-mono text-[10px] shrink-0 ml-2">~470s + cached</span>
                         </button>
-                      ))}
+                        <button
+                          onClick={e => { e.stopPropagation(); setHnnDisclaimerOpen(true); }}
+                          title="About the HNN model"
+                          className="shrink-0 w-5 h-5 flex items-center justify-center rounded-full text-gray-500 hover:text-violet-400 hover:bg-violet-900/20 transition-colors text-[11px] border border-gray-700/50"
+                        >
+                          ℹ
+                        </button>
+                      </div>
                     </div>
+
+                    {/* HNN disclaimer modal */}
+                    {hnnDisclaimerOpen && (
+                      <div
+                        className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm"
+                        onClick={() => setHnnDisclaimerOpen(false)}
+                      >
+                        <div
+                          className="relative w-full max-w-lg mx-4 bg-gray-900 border border-gray-700 rounded-xl shadow-2xl p-5 space-y-3 text-[12px] text-gray-300 leading-relaxed"
+                          onClick={e => e.stopPropagation()}
+                        >
+                          <div className="flex items-start justify-between gap-3">
+                            <div className="flex items-center gap-2">
+                              <h3 className="text-sm font-semibold text-white">HNN Physics ML Model</h3>
+                              <span className="px-1.5 py-0.5 rounded text-[9px] font-semibold bg-amber-500/20 text-amber-400 border border-amber-500/30">Beta</span>
+                            </div>
+                            <button onClick={() => setHnnDisclaimerOpen(false)} className="text-gray-500 hover:text-white text-base leading-none mt-0.5">✕</button>
+                          </div>
+
+                          <p>
+                            The HNN (Hamiltonian Neural Network) trajectory preview is an experimental implementation
+                            designed to demonstrate the capability of physics-informed machine learning to approximate
+                            three-body orbital dynamics. Rather than solving the equations of motion directly, the HNN
+                            learns to predict system state step-by-step from training data, attempting to preserve
+                            physical conservation laws (energy, angular momentum) at each step.
+                          </p>
+
+                          <p>
+                            <span className="text-amber-400 font-medium">Why its maps differ from Ground Truth:</span>{' '}
+                            Small prediction errors accumulate across thousands of autoregressive steps, causing the
+                            HNN&apos;s stability and habitability maps to diverge from exact physics — particularly
+                            near stability boundaries and at longer simulation durations. Its output reflects the
+                            model&apos;s learned approximation of orbital behaviour, not a direct solution of the
+                            governing equations.
+                          </p>
+
+                          <p>
+                            <span className="text-violet-400 font-medium">Why confidence labels only apply here:</span>{' '}
+                            The Ground Truth integrator is the reference standard — its results need no external
+                            validation. HNN results are cross-checked against the Layer 1 MLP classifier:
+                            HIGH confidence means both agree a cell is stable+habitable; LOW confidence means
+                            the MLP predicts it should be, but the HNN trajectory disagrees — flagging where
+                            the approximation may be unreliable.
+                          </p>
+
+                          <p>
+                            <span className="text-cyan-400 font-medium">Why the MLP outperforms HNN for classification:</span>{' '}
+                            The MLP was trained with direct supervision on per-simulation outcomes — each training
+                            example is a complete simulation with a final stable/habitable verdict. This is a
+                            focused, data-efficient task. The HNN was trained to reproduce full trajectory
+                            evolution at every timestep — a harder problem where per-step errors compound. A
+                            model that perfectly predicts trajectories would also be a perfect classifier, but
+                            the MLP achieves strong classification accuracy without needing to reconstruct the
+                            intermediate dynamics at all.
+                          </p>
+
+                          <div className="pt-1 border-t border-gray-800 text-gray-500 text-[11px]">
+                            For accurate stability and habitability maps, use the{' '}
+                            <span className="text-gray-300 font-medium">Ground Truth Physics Integrator</span>.
+                            The HNN is best understood as a live illustration of where physics-based ML currently
+                            stands in approximating complex gravitational systems.
+                          </div>
+                        </div>
+                      </div>
+                    )}
 
                     {/* Run trajectory batch */}
                     <button

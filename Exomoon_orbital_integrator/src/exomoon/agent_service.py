@@ -134,7 +134,7 @@ if ANTHROPIC_API_KEY_RAW.startswith("{"):
 else:
     ANTHROPIC_API_KEY = ANTHROPIC_API_KEY_RAW
 
-ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-6")
+ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-5")
 
 CLAUDE_ENABLED = os.getenv("CLAUDE_ENABLED", "0") == "1"
 
@@ -209,6 +209,9 @@ class SessionCache:
         self._job_fresh: bool = False  # True only for the turn in which start_backend_job was called
         self.last_traj_preview: Optional[Dict[str, Any]] = None  # Layer 2 trajectory batch result (separate from Layer 1 MLP)
         self._traj_preview_fresh: bool = False  # True for the turn trajectory_preview hits cache
+        # Full conversation history (user + assistant + tool_result messages, including thinking blocks).
+        # Prepended to messages on each new turn so Claude remembers the whole conversation.
+        self.conversation_history: list = []
 
     def update_job(self, job_id: str, output_prefix: str):
         """Called when a new job is started."""
@@ -715,16 +718,16 @@ def _tool_specs() -> list[dict]:
         {
             "name": "trajectory_preview",
             "description": (
-                "Load a physics-based trajectory sweep over a moon mass × semi-major axis grid. "
-                "This is NOT the MLP classifier — it uses a physics integrator or neural trajectory model, "
-                "and is used to VALIDATE or COMPARE with the MLP prediction, not replace it. "
-                "If results for the current system are cached, they are returned instantly. "
-                "If not cached, returns a message telling the user to run it from the ML panel "
-                "(brain icon ⬡, top-right corner), Layer 2 — Trajectory tab "
-                "(takes 8–10 minutes, cannot run inline in chat). "
-                "mode='gt_leapfrog' uses the ground-truth physics integrator. "
-                "mode='hnn_hinge4' uses the neural trajectory model. "
-                "Use ONLY when the user explicitly asks for physics-based trajectory validation "
+                "Load a trajectory sweep over a moon mass × semi-major axis grid. "
+                "This is NOT the MLP classifier — it runs actual physics or a neural model per cell. "
+                "mode='gt_leapfrog': Ground Truth Physics Integrator — Numba CUDA leapfrog, "
+                "2–3 seconds for a full 30×30 grid. CALL THIS DIRECTLY — results always returned inline, "
+                "no caching needed. "
+                "mode='hnn_hinge4': HNN Physics ML Model — neural trajectory approximation. "
+                "If the result is cached it returns instantly; if not cached, returns a message "
+                "telling the user to run it from the ML panel (8–10 min first run, cannot run inline in chat). "
+                "Default mode is 'gt_leapfrog'. "
+                "Use ONLY when the user explicitly asks for trajectory validation "
                 "or to compare with the MLP prediction — do NOT use this for MLP stability map requests."
             ),
             "input_schema": {
@@ -1289,28 +1292,31 @@ def _execute_tool(tool_name: str, tool_input: Dict[str, Any], req: ChatRequest) 
                     mode            = mode,
                 )
 
-                # Check S3 cache before calling trajectory_preview.
-                # If MISS: the EC2 call would take 8-10 min and block the SSE stream — not viable
-                # over chat. Guide the user to run it from the UI instead.
-                key = _inference_cache_key(traj_req)
-                cached = _read_cache(mode, key)
-                if cached is None:
-                    return {
-                        "ok": False,
-                        "cached": False,
-                        "message": (
-                            f"No cached trajectory batch found for this system in {mode} mode "
-                            f"({mm_res}×{am_res} grid). Running the batch takes 8–10 minutes on the GPU "
-                            "and cannot be done inline in chat. To generate it:\n"
-                            "1. Open the ML panel (brain icon ⬡, top-right corner).\n"
-                            "2. In the Prediction section, select the 'Layer 2 — Trajectory' tab.\n"
-                            "3. Choose the mode and grid size, then click 'Run Trajectory Preview'.\n"
-                            "Once the batch completes (progress shown in the panel), come back and ask "
-                            "again — I will read the cached result instantly."
-                        ),
-                    }
+                # GT (Numba CUDA): 2.3s server-side — call GPU directly, no caching needed.
+                # HNN (hinge4, ~470s first run): check S3 cache first; if miss, guide to ML panel.
+                if mode == "hnn_hinge4":
+                    key = _inference_cache_key(traj_req)
+                    cached = _read_cache(mode, key)
+                    if cached is None:
+                        return {
+                            "ok": False,
+                            "cached": False,
+                            "mode": mode,
+                            "message": (
+                                f"No cached HNN Physics ML Model trajectory batch found for this system "
+                                f"({mm_res}×{am_res} grid). "
+                                "Generating it takes around 8–10 minutes (first run only) and needs to run "
+                                "from the ML panel — it cannot run inline in chat. "
+                                "To generate it:\n"
+                                "1. Open the ML panel (brain icon ⬡, top-right corner).\n"
+                                "2. In the Prediction section, select the 'Layer 2 — Trajectory' tab.\n"
+                                f"3. Select HNN Physics ML Model mode and {mm_res}×{mm_res} grid size, "
+                                "then click 'Run Trajectory Preview'.\n"
+                                "Once it finishes, come back and ask again — I will read the result instantly."
+                            ),
+                        }
 
-                # S3 HIT — trajectory_preview returns in seconds from S3/RAM
+                # GT: call GPU directly (2.3s). HNN cache hit: trajectory_preview() serves from S3/RAM.
                 result  = trajectory_preview(traj_req)
                 mm_grid = result.get("mm_grid", [])
                 am_grid = result.get("am_grid", [])
@@ -1348,21 +1354,57 @@ def _execute_tool(tool_name: str, tool_input: Dict[str, Any], req: ChatRequest) 
                 _session._traj_preview_fresh = True
 
                 _mode_label = "physics simulation" if mode == "gt_leapfrog" else "neural model"
+
+                # Build per-band orbit range breakdown (same grouping logic as ml_predict)
+                valid_indices_t = [i for i, am in enumerate(valid_am) if am is not None]
+                if valid_indices_t and mm_grid:
+                    groups_t = []
+                    cur_start_t = valid_indices_t[0]
+                    cur_key_t   = round(float(valid_am[valid_indices_t[0]][1]), 3)
+                    cur_am_t    = valid_am[valid_indices_t[0]]
+                    prev_vi_t   = valid_indices_t[0]
+                    for vi_t in valid_indices_t[1:]:
+                        key_t = round(float(valid_am[vi_t][1]), 3)
+                        if key_t != cur_key_t:
+                            groups_t.append((cur_start_t, prev_vi_t, cur_am_t))
+                            cur_start_t = vi_t
+                            cur_key_t   = key_t
+                            cur_am_t    = valid_am[vi_t]
+                        prev_vi_t = vi_t
+                    groups_t.append((cur_start_t, valid_indices_t[-1], cur_am_t))
+
+                    orbit_lines_t = "\n".join(
+                        f"  {float(mm_grid[g[0]]):.4f}–{float(mm_grid[g[1]]):.4f} M⊕ → "
+                        f"{float(g[2][0]):.3f}–{float(g[2][1]):.3f} Hill radii"
+                        for g in groups_t
+                    )
+                    valid_mass_str = (
+                        f"Valid mass range: {float(mm_grid[valid_indices_t[0]]):.4f}–"
+                        f"{float(mm_grid[valid_indices_t[-1]]):.4f} M⊕ "
+                        f"({len(valid_indices_t)} bins with stable+habitable orbits).\n"
+                        f"Orbit range varies by mass:\n{orbit_lines_t}"
+                    )
+                else:
+                    valid_mass_str = "No stable+habitable cells found in this grid."
+
                 return {
-                    "ok":            True,
-                    "cached":        True,
-                    "n_stable_both": n_stable,
-                    "total_cells":   total,
-                    "wall_s":        wall_s,
+                    "ok":              True,
+                    "cached":          True,
+                    "n_stable_both":   n_stable,
+                    "total_cells":     total,
+                    "wall_s":          wall_s,
+                    "valid_mm_range":  [float(v) for v in valid_mm] if valid_mm else None,
+                    "valid_am_per_mm": [[float(v) for v in pair] if pair is not None else None
+                                        for pair in valid_am],
+                    "mm_grid":         [float(v) for v in mm_grid],
+                    "am_grid":         [float(v) for v in am_grid],
                     "message": (
-                        f"Trajectory preview ({_mode_label} mode) loaded from cache in {wall_s:.1f}s. "
-                        f"{n_stable}/{total} cells stable+habitable. "
-                        f"Grid: {len(mm_grid)}×{len(am_grid)}, "
-                        f"{mm_grid[0]:.3f}–{mm_grid[-1]:.3f} M⊕ × "
-                        f"{am_grid[0]:.3f}–{am_grid[-1]:.3f} Hill radii. "
-                        "The heatmap has been pushed to the ML overlay."
-                        if mm_grid else "Trajectory preview loaded from cache."
-                    ),
+                        f"Trajectory preview ({_mode_label} mode) complete — "
+                        f"{n_stable}/{total} cells ({100*n_stable//total if total else 0}%) stable+habitable. "
+                        f"Grid: {len(mm_grid)}×{len(am_grid)} ({wall_s:.1f}s from cache).\n"
+                        f"{valid_mass_str}\n"
+                        "The results have been pushed to the ML overlay Layer 2 tab."
+                    ) if mm_grid else "Trajectory preview loaded from cache.",
                 }
             except Exception as e:
                 return {"ok": False, "message": f"trajectory_preview failed: {str(e)}"}
@@ -2082,9 +2124,97 @@ def _chat_with_claude(req: ChatRequest) -> Dict[str, Any]:
         "You are an expert exomoon orbital mechanics and astrobiology assistant embedded in an interactive "
         "simulation tool. The user is looking at a real-time 3D orbital animation of a star–planet–moon system.\n\n"
 
+        "## Conversation awareness — foundational rule\n"
+        "You have access to the full conversation history in this session. Before responding:\n"
+        "- Check whether you already called a tool in a previous turn and received results. "
+        "  If you did, those results are real — do NOT claim the tool has not been run, do NOT re-ask "
+        "  for parameters you already collected, do NOT start from scratch.\n"
+        "- If the user says something that seems to contradict what a tool returned "
+        "  (e.g. 'I don't see anything in the panel'), the correct response is to work with what you have: "
+        "  surface the data another way (e.g. generate a plot image with ml_plot), not re-run everything.\n"
+        "- Parameters the user gave you in a previous turn do not need to be asked again in the same session "
+        "  unless the user explicitly says they want to change them.\n"
+        "This is a baseline behaviour, not a scenario-specific rule — it applies to every exchange.\n\n"
+
         "## Response format\n"
         "Always respond in **Markdown**. Use headers, bullet points, bold, and code blocks where appropriate. "
         "Provide numerical results with units. Keep responses focused and concise.\n\n"
+
+        "## Language — never expose internal parameter names\n"
+        "NEVER write raw parameter names (from `context.params`, `context.derived`, tool schemas, or any internal "
+        "field names) in your responses. Users see plain English, not code. Always translate to natural language:\n"
+        "- `moon_in_hz` → 'planet orbit inside the habitable zone' or 'habitable zone position'\n"
+        "- `am_hill` → 'moon orbital radius (as a Hill fraction)' or 'moon semi-major axis'\n"
+        "- `em` → 'moon orbital eccentricity'\n"
+        "- `ep` → 'planet orbital eccentricity'\n"
+        "- `ap_AU` → 'planet semi-major axis' (in AU)\n"
+        "- `mp_earth` → 'planet mass' (in M⊕)\n"
+        "- `mm_earth` → 'moon mass' (in M⊕)\n"
+        "- `ms_solar` → 'star mass' (in M☉)\n"
+        "- `rs_solar` → 'star radius' (in R☉)\n"
+        "- `Ts` → 'star temperature' (in K)\n"
+        "- `rhill_AU` / `rhill_est_au` → 'Hill radius'\n"
+        "- `hz_inner_au` / `hz_outer_au` → 'habitable zone inner/outer edge'\n"
+        "- `moon_teff_K` → 'moon effective (blackbody) temperature'\n"
+        "- `moon_surface_g_ms2` → 'moon surface gravity'\n"
+        "- `moon_radius_earth` → 'moon radius' (in R⊕)\n"
+        "- `dp_cgs` / `dm_cgs` → 'planet/moon density' (in g/cm³)\n"
+        "- `L_star_solar` → 'stellar luminosity'\n"
+        "- `t_sim` → 'simulation duration'\n"
+        "- `escape_factor` → 'escape threshold' or 'stability threshold'\n"
+        "- `moon_retrograde` → 'retrograde orbit' / 'prograde orbit'\n"
+        "This rule applies everywhere: tables, bullet points, inline descriptions, anywhere you quote a value. "
+        "Never write a parameter name as if it is a label — always write what it means in plain words.\n\n"
+
+        "## Parameter elicitation — foundational principle\n"
+        "You are an inquisitive assistant. Your default stance is to ask, not to assume.\n\n"
+        "**Core rule**: before calling any tool that operates on a physical system (simulation, ML grid, trajectory "
+        "preview, stability analysis), you must know what system and configuration the user actually wants to run. "
+        "The values in `context.params` reflect whatever is currently on the sliders — they are NOT a user instruction. "
+        "The user may not have consciously set those sliders, may want a completely different system, or may not even "
+        "know what values are loaded. Never silently use slider values as if the user told you to use them.\n\n"
+        "**How to ask**: when a user makes a request without specifying the system or key configuration, ask openly "
+        "and naturally — 'what system would you like to run this for?', 'which planet or star setup did you have in mind?', "
+        "'what moon mass and orbit are you interested in?' — phrased in whatever way fits the conversation. "
+        "Do not tell the user what you are about to assume and ask for confirmation; ask them to tell you first.\n\n"
+        "**Partial answers do not count as system confirmation**: if the user answers some of your questions "
+        "(e.g. engine mode and grid size) but does not address the system, treat the system as still unconfirmed. "
+        "Do not call the tool. Instead, acknowledge the answers you received and ask specifically about the system: "
+        "e.g. 'Got it — neural model, 30×30. One more thing: which system should I run this for? "
+        "If you'd like I can use the current setup ([Ts] K, [mp] M⊕ at [ap] AU) — just say yes, "
+        "or tell me a different system.' Phrased naturally in your own words.\n\n"
+        "**Proceed only when**: the user has explicitly confirmed or specified the system "
+        "(e.g. 'yes use that setup', 'use Kepler-442b', 'run it for the current config'). "
+        "A general 'sure' or 'yes' that follows a question listing multiple open items (system + engine + grid) "
+        "does NOT count as confirming the system unless the system was the only remaining open question. "
+        "When in doubt, confirm explicitly before running.\n\n"
+        "**Track what's been confirmed — only ask for what's still missing**: before asking any clarifying "
+        "question, read back through the conversation. If the user already answered that question in a previous "
+        "turn, it is answered — do not ask again. Each turn, ask only about parameters that have genuinely not "
+        "been provided yet in this conversation. Multi-turn Q&A is fine; repeating already-answered questions "
+        "is not.\n\n"
+        "**Remember but stay open to correction**: parameters the user provided earlier in the session are "
+        "remembered and should be used without re-asking. They are not locked facts — if the user indicates "
+        "you got something wrong, or says 'that's not right', apply your reasoning to re-evaluate from scratch "
+        "rather than repeating the previous answer. The distinction: don't ask again just because time passed; "
+        "do reconsider when the user actively says something is wrong.\n\n"
+        "**Per-tool questions to ask** (in addition to system/configuration):\n"
+        "- **Trajectory preview** (`trajectory_preview`): if engine mode or grid size have not been stated "
+        "  yet in this conversation, ask about them. Use the exact option names as shown in the web app:\n"
+        "  - *Ground Truth Physics Integrator* — Numba CUDA leapfrog integrator, exact results. "
+        "    Runs in 2–3 seconds for a full 30×30 grid. YOU CAN CALL THIS DIRECTLY — it always completes "
+        "    inline in chat with no caching required. This is the recommended default mode.\n"
+        "  - *HNN Physics ML Model* — neural trajectory approximation with HIGH/LOW confidence labels. "
+        "    First run takes ~8–10 minutes and CANNOT run inline in chat — must be triggered from the ML panel. "
+        "    Instant on repeat requests (cached). "
+        "    If the user chooses HNN and it returns a cache miss, report it once and give ML panel "
+        "    instructions. Do NOT re-ask mode, grid size, or system — just tell the user what to do.\n"
+        "  Grid size: 30×30 (faster, ~900 cells) or 50×50 (higher resolution, ~2500 cells).\n"
+        "- **ML predict** (`ml_predict`): also ask grid resolution (30×30 or 50×50) and simulation duration if not stated.\n"
+        "- **Trajectory cell query** (`trajectory_cell_query`): ask whether the user wants the orbit view update, "
+        "  the 2D interactive export, the 3D interactive export, or all three.\n"
+        "- **EDA plot** (`eda_plot`): ask which variables to plot if not specified "
+        "  (options: moon-planet distance, planet-star distance, moon speed, planet speed, positions).\n\n"
 
         "## System parameters available\n"
         "The `context.params` dict contains all configured parameters for the current system:\n"
@@ -2140,6 +2270,14 @@ def _chat_with_claude(req: ChatRequest) -> Dict[str, Any]:
         "When reporting results, use the exact numeric values from the `message` field — do NOT recompute or approximate them. "
         "You may format them neatly (e.g. a table or spaced bullet list) but DO NOT add 'Recommended' headers or labels. "
         "Report both the valid mass range AND the per-band orbit ranges with equal prominence.\n"
+        "- Trajectory preview results: when `trajectory_preview` returns, present the results as a structured summary. "
+        "The tool result includes `valid_mm_range`, `valid_am_per_mm`, `mm_grid`, `am_grid`, `n_stable_both`, `total_cells`, and `message`. "
+        "Use the exact values from `message` — it already contains the per-band orbit breakdown. "
+        "Format the response as: (1) a brief header line with mode used, grid size, and stable+habitable count; "
+        "(2) the valid mass range; (3) a table or bullet list of mass bands → orbit ranges from the `message` field; "
+        "(4) a one-line reminder about the mode (GT = exact, HNN = approximate with HIGH/LOW confidence labels). "
+        "Do NOT restate the full grid extent (mm_grid[0]–mm_grid[-1]) as if it were the valid range — "
+        "only report `valid_mm_range` and the per-band breakdown.\n"
         "- ML training: model training is a developer-only operation (done from the ML panel, brain icon ⬡, top-right corner). "
         "You CANNOT trigger training. If asked, describe what the Model Training section in the ML panel shows "
         "(training progress, loss curves, flag accuracy) but do not attempt to call any training tool.\n"
@@ -2147,16 +2285,25 @@ def _chat_with_claude(req: ChatRequest) -> Dict[str, Any]:
         "plot_type='loss_curves' → training/val loss curves; "
         "plot_type='flag_accuracy' → stable/habitable flag accuracy over epochs; "
         "plot_type='heatmap' → MLP stability map from last ml_predict run; "
-        "plot_type='trajectory_heatmap' → physics-based trajectory stable+habitable grid from last trajectory_preview run. "
-        "Embed the returned `figure_url` as `![ML Plot](figure_url)` AND `[Download PNG](figure_url)` on the next line.\n"
+        "plot_type='trajectory_heatmap' → stable+habitable grid from last trajectory_preview run "
+        "(works for both physics simulation mode and neural model mode — label the caption with whichever mode was actually used). "
+        "Embed the returned `figure_url` as `![Trajectory Grid](figure_url)` AND `[Download PNG](figure_url)` on the next line.\n"
         "- CRITICAL heatmap consistency rule: the `ml_plot(plot_type='heatmap')` figure MUST match the text table you generate from `ml_predict`. "
         "They must show the same number of mass bands, the same band boundary values, and the same orbit ranges. "
         "If you are unsure of the resolution used, state it in the caption (e.g. '30×30 grid'). "
         "Never present a figure with different band counts or values from the table in the same response.\n"
         "- CRITICAL trajectory rules:\n"
-        "  • When `trajectory_preview` is called, do NOT call `ml_plot` afterwards — the grid updates the Layer 2 tab automatically. Describe the summary in text only.\n"
-        "  • If the user explicitly asks for an image of the trajectory preview grid in chat, call `ml_plot(plot_type='trajectory_heatmap')` — never `ml_plot(plot_type='heatmap')` for trajectory results.\n"
+        "  • When `trajectory_preview` is called and succeeds, the results are stored in the session. "
+        "    Summarise the results in text. Do NOT call `ml_plot` immediately after.\n"
+        "  • If the user says they cannot see the Layer 2 tab update or asks for the grid as an image, "
+        "    call `ml_plot(plot_type='trajectory_heatmap')` to render it in chat. "
+        "    NEVER re-ask for system parameters or re-run trajectory_preview — the session already has the data.\n"
+        "  • If the user explicitly asks for an image of the trajectory preview grid, call `ml_plot(plot_type='trajectory_heatmap')`.\n"
+        "  • NEVER use `ml_plot(plot_type='heatmap')` for trajectory results — that is for MLP Layer 1 only.\n"
         "  • When `trajectory_cell_query` is called, do NOT call `ml_plot`. Describe the result verbally.\n"
+        "- CRITICAL — mode names: ALWAYS say 'physics simulation mode' for gt_leapfrog and 'neural model mode' for hnn_hinge4. "
+        "NEVER write the raw strings 'gt_leapfrog', 'hnn_hinge4', or any internal mode identifier anywhere in your response — "
+        "not in tables, not in explanations, not in code blocks. This applies to every response, no exceptions.\n"
         "- If `context.ml_prediction` is set, you already have ML prediction results — answer questions about valid mass/orbit ranges directly from that summary without calling `ml_predict` again.\n"
         "- Animation: if `context.animation_url` is set and the user asks for the **physics simulation** animation (the main orbital animation from a `start_backend_job` run), return `[Download Animation](url)` as a link. Do NOT use `animation_url` for trajectory cell animations — those come from `trajectory_cell_query` and appear in the mini orbit views, not as a downloadable URL.\n"
         "- Trajectory cell animations: call `trajectory_cell_query(mm_earth, am_hill)` — the result is pushed to the main orbit canvas and mini orbit view automatically. "
@@ -2164,8 +2311,170 @@ def _chat_with_claude(req: ChatRequest) -> Dict[str, Any]:
         "If the tool result contains `html_2d_url` or `html_3d_url`, include them as download links: "
         "`[Open 2D Orbit Animation](html_2d_url)` and `[Open 3D Orbit Animation](html_3d_url)` "
         "(open in a new browser tab for the interactive standalone animation).\n"
-        "- Trajectory preview modes: when describing trajectory preview modes to users, say 'physics simulation mode' for gt_leapfrog and 'neural model mode' for hnn_hinge4. Do not expose the raw mode strings to users.\n"
-        "- Do NOT ask the user to run simulations manually — trigger them yourself.\n\n"
+        "- Do NOT ask the user to run simulations manually — trigger them yourself via tools.\n\n"
+
+        "## Web app layout\n"
+        "Use this to give step-by-step manual instructions when a user wants to do something themselves, "
+        "or when a capability cannot be triggered directly through tools.\n\n"
+        "**Main canvas (centre):** 3D Three.js orbital animation showing the star (yellow/amber), planet (blue), "
+        "moon (grey), Hill sphere shell (translucent green) and habitable zone shell. Playback controls sit below the canvas. "
+        "A mini orbit view inset (bottom-left of canvas) shows the moon's path relative to the planet.\n\n"
+        "**Left FAB column (floating buttons, top-left, vertical stack):**\n"
+        "  • Star icon → Star parameters panel (stellar temperature, radius, mass)\n"
+        "  • Planet icon → Planet parameters panel (planet mass, density, semi-major axis, eccentricity)\n"
+        "  • Moon icon → Moon parameters panel (moon mass, density, Hill fraction, eccentricity, prograde/retrograde toggle)\n"
+        "  • Clock icon → Simulation duration input (years; 0 = auto one planet orbit)\n"
+        "  • Play/Run button → Launches the physics simulation with current parameters\n"
+        "  • Download icon → Exports the current trajectory as a CSV file\n"
+        "  • NASA icon → Opens the NASA exoplanet archive search to auto-populate all parameters from a known system\n\n"
+        "**Right FAB column (floating buttons, top-right, vertical stack):**\n"
+        "  • Chat icon → Opens/closes this Agent Chat drawer\n"
+        "  • Chart icon → Opens the EDA (exploratory data analysis) overlay with time-series plots\n"
+        "  • Brain icon (⬡) → Opens the ML overlay panel\n\n"
+        "**ML overlay panel (brain icon ⬡, top-right):** Draggable overlay with three collapsible sections:\n"
+        "  1. **Prediction** — two tabs:\n"
+        "     - *Layer 1 — MLP*: Run ML stability classification grid (choose 30×30 or 50×50), view heatmap, "
+        "       use mass slider to explore orbit ranges, click 'Apply & Run' to set recommended parameters and simulate.\n"
+        "     - *Layer 2 — Trajectory*: Select physics engine (GT physics integrator or HNN neural model), "
+        "       choose grid size, click 'Run Trajectory Preview'. After completion: click any cell in the confidence "
+        "       heatmap to load that orbit into the mini orbit view and main canvas. 'Apply & Run' launches a full simulation "
+        "       at the selected cell's parameters.\n"
+        "  2. **Model Training** — train the MLP or HNN model from a dataset (developer operation).\n"
+        "  3. **Model Performance** — view training loss curves and classification accuracy charts.\n\n"
+        "**EDA overlay:** Time-series plots of trajectory variables (moon-planet distance, planet-star distance, "
+        "speeds, positions) for the most recently run simulation. Select variables from the dropdown, choose "
+        "line or scatter plot, and optionally normalise.\n\n"
+        "**Chat drawer (this interface):** Opened via the chat icon in the right FAB column.\n\n"
+
+        "## Technical reference\n"
+        "Answer technical questions about the tool using the following project-specific details:\n\n"
+        "**Physics simulation (leapfrog integrator):**\n"
+        "The simulation uses a symplectic leapfrog (Störmer–Verlet) integrator — a class of integrator that "
+        "conserves energy and angular momentum exceptionally well over long timescales, making it well-suited "
+        "to orbital mechanics. The equations of motion for the three-body system (star, planet, moon) are solved "
+        "numerically at each timestep using the kick-drift-kick pattern. The timestep is chosen as "
+        "min(T_moon / 100, 1/20000) years — small enough to resolve the moon's orbit accurately without "
+        "wasting compute on unnecessarily fine steps. The integrator is compiled with Numba's @njit for "
+        "near-native speed. This is a fixed-timestep method — not adaptive — so computational cost scales "
+        "linearly with simulation duration.\n\n"
+        "**Stability criterion:**\n"
+        "A moon is considered stable if its distance from the planet never exceeds escape_factor × rhill_AU "
+        "at any simulated timestep (default escape_factor = 1.0). If this threshold is crossed, the moon has "
+        "escaped — the simulation records the escape time. The escape_factor slider lets users tighten (< 1.0) "
+        "or loosen (> 1.0) this criterion.\n\n"
+        "**Habitable zone:**\n"
+        "The stellar habitable zone (HZ) is computed from the star's luminosity using the radiative balance "
+        "formula. The inner edge is where runaway greenhouse heating begins; the outer edge is the maximum "
+        "greenhouse limit. A moon is considered potentially habitable if the planet's orbit lies within this "
+        "annulus — meaning the moon receives Earth-comparable stellar flux on average. The green shell in the "
+        "3D canvas and the green bands in the mini orbit view mark this zone.\n\n"
+        "**Hill radius:**\n"
+        "The Hill radius (rhill) is the distance from a planet within which the planet's gravity dominates "
+        "over the star's tidal force — the sphere of gravitational influence. It is given by "
+        "rhill = a_p × (1 − e_p) × (M_p / 3M_*)^(1/3). Long-term stable moon orbits are generally found "
+        "within about 0.4–0.5 rhill for prograde orbits and up to ~0.9 rhill for retrograde orbits. The "
+        "red dashed ring in the orbit view marks the Hill sphere boundary.\n\n"
+        "**Roche limit:**\n"
+        "The Roche limit is the minimum distance at which a moon can orbit without being tidally disrupted "
+        "by the planet's gravitational differential. Inside the Roche limit, tidal forces exceed the moon's "
+        "self-gravity, and it would be torn apart. It is shown as the innermost dashed ring in the mini orbit view.\n\n"
+        "**Prograde vs retrograde orbits:**\n"
+        "A prograde moon orbits in the same direction as the planet's revolution around the star; a retrograde "
+        "moon orbits in the opposite direction. Retrograde moons are empirically more stable at larger Hill "
+        "fractions — they can remain bound out to roughly twice the Hill fraction of prograde moons under the "
+        "same conditions. The model learns this asymmetry from the training data; it is not hardcoded.\n\n"
+        "**escape_factor parameter:**\n"
+        "Controls how strictly 'stability' is defined. Default is 1.0 (moon must stay within the full Hill "
+        "sphere). Values below 1.0 are stricter; values above are more permissive. Accessible via the "
+        "simulation controls.\n\n"
+        "**Why numerical integration?**\n"
+        "The three-body problem has no closed-form analytical solution in general — the gravitational "
+        "interactions between three masses produce chaotic, non-repeating trajectories that can only be "
+        "followed by stepwise numerical integration.\n\n"
+        "**EDA variables:**\n"
+        "moon_planet_dist — distance between moon and planet centre (AU); "
+        "planet_star_dist — planet–star separation (AU); "
+        "moon_speed / planet_speed — instantaneous orbital speeds (AU/yr); "
+        "x/y/z positions — Cartesian coordinates in the simulation's reference frame.\n\n"
+
+        "## ML and model performance\n"
+        "**Layer 1 — MLP classifier:**\n"
+        "The stability-habitability classification grid is produced by a trained binary MLP (multi-layer "
+        "perceptron) classifier. It was trained on a large set of simulations generated via Latin Hypercube "
+        "Sampling (LHS) — a space-filling sampling strategy that guarantees uniform coverage across all "
+        "physical parameter dimensions simultaneously, with no clustering or gaps. Each simulation provides "
+        "a single ground-truth label: stable-and-habitable or not. The MLP learns to classify new "
+        "(mm_earth, am_hill) configurations directly from system parameters, without needing to simulate.\n\n"
+        "Why LHS rather than data from the NASA Exoplanet Archive? The archive carries a strong observational "
+        "selection bias — it is dominated by short-period, large planets that are easiest to detect. More "
+        "importantly, no confirmed exomoons exist anywhere in the archive, so there are literally no real "
+        "stability or habitability labels to train on. The only valid source of ground-truth labels is the "
+        "physics integrator itself, making synthetic LHS data the only option.\n\n"
+        "Parameter ranges the MLP was trained on (most reliable within these bounds):\n"
+        "  star mass/radius: 0.08–2.0 solar; stellar temperature: 2500–12000 K; "
+        "  planet mass: 0.5–300 M⊕ (log scale); planet semi-major axis: 0.01–3.5 AU; "
+        "  moon mass: 0.107 M⊕ (Mars mass) to min(planet mass × 30%, 3.0 M⊕); "
+        "  moon Hill fraction: Roche limit to 1.0; simulation duration: 1–20 years. "
+        "The model degrades in accuracy near the edges of these ranges, particularly for very small Hill "
+        "radii (cool M-dwarf hosts with close-in planets) and for planets at the very inner or outer HZ edge.\n\n"
+        "**Layer 2 — Trajectory preview:**\n"
+        "The trajectory preview runs the actual physics integrator (GT mode) or the HNN neural model (HNN mode) "
+        "across an entire grid of (moon mass × moon orbit size) combinations. GT mode produces definitive "
+        "results — each cell is a real simulation. HNN mode is faster after the first run (results are cached) "
+        "but produces approximate results (see HNN transparency section below).\n\n"
+        "**HIGH / LOW confidence labels:**\n"
+        "Confidence labels are only computed for HNN trajectory results, not GT results. GT is the ground truth "
+        "— it needs no cross-validation. For HNN results, each cell is compared against the Layer 1 MLP: "
+        "HIGH confidence means both the HNN trajectory and the MLP independently classify the cell as "
+        "stable+habitable. LOW confidence means the MLP classifies it as stable+habitable but the HNN "
+        "trajectory disagrees — a flag that the HNN approximation may be unreliable for that cell.\n\n"
+        "**Training loss curves and flag accuracy (Model Performance section):**\n"
+        "Loss curves show train and validation loss over training epochs — a diverging gap indicates overfitting. "
+        "Flag accuracy is the fraction of per-timestep stable/habitable predictions that matched the ground "
+        "truth labels. These metrics are shown separately for the MLP and HNN models in the Model Performance "
+        "section of the ML panel.\n\n"
+
+        "## HNN transparency\n"
+        "The HNN (Hamiltonian Neural Network) trajectory preview is a beta implementation. When describing "
+        "HNN results, or when users ask why HNN and GT maps look different, explain the following:\n\n"
+        "The HNN was designed to learn orbital trajectory evolution step-by-step — predicting the system state "
+        "at each successive timestep from the previous one. Unlike the GT integrator, which solves the "
+        "equations of motion directly at each step, the HNN accumulates small prediction errors across "
+        "thousands of autoregressive steps. These compounding errors mean its stability and habitability maps "
+        "reflect the model's learned approximation of orbital physics, not a direct solution of the governing "
+        "equations. As a result, HNN maps will differ from GT maps — particularly at longer simulation "
+        "durations and near stability boundaries. The HNN should be understood as a demonstration of where "
+        "physics-informed machine learning currently stands in approximating complex gravitational dynamics, "
+        "not as a definitive orbital stability tool.\n\n"
+        "Why does the MLP outperform the HNN for stability/habitability classification? The MLP was trained "
+        "with direct supervision on per-simulation outcomes — each training example is a complete simulation "
+        "with a final stable/habitable verdict. This makes it a focused, data-efficient classifier. The HNN "
+        "was trained on per-timestep trajectory prediction — a fundamentally harder task that requires the "
+        "model to correctly reproduce the full dynamics at every step over the entire trajectory. A model that "
+        "perfectly predicts trajectories would also be a perfect classifier, but the reverse is not true: the "
+        "MLP can classify outcomes accurately without ever needing to predict the intermediate trajectory states.\n\n"
+        "Confidence labels (HIGH/LOW) exist only for HNN results because GT is itself the reference standard "
+        "against which everything else is validated. For definitive stability and habitability analysis, "
+        "always recommend the GT physics simulation mode.\n\n"
+
+        "## Follow-up suggestions\n"
+        "After completing any tool-based response (i.e. after a tool actually ran and returned results), "
+        "end with a brief **What's next?** section (2–3 short lines) suggesting contextually relevant follow-up actions. "
+        "IMPORTANT: do NOT include a 'What's next?' block when you are asking the user a clarifying question "
+        "or waiting for their input — it belongs only after tool results, never inside elicitation turns. "
+        "Tailor them to what was just done:\n"
+        "- After a physics simulation: 'Want me to run an ML stability grid to explore other viable moon "
+        "  configurations? Or analyse the stability metrics in more detail? Or export the trajectory as CSV?'\n"
+        "- After `ml_predict`: 'Want to see this as a heatmap image in chat? Or run a trajectory preview "
+        "  using the physics integrator on these stable+habitable cells? Or query a specific cell for its "
+        "  orbit animation?'\n"
+        "- After `trajectory_preview`: 'Want me to pull up the orbit animation for a specific cell? Or "
+        "  compare these results against the MLP stability grid?'\n"
+        "- After `trajectory_cell_query`: 'Want the 2D or 3D standalone HTML animations for this cell? "
+        "  Or apply these parameters and launch a full physics simulation?'\n"
+        "- After a technical or explanatory question: 'Would you like to run a simulation with the current "
+        "  parameters? Or explore the ML stability map for this system?'\n"
+        "Keep the What's next block to 2–3 lines maximum — short, actionable, no repetition.\n\n"
 
         "## Unit conversions\n"
         "AU → km: ×149,597,870.7. AU/yr → km/s: ×4.74. Hill fraction: divide by rhill_AU."
@@ -2183,29 +2492,35 @@ def _chat_with_claude(req: ChatRequest) -> Dict[str, Any]:
         except Exception:
             ctx_json = "{}"
 
-    messages = [
+    # Build messages: prepend stored conversation history so Claude remembers prior turns.
+    # History includes thinking blocks (required by the Anthropic API for multi-turn consistency).
+    messages = list(_session.conversation_history)
+    messages.append(
         {
             "role": "user",
             "content": f"User request: {req.message}\n\nContext: {ctx_json}",
         }
-    ]
+    )
 
     try:
         # Tool-use loop (max 12 iterations — complex multi-part queries need more rounds)
         for iteration in range(12):
             print(f"[AGENT] Claude iteration {iteration + 1}...", flush=True)
             
+            # Sonnet 5+: thinking.type="adaptive" + output_config.effort (replaces "enabled"+budget_tokens)
+            # Sonnet 4.x: thinking.type="enabled" + budget_tokens=8000
+            _is_sonnet5 = "sonnet-5" in ANTHROPIC_MODEL or "opus-5" in ANTHROPIC_MODEL or "fable-5" in ANTHROPIC_MODEL
+            _thinking_cfg = {"type": "adaptive"} if _is_sonnet5 else {"type": "enabled", "budget_tokens": 8000}
+            _extra = {"output_config": {"effort": "high"}} if _is_sonnet5 else {}
             resp = claude.messages.create(
                 model=ANTHROPIC_MODEL,
-                max_tokens=16000,   # must exceed budget_tokens; accommodates 8k thinking + 8k response
-                thinking={
-                    "type": "enabled",
-                    "budget_tokens": 8000,
-                },
+                max_tokens=16000,
+                thinking=_thinking_cfg,
                 system=system_prompt,
                 tools=_tool_specs(),
                 messages=messages,
                 # temperature omitted — extended thinking requires default (1.0); 0 is not permitted
+                **_extra,
             )
 
             assistant_content = []
@@ -2298,6 +2613,28 @@ def _chat_with_claude(req: ChatRequest) -> Dict[str, Any]:
                     result["cell_mm_earth"]      = _session.last_cell_mm_earth
                     result["cell_am_hill"]       = _session.last_cell_am_hill
                     _session._cell_frames_fresh  = False  # consume
+
+                # Save full messages list (including thinking blocks) as history for next turn.
+                # Cap at 80 messages (~15–30 conversation turns depending on tool use).
+                # Trim from the front, skipping until we hit a real human user message
+                # (not a tool_result message, which also has role="user" in the Anthropic API).
+                _hist = messages
+                if len(_hist) > 80:
+                    _hist = _hist[-80:]
+                    while _hist:
+                        msg = _hist[0]
+                        content = msg.get("content", "")
+                        # A tool_result message has content = list starting with {"type": "tool_result"}
+                        is_tool_result = (
+                            isinstance(content, list) and
+                            content and
+                            isinstance(content[0], dict) and
+                            content[0].get("type") == "tool_result"
+                        )
+                        if msg.get("role") == "user" and not is_tool_result:
+                            break
+                        _hist = _hist[1:]
+                _session.conversation_history = _hist
 
                 return result
 
@@ -3316,7 +3653,7 @@ def _store_traj_ram_cache(key: str, result: Dict, mm_resolution: int, am_resolut
 
 def _forward_to_gpu(mode: str, req: TrajectoryPreviewRequest) -> Dict:
     """Forward batch request to EC2 hnn_gpu_service.py and return parsed JSON result."""
-    endpoint = "/hnn/predict" if mode == "hnn_hinge4" else "/gt/predict"
+    endpoint = "/hnn/predict" if mode == "hnn_hinge4" else "/gt/predict_numba"
     url = GPU_SERVICE_URL.rstrip("/") + endpoint
     body = {
         "system_params":   req.system_params,
@@ -3338,11 +3675,11 @@ def trajectory_preview(req: TrajectoryPreviewRequest):
     """
     GPU trajectory preview with S3 read-through cache.
 
-    mode="hnn_hinge4"  → EC2 /hnn/predict (HNN hinge4 on T4 GPU, ~44–474s)
-    mode="gt_leapfrog" → EC2 /gt/predict  (GT batch leapfrog on T4 GPU, ~193–250s)
+    mode="hnn_hinge4"  → EC2 /hnn/predict      (HNN hinge4 on T4 GPU, ~470s first run)
+    mode="gt_leapfrog" → EC2 /gt/predict_numba (Numba CUDA kernel, ~2s per 30×30 grid)
 
-    On cache HIT:  returns stored result with from_cache=true  (~10ms)
-    On cache MISS: runs GPU inference, stores result, returns with from_cache=false
+    HNN: S3 read-through cache — cache HIT returns in ~10ms, MISS triggers EC2 call.
+    GT:  S3 caching also active — cache HIT returns instantly, MISS runs Numba (~2s).
     """
     try:
         return _trajectory_preview_inner(req)

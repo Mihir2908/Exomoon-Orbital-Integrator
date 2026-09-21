@@ -33,30 +33,40 @@ import numpy as np
 # ── NVVM library resolution (must happen before any numba.cuda import) ─────────
 # The pytorch Docker container has CUDA runtime but not the compiler toolkit.
 # nvidia-cuda-nvcc-cu12==12.4.131 (pip) installs libnvvm for the matching version.
-# Numba checks NUMBA_CUDA_NVVM first when loading libnvvm.so — set it here so the
-# correct version is loaded regardless of what ldconfig / LD_LIBRARY_PATH finds.
+#
+# Numba 0.67 find_lib() uses regex libnvvm\.so\.[0-9]+ — it matches versioned
+# names (libnvvm.so.4) but NOT the bare libnvvm.so that pip installs.
+# Fix: create a versioned symlink in the same directory so numba can find it.
 def _resolve_nvvm() -> None:
     import glob as _glob
 
-    # ── Step 1: resolve libnvvm.so (NUMBA_CUDA_NVVM) ─────────────────────────
-    if "NUMBA_CUDA_NVVM" not in os.environ:
-        _nvvm_candidates = [
-            "/opt/conda/lib/python3.11/site-packages/nvidia/cuda_nvcc/nvvm/lib64/libnvvm.so",
-            "/opt/conda/lib/python3.10/site-packages/nvidia/cuda_nvcc/nvvm/lib64/libnvvm.so",
-            "/usr/local/cuda/nvvm/lib64/libnvvm.so",
-            "/usr/local/cuda-12.4/nvvm/lib64/libnvvm.so",
-        ]
-        _nvvm_candidates += _glob.glob(
-            "/opt/conda/lib/python3.*/site-packages/nvidia/cuda_nvcc/nvvm/lib64/libnvvm.so"
-        )
-        for _path in _nvvm_candidates:
-            if os.path.exists(_path):
-                os.environ["NUMBA_CUDA_NVVM"] = _path
-                break
+    # ── Step 1: find libnvvm.so from pip-installed cuda_nvcc package ─────────
+    _nvvm_candidates = [
+        "/opt/conda/lib/python3.11/site-packages/nvidia/cuda_nvcc/nvvm/lib64/libnvvm.so",
+        "/opt/conda/lib/python3.10/site-packages/nvidia/cuda_nvcc/nvvm/lib64/libnvvm.so",
+        "/usr/local/cuda/nvvm/lib64/libnvvm.so",
+        "/usr/local/cuda-12.4/nvvm/lib64/libnvvm.so",
+    ]
+    _nvvm_candidates += _glob.glob(
+        "/opt/conda/lib/python3.*/site-packages/nvidia/cuda_nvcc/nvvm/lib64/libnvvm.so"
+    )
+    _nvvm_path = None
+    for _path in _nvvm_candidates:
+        if os.path.exists(_path):
+            _nvvm_path = _path
+            break
 
-    # ── Step 2: resolve CUDA_HOME for libdevice.10.bc ─────────────────────────
-    # Numba's get_cuda_home('nvvm', 'libdevice') uses CUDA_HOME to locate
-    # libdevice.10.bc.  Point it at the pip-installed cuda_nvcc package root.
+    # ── Step 2: create versioned symlink if bare .so exists but .so.X does not ─
+    # Numba's find_lib() requires libnvvm.so.X — create the symlink so it matches.
+    if _nvvm_path:
+        _versioned = _nvvm_path + ".4"
+        if not os.path.exists(_versioned):
+            try:
+                os.symlink(_nvvm_path, _versioned)
+            except OSError:
+                pass  # read-only fs or already exists race — fall through
+
+    # ── Step 3: set CUDA_HOME so numba can locate nvvm/lib64 and libdevice ────
     if "CUDA_HOME" not in os.environ and "CUDA_PATH" not in os.environ:
         _home_candidates = [
             "/opt/conda/lib/python3.11/site-packages/nvidia/cuda_nvcc",

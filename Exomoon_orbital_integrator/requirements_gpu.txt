@@ -10,6 +10,12 @@ uvicorn==0.31.1
 pydantic==2.12.4
 python-dotenv==1.2.1
 
+# Numba CUDA JIT (GT batch leapfrog kernel — /gt/predict_numba endpoint)
+# nvidia-cuda-nvcc-cu12 provides libnvvm.so + libdevice.10.bc at the exact
+# path that batch_leapfrog_numba_cuda._resolve_nvvm() probes.
+numba>=0.59.0
+nvidia-cuda-nvcc-cu12==12.4.131
+
 # Scientific compute
 scipy==1.14.0
 scikit-learn==1.7.2

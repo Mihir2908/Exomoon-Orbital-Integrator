@@ -8,8 +8,10 @@ Endpoints:
   GET  /health              — CUDA availability + GPU name
   POST /hnn/predict         — stability map via HNN hinge4 on GPU
   POST /gt/predict          — stability map via GT batch leapfrog on GPU (PyTorch, Python loop)
-  POST /gt/predict_numba    — stability map via GT batch leapfrog on GPU (Numba CUDA kernel,
-                               zero Python iterations — maps only, no trajectory arrays)
+  POST /gt/predict_numba    — stability map + full trajectories via GT batch leapfrog on GPU
+                               (Numba CUDA kernel, zero Python iterations, ~2.3s, n_steps frames)
+                               Trajectory arrays returned compressed (float32 binary + zlib +
+                               base64) — ~15-30MB vs 486MB raw JSON, no EC2-side caching.
 
 Environment variables:
   ML_DEVICE      default "cuda" (set to "cpu" for local testing)
@@ -18,9 +20,12 @@ Environment variables:
 
 from __future__ import annotations
 
+import base64
 import os
 import sys
 import time
+import zlib
+from typing import Optional
 
 _SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)))
 if _SRC not in sys.path:
@@ -29,7 +34,6 @@ if _SRC not in sys.path:
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import Optional
 
 ML_DEVICE     = os.getenv("ML_DEVICE", "cuda")
 HNN_MODEL_DIR = os.getenv(
@@ -138,10 +142,13 @@ def gt_predict(req: HnnPredictRequest):
 @app.post("/gt/predict_numba")
 def gt_predict_numba(req: HnnPredictRequest):
     """
-    GT batch leapfrog via Numba CUDA kernel — same physics as /gt/predict but
-    the integration loop runs entirely on-device (zero Python iterations).
-    Returns map outputs only (no trajectory arrays stored).
+    GT batch leapfrog via Numba CUDA kernel (~2.3s server-side).
+
+    Trajectory arrays are compressed (float32 binary + zlib level 6 + base64) and included
+    in the response. Transfer size: ~15-30MB vs 486MB uncompressed JSON. No EC2-side storage.
+    Agent service decompresses and stores in its own RAM for instant cell clicks.
     """
+    import numpy as np
     from exomoon.ml.batch_leapfrog_numba_cuda import batch_leapfrog_numba_trajectories
 
     t0 = time.perf_counter()
@@ -153,12 +160,25 @@ def gt_predict_numba(req: HnnPredictRequest):
         mm_resolution   = req.mm_resolution,
         am_resolution   = req.am_resolution,
         escape_factor   = req.escape_factor,
+        n_steps         = req.n_steps,
         device          = ML_DEVICE,
     )
-    result["wall_s"] = round(time.perf_counter() - t0, 1)
-    result["device"] = ML_DEVICE
+
+    # Compress trajectory arrays: float32 binary + zlib → base64.
+    # Orbital trajectories (smooth periodic motion) compress ~5-15x with zlib.
+    # ~162MB float32 raw → ~15-30MB base64 → fast transfer, no EC2-side caching needed.
+    for key in ("traj_planet", "traj_star", "traj_moon", "t_grid"):
+        arr = result.pop(key, None)
+        if arr is not None:
+            arr_f32    = np.array(arr, dtype=np.float32)
+            compressed = zlib.compress(arr_f32.tobytes(), level=6)
+            result[f"{key}_zlib_f32"] = base64.b64encode(compressed).decode("ascii")
+            result[f"{key}_shape"]    = list(arr_f32.shape)
+
+    result["wall_s"]         = round(time.perf_counter() - t0, 1)
+    result["device"]         = ML_DEVICE
     result["cells_computed"] = req.mm_resolution * req.am_resolution
-    result["grid_shape"] = [req.mm_resolution, req.am_resolution]
+    result["grid_shape"]     = [req.mm_resolution, req.am_resolution]
     return _to_serializable(result)
 
 

@@ -24,7 +24,8 @@ def main():
         traj=sim["traj"],
         a_inner_au=sim["a_inner_au"],
         a_outer_au=sim["a_outer_au"],
-        open_in_browser=True
+        open_in_browser=True,
+        rhill_au=sim.get("state", {}).get("rhill_AU")
     )
     fig.show(renderer="browser")
     fig.write_html("orbit_anim.html")

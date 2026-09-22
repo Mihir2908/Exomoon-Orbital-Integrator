@@ -90,7 +90,8 @@ def main():
         json.dump(summary, f)
 
     fig = build_animation(sim["traj"], sim["a_inner_au"], sim["a_outer_au"],
-                          open_in_browser=False, dt=sim["dt"], t_end=sim["t_end"])
+                          open_in_browser=False, dt=sim["dt"], t_end=sim["t_end"],
+                          rhill_au=sim.get("state", {}).get("rhill_AU"))
     local_html = str(workdir / "animation.html")
     fig.write_html(local_html, include_plotlyjs="cdn")
 

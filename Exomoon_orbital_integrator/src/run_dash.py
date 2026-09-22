@@ -1099,10 +1099,10 @@ def run_cb(n_clicks, kick, Ts, rs_solar, ms_solar, mp_earth, dp_cgs, ap_AU, ep,
     else:
         sim = run_simulation(p)
         duration_label = "1 planet orbit"
+    rhill = sim.get("state", {}).get("rhill_AU")
     fig = build_animation(sim["traj"], sim["a_inner_au"], sim["a_outer_au"],
-                          open_in_browser=False, dt=sim["dt"], t_end=sim["t_end"])
-    st = sim.get("state", {})
-    rhill = st.get("rhill_AU")
+                          open_in_browser=False, dt=sim["dt"], t_end=sim["t_end"],
+                          rhill_au=rhill)
     if isinstance(rhill, (int, float)):
         dir_txt = "Retrograde" if p.moon_retrograde else "Prograde"
         fig.add_annotation(
@@ -1366,7 +1366,8 @@ def load_s3_results(job_info_trigger, job_info):
         }
 
         fig = build_animation(sim["traj"], sim["a_inner_au"], sim["a_outer_au"],
-                              open_in_browser=False, dt=sim["dt"], t_end=sim["t_end"])
+                              open_in_browser=False, dt=sim["dt"], t_end=sim["t_end"],
+                              rhill_au=sim["state"].get("rhill_AU"))
         packed = pack_sim(sim)
         return fig, packed
 
@@ -1437,7 +1438,8 @@ def restore_main_figure(pathname, packed):
     a_out = sim.get("a_outer_au") or 1.75
     if a_in > a_out:
         a_in, a_out = a_out, a_in
-    fig = build_animation(sim["traj"], a_in, a_out, open_in_browser=False, dt=sim["dt"], t_end=sim["t_end"])
+    fig = build_animation(sim["traj"], a_in, a_out, open_in_browser=False, dt=sim["dt"], t_end=sim["t_end"],
+                          rhill_au=sim.get("state", {}).get("rhill_AU"))
     fig.update_layout(template="plotly_white", uirevision="anim")
     return fig
 

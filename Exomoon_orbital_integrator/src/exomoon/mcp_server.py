@@ -136,7 +136,8 @@ def run_sim(params: Dict[str, Any]) -> Dict[str, Any]:
         sim = run_simulation(p)
         t1 = perf_counter()
         fig = build_animation(sim["traj"], sim["a_inner_au"], sim["a_outer_au"],
-                              open_in_browser=False, dt=sim["dt"], t_end=sim["t_end"])
+                              open_in_browser=False, dt=sim["dt"], t_end=sim["t_end"],
+                              rhill_au=sim.get("state", {}).get("rhill_AU"))
         outdir = Path("outputs"); outdir.mkdir(exist_ok=True)
         outfile = outdir / "exomoon_sim.html"
         fig.write_html(str(outfile), include_plotlyjs="cdn")
@@ -174,7 +175,8 @@ def run_sim_years(params: Dict[str, Any], years: float | None = None) -> Dict[st
         sim = run_simulation_for_years(p, years_f)
         t1 = perf_counter()
         fig = build_animation(sim["traj"], sim["a_inner_au"], sim["a_outer_au"],
-                              open_in_browser=False, dt=sim["dt"], t_end=sim["t_end"])
+                              open_in_browser=False, dt=sim["dt"], t_end=sim["t_end"],
+                              rhill_au=sim.get("state", {}).get("rhill_AU"))
         outdir = Path("outputs"); outdir.mkdir(exist_ok=True)
         outfile = outdir / f"exomoon_sim_{int(round(years_f))}y.html"
         fig.write_html(str(outfile), include_plotlyjs="cdn")

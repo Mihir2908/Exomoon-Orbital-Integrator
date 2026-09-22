@@ -176,6 +176,17 @@ export function MlMapOverlay({ onClose, containerRef, onApplyAndRun, frameIndex 
     window.addEventListener('mouseup',   onUp);
   }, [containerRef]);
 
+  const startHnnDrag = useCallback((e: React.MouseEvent) => {
+    e.preventDefault();
+    const rect = hnnModalRef.current?.getBoundingClientRect();
+    if (!rect) return;
+    const [sx, sy, ox, oy] = [e.clientX, e.clientY, rect.left, rect.top];
+    function onMove(ev: MouseEvent) { setHnnModalPos({ x: ox + ev.clientX - sx, y: oy + ev.clientY - sy }); }
+    function onUp()  { window.removeEventListener('mousemove', onMove); window.removeEventListener('mouseup', onUp); }
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup',   onUp);
+  }, []);
+
   // ── Section collapse ───────────────────────────────────────────────────────
   const [sec1Open, setSec1Open] = useState(false);   // Model Training (collapsed by default)
   const [sec2Open, setSec2Open] = useState(true);    // Prediction (open by default)
@@ -183,6 +194,8 @@ export function MlMapOverlay({ onClose, containerRef, onApplyAndRun, frameIndex 
 
   // ── HNN disclaimer modal ───────────────────────────────────────────────────
   const [hnnDisclaimerOpen, setHnnDisclaimerOpen] = useState(false);
+  const [hnnModalPos,       setHnnModalPos]        = useState<{ x: number; y: number } | null>(null);
+  const hnnModalRef = useRef<HTMLDivElement>(null);
 
   // ── Section 1: Model Training layer tab ───────────────────────────────────
   const [trainLayer, setTrainLayer] = useState<'mlp' | 'hnn'>('mlp');
@@ -199,7 +212,11 @@ export function MlMapOverlay({ onClose, containerRef, onApplyAndRun, frameIndex 
   const [trajEngine,        setTrajEngine]        = useState<'gt_leapfrog' | 'hnn_hinge4'>('gt_leapfrog');
   const [trajLoading,       setTrajLoading]        = useState(false);
   const [trajError,         setTrajError]          = useState<string | null>(null);
-  const [trajResult,        setTrajResult]         = useState<TrajResult | null>(null);
+  const [trajResultByEngine, setTrajResultByEngine] = useState<Record<string, TrajResult | null>>({
+    gt_leapfrog: null,
+    hnn_hinge4:  null,
+  });
+  const trajResult = trajResultByEngine[trajEngine] ?? null;
   const [selectedCell,      setSelectedCell]       = useState<{ mmIdx: number; amIdx: number } | null>(null);
   const [selectedCellFrames, setSelectedCellFrames] = useState<TrajectoryFrame[] | null>(null);
   const [cellTrajLoading,   setCellTrajLoading]    = useState(false);
@@ -230,8 +247,11 @@ export function MlMapOverlay({ onClose, containerRef, onApplyAndRun, frameIndex 
   useEffect(() => {
     if (!trajPreview) return;
     const result = { ...trajPreview } as unknown as TrajResult;
-    // Compute confidence_map client-side when in HNN mode and MLP prediction is available
-    if (trajEngine === 'hnn_hinge4' && mlPrediction) {
+    // Use the engine mode the chatbot reported (added by Fix B in agent_service.py).
+    // Falls back to 'gt_leapfrog' for payloads from before that fix.
+    const previewMode = (trajPreview as Record<string, unknown>).mode as string ?? 'gt_leapfrog';
+    // Compute confidence_map client-side when the preview is from HNN and MLP prediction is available
+    if (previewMode === 'hnn_hinge4' && mlPrediction) {
       const N_MM = result.mm_grid.length;
       const N_AM = result.am_grid.length;
       result.confidence_map = Array.from({ length: N_MM }, (_, mi) =>
@@ -242,8 +262,9 @@ export function MlMapOverlay({ onClose, containerRef, onApplyAndRun, frameIndex 
         })
       );
     }
-    setTrajResult(result);
-    // Switch to trajectory tab so the user sees the pushed result
+    setTrajResultByEngine(prev => ({ ...prev, [previewMode]: result }));
+    // Switch engine selector to match the pushed result, then show trajectory tab
+    setTrajEngine(previewMode as 'gt_leapfrog' | 'hnn_hinge4');
     setPredLayer('trajectory');
   }, [trajPreview]);
 
@@ -335,7 +356,7 @@ export function MlMapOverlay({ onClose, containerRef, onApplyAndRun, frameIndex 
           validAmPerMm: data.valid_am_per_mm as ([number, number] | null)[],
         };
         setMlPrediction(pred);
-        setTrajResult(null);
+        setTrajResultByEngine({ gt_leapfrog: null, hnn_hinge4: null });
         setSelectedCell(null);
         setSelectedCellFrames(null);
         setPreviewCellFrames(null, null);
@@ -414,7 +435,7 @@ export function MlMapOverlay({ onClose, containerRef, onApplyAndRun, frameIndex 
             })
           );
         }
-        setTrajResult(result);
+        setTrajResultByEngine(prev => ({ ...prev, [trajEngine]: result }));
       } else {
         setTrajError(data.message ?? data.error ?? 'Trajectory batch failed');
       }
@@ -617,8 +638,10 @@ export function MlMapOverlay({ onClose, containerRef, onApplyAndRun, frameIndex 
         // MLP Layer 1 classification drives green/grey coloring (canonical source)
         const mlBoth = mlPrediction?.mapBoth[mi]?.[ai] ?? false;
         const conf   = trajResult.confidence_map?.[mi]?.[ai] ?? null;
-        // Background: HNN LOW = dark red, HNN HIGH or GT = dark green, invalid = black
-        const isLow  = isHNN && mlBoth && conf === 'LOW';
+        // Background: HNN LOW = dark red, GT-invalidated = dark red, valid = dark green, invalid = black
+        const gtBoth    = trajResult.map_both[mi]?.[ai] ?? false;
+        const isGTInval = !isHNN && mlBoth && !gtBoth;
+        const isLow     = (isHNN && mlBoth && conf === 'LOW') || isGTInval;
         ctx.fillStyle = mlBoth ? (isLow ? '#2d0a0a' : '#0d3830') : '#0d1117';
         ctx.fillRect(x0, y0, CELL_PX, CELL_PX);
         // Grid lines
@@ -1065,7 +1088,7 @@ export function MlMapOverlay({ onClose, containerRef, onApplyAndRun, frameIndex 
                           <span className="text-gray-500 font-mono text-[10px] shrink-0 ml-2">~470s + cached</span>
                         </button>
                         <button
-                          onClick={e => { e.stopPropagation(); setHnnDisclaimerOpen(true); }}
+                          onClick={e => { e.stopPropagation(); setHnnModalPos(null); setHnnDisclaimerOpen(true); }}
                           title="About the HNN model"
                           className="shrink-0 w-5 h-5 flex items-center justify-center rounded-full text-gray-500 hover:text-violet-400 hover:bg-violet-900/20 transition-colors text-[11px] border border-gray-700/50"
                         >
@@ -1074,17 +1097,21 @@ export function MlMapOverlay({ onClose, containerRef, onApplyAndRun, frameIndex 
                       </div>
                     </div>
 
-                    {/* HNN disclaimer modal */}
+                    {/* HNN disclaimer modal — draggable + resizable */}
                     {hnnDisclaimerOpen && (
-                      <div
-                        className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm"
-                        onClick={() => setHnnDisclaimerOpen(false)}
-                      >
+                      <>
+                        <div className="fixed inset-0 z-50 bg-black/60 backdrop-blur-sm" onClick={() => setHnnDisclaimerOpen(false)} />
                         <div
-                          className="relative w-full max-w-lg mx-4 bg-gray-900 border border-gray-700 rounded-xl shadow-2xl p-5 space-y-3 text-[12px] text-gray-300 leading-relaxed"
+                          ref={hnnModalRef}
+                          className="fixed z-[51] w-full max-w-lg max-h-[75vh] bg-gray-900 border border-gray-700 rounded-xl shadow-2xl text-[12px] text-gray-300 leading-relaxed overflow-auto resize min-w-[280px] min-h-[160px]"
+                          style={hnnModalPos ? { left: hnnModalPos.x, top: hnnModalPos.y } : { top: '50%', left: '50%', transform: 'translate(-50%, -50%)' }}
                           onClick={e => e.stopPropagation()}
                         >
-                          <div className="flex items-start justify-between gap-3">
+                          {/* Drag handle — sticky header */}
+                          <div
+                            className="sticky top-0 z-10 bg-gray-900 rounded-t-xl px-5 pt-5 pb-3 cursor-move select-none border-b border-gray-800 flex items-start justify-between gap-3"
+                            onMouseDown={startHnnDrag}
+                          >
                             <div className="flex items-center gap-2">
                               <h3 className="text-sm font-semibold text-white">HNN Physics ML Model</h3>
                               <span className="px-1.5 py-0.5 rounded text-[9px] font-semibold bg-amber-500/20 text-amber-400 border border-amber-500/30">Beta</span>
@@ -1092,51 +1119,54 @@ export function MlMapOverlay({ onClose, containerRef, onApplyAndRun, frameIndex 
                             <button onClick={() => setHnnDisclaimerOpen(false)} className="text-gray-500 hover:text-white text-base leading-none mt-0.5">✕</button>
                           </div>
 
-                          <p>
-                            The HNN (Hamiltonian Neural Network) trajectory preview is an experimental implementation
-                            designed to demonstrate the capability of physics-informed machine learning to approximate
-                            three-body orbital dynamics. Rather than solving the equations of motion directly, the HNN
-                            learns to predict system state step-by-step from training data, attempting to preserve
-                            physical conservation laws (energy, angular momentum) at each step.
-                          </p>
+                          {/* Scrollable content */}
+                          <div className="px-5 py-4 space-y-3">
+                            <p>
+                              The HNN (Hamiltonian Neural Network) trajectory preview is an experimental implementation
+                              designed to demonstrate the capability of physics-informed machine learning to approximate
+                              three-body orbital dynamics. Rather than solving the equations of motion directly, the HNN
+                              learns to predict system state step-by-step from training data, attempting to preserve
+                              physical conservation laws (energy, angular momentum) at each step.
+                            </p>
 
-                          <p>
-                            <span className="text-amber-400 font-medium">Why its maps differ from Ground Truth:</span>{' '}
-                            Small prediction errors accumulate across thousands of autoregressive steps, causing the
-                            HNN&apos;s stability and habitability maps to diverge from exact physics — particularly
-                            near stability boundaries and at longer simulation durations. Its output reflects the
-                            model&apos;s learned approximation of orbital behaviour, not a direct solution of the
-                            governing equations.
-                          </p>
+                            <p>
+                              <span className="text-amber-400 font-medium">Why its maps differ from Ground Truth:</span>{' '}
+                              Small prediction errors accumulate across thousands of autoregressive steps, causing the
+                              HNN&apos;s stability and habitability maps to diverge from exact physics — particularly
+                              near stability boundaries and at longer simulation durations. Its output reflects the
+                              model&apos;s learned approximation of orbital behaviour, not a direct solution of the
+                              governing equations.
+                            </p>
 
-                          <p>
-                            <span className="text-violet-400 font-medium">Why confidence labels only apply here:</span>{' '}
-                            The Ground Truth integrator is the reference standard — its results need no external
-                            validation. HNN results are cross-checked against the Layer 1 MLP classifier:
-                            HIGH confidence means both agree a cell is stable+habitable; LOW confidence means
-                            the MLP predicts it should be, but the HNN trajectory disagrees — flagging where
-                            the approximation may be unreliable.
-                          </p>
+                            <p>
+                              <span className="text-violet-400 font-medium">Why confidence labels only apply here:</span>{' '}
+                              The Ground Truth integrator is the reference standard — its results need no external
+                              validation. HNN results are cross-checked against the Layer 1 MLP classifier:
+                              HIGH confidence means both agree a cell is stable+habitable; LOW confidence means
+                              the MLP predicts it should be, but the HNN trajectory disagrees — flagging where
+                              the approximation may be unreliable.
+                            </p>
 
-                          <p>
-                            <span className="text-cyan-400 font-medium">Why the MLP outperforms HNN for classification:</span>{' '}
-                            The MLP was trained with direct supervision on per-simulation outcomes — each training
-                            example is a complete simulation with a final stable/habitable verdict. This is a
-                            focused, data-efficient task. The HNN was trained to reproduce full trajectory
-                            evolution at every timestep — a harder problem where per-step errors compound. A
-                            model that perfectly predicts trajectories would also be a perfect classifier, but
-                            the MLP achieves strong classification accuracy without needing to reconstruct the
-                            intermediate dynamics at all.
-                          </p>
+                            <p>
+                              <span className="text-cyan-400 font-medium">Why the MLP outperforms HNN for classification:</span>{' '}
+                              The MLP was trained with direct supervision on per-simulation outcomes — each training
+                              example is a complete simulation with a final stable/habitable verdict. This is a
+                              focused, data-efficient task. The HNN was trained to reproduce full trajectory
+                              evolution at every timestep — a harder problem where per-step errors compound. A
+                              model that perfectly predicts trajectories would also be a perfect classifier, but
+                              the MLP achieves strong classification accuracy without needing to reconstruct the
+                              intermediate dynamics at all.
+                            </p>
 
-                          <div className="pt-1 border-t border-gray-800 text-gray-500 text-[11px]">
-                            For accurate stability and habitability maps, use the{' '}
-                            <span className="text-gray-300 font-medium">Ground Truth Physics Integrator</span>.
-                            The HNN is best understood as a live illustration of where physics-based ML currently
-                            stands in approximating complex gravitational systems.
+                            <div className="pt-1 border-t border-gray-800 text-gray-500 text-[11px]">
+                              For accurate stability and habitability maps, use the{' '}
+                              <span className="text-gray-300 font-medium">Ground Truth Physics Integrator</span>.
+                              The HNN is best understood as a live illustration of where physics-based ML currently
+                              stands in approximating complex gravitational systems.
+                            </div>
                           </div>
                         </div>
-                      </div>
+                      </>
                     )}
 
                     {/* Run trajectory batch */}

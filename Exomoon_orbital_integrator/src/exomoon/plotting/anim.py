@@ -11,7 +11,8 @@ def build_animation(traj: dict,
                     t_end: float | None = None,
                     max_frames: int = 2500,
                     playback_seconds: float | None = None,
-                    speed_factor: float = 200.0) -> go.Figure:
+                    speed_factor: float = 200.0,
+                    rhill_au: float | None = None) -> go.Figure:
     """
     Build animated figure.
     dt, t_end (years) allow time-scaled slider labels & adaptive playback.
@@ -57,7 +58,8 @@ def build_animation(traj: dict,
 
     moon_rel = xyzarr_mm - xyzarr_mp
     r_rel = 1.2 * np.max(np.sqrt(moon_rel[:, 0] ** 2 + moon_rel[:, 1] ** 2))
-    zoom_range = [-r_rel, r_rel]
+    r_zoom = max(r_rel, rhill_au * 1.1) if rhill_au is not None else r_rel
+    zoom_range = [-r_zoom, r_zoom]
 
     ms_x = xyzarr_ms[frame_indices, 0]; ms_y = xyzarr_ms[frame_indices, 1]
     mp_x = xyzarr_mp[frame_indices, 0]; mp_y = xyzarr_mp[frame_indices, 1]
@@ -126,6 +128,15 @@ def build_animation(traj: dict,
     fig.update_xaxes(title_text="ΔX (AU)", range=zoom_range, row=2, col=2)
     fig.update_yaxes(title_text="ΔY (AU)", range=zoom_range, scaleanchor="x2", scaleratio=1, row=2, col=2)
 
+    zoom_shapes = []
+    if rhill_au is not None:
+        zoom_shapes.append(
+            dict(type="circle", xref="x2", yref="y2",
+                 x0=-rhill_au, y0=-rhill_au, x1=rhill_au, y1=rhill_au,
+                 fillcolor="rgba(0,0,0,0)",
+                 line=dict(color="rgba(255,255,255,0.45)", width=1, dash="dot"),
+                 layer="above")
+        )
     fig.update_layout(
         shapes=[
             dict(type="circle", xref="x1", yref="y1",
@@ -134,6 +145,7 @@ def build_animation(traj: dict,
             dict(type="circle", xref="x1", yref="y1",
                  x0=-a_inner_au, y0=-a_inner_au, x1=a_inner_au, y1=a_inner_au,
                  fillcolor="white", line=dict(color="rgba(0,0,0,0)"), layer="below"),
+            *zoom_shapes,
         ]
     )
 

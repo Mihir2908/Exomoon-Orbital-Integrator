@@ -266,14 +266,14 @@ export function MiniOrbitView({
                   <line x1="0" y1="2.5" x2="18" y2="2.5"
                     stroke="rgba(139,92,246,0.80)" strokeWidth="1.2" strokeDasharray="4,3" />
                 </svg>
-                <span>ML outer {(amRange[1] * rhill).toFixed(4)} AU</span>
+                <span>MLP valid orbit max {(amRange[1] * rhill).toFixed(4)} AU</span>
               </div>
               <div className="flex items-center gap-1.5">
                 <svg width="18" height="5">
                   <line x1="0" y1="2.5" x2="18" y2="2.5"
                     stroke="rgba(6,182,212,0.80)" strokeWidth="1.2" strokeDasharray="4,3" />
                 </svg>
-                <span>ML inner {(amRange[0] * rhill).toFixed(4)} AU</span>
+                <span>MLP valid orbit min {(amRange[0] * rhill).toFixed(4)} AU</span>
               </div>
             </>
           )}

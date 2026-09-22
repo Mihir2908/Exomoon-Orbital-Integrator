@@ -67,7 +67,7 @@ export function ChatMessage({ message }: ChatMessageProps) {
                 ),
               }}
             >
-              {message.content || (message.streaming ? '▋' : '')}
+              {message.content || (message.streaming ? 'Loading.....' : '')}
             </ReactMarkdown>
           </div>
         )}

@@ -6,9 +6,10 @@ batch_leapfrog.py, but the integration loop runs entirely on-device via a
 Numba CUDA @cuda.jit kernel.  One CUDA thread per grid cell → zero Python
 iterations → zero GPU→CPU sync overhead during integration.
 
-Only map outputs (stable/habitable per cell) are produced — no trajectory
-arrays.  This is sufficient for the /gt/predict_numba endpoint and production
-use of the GT batch leapfrog path.
+Produces BOTH map outputs (stable/habitable per cell) AND full trajectory
+arrays (traj_planet, traj_star, traj_moon) shaped (N, n_out, 3).  Positions
+are stored at evenly-spaced stride intervals during integration so that the
+n_out output frames span the full simulation duration.
 
 Timing scope (t0) is identical to batch_leapfrog_trajectories():
   t0 covers IC computation for ALL N cells + kernel launch + kernel
@@ -109,7 +110,12 @@ def _leapfrog_3body_kernel(
     rhill, escape_factor,       # float64 scalars: Hill radius, escape multiplier
     a_inner, a_outer,           # float64 scalars: HZ bounds (AU)
     n_warmup, n_steps,          # int scalars: warmup steps, total physics steps
+    stride,                     # int scalar: store trajectory every `stride` steps
+    n_out,                      # int scalar: number of output frames
     out_stable, out_habitable,  # (N,) uint8 output arrays (1=yes, 0=no)
+    out_traj_p,                 # (N, n_out, 3) float64 planet trajectory
+    out_traj_s,                 # (N, n_out, 3) float64 star trajectory
+    out_traj_m,                 # (N, n_out, 3) float64 moon trajectory
 ):
     """
     3-body KDK leapfrog for one (mm, am) grid cell per CUDA thread.
@@ -117,6 +123,8 @@ def _leapfrog_3body_kernel(
     Each thread runs n_steps leapfrog steps independently on-device.
     Accumulates ever_escaped / ever_uninhabitable flags post-warmup and
     writes final stable/habitable booleans to output arrays.
+    Also stores planet/star/moon positions every `stride` steps into the
+    trajectory output arrays for cell-click previews.
     """
     idx = cuda.threadIdx.x + cuda.blockIdx.x * cuda.blockDim.x
     if idx >= pos_mp.shape[0]:
@@ -133,10 +141,17 @@ def _leapfrog_3body_kernel(
 
     mu_mm   = mu_mm_arr[idx]
     half_dt = dt * 0.5
-    esc_sq  = (escape_factor * rhill) * (escape_factor * rhill)  # squared for cheap compare
+    esc_sq  = (escape_factor * rhill) * (escape_factor * rhill)
 
     ever_escaped       = False
     ever_uninhabitable = False
+
+    # Store initial positions (frame 0)
+    out_traj_p[idx, 0, 0] = px_p; out_traj_p[idx, 0, 1] = py_p; out_traj_p[idx, 0, 2] = pz_p
+    out_traj_s[idx, 0, 0] = px_s; out_traj_s[idx, 0, 1] = py_s; out_traj_s[idx, 0, 2] = pz_s
+    out_traj_m[idx, 0, 0] = px_m; out_traj_m[idx, 0, 1] = py_m; out_traj_m[idx, 0, 2] = pz_m
+
+    frame_idx = 1  # next frame to write (frame 0 already written above)
 
     for step in range(n_steps):
 
@@ -218,6 +233,19 @@ def _leapfrog_3body_kernel(
         py_m = p2y_m + vy_m * half_dt
         pz_m = p2z_m + vz_m * half_dt
 
+        # ── Store trajectory frame at stride intervals ─────────────────────
+        if stride > 0 and (step + 1) % stride == 0 and frame_idx < n_out:
+            out_traj_p[idx, frame_idx, 0] = px_p
+            out_traj_p[idx, frame_idx, 1] = py_p
+            out_traj_p[idx, frame_idx, 2] = pz_p
+            out_traj_s[idx, frame_idx, 0] = px_s
+            out_traj_s[idx, frame_idx, 1] = py_s
+            out_traj_s[idx, frame_idx, 2] = pz_s
+            out_traj_m[idx, frame_idx, 0] = px_m
+            out_traj_m[idx, frame_idx, 1] = py_m
+            out_traj_m[idx, frame_idx, 2] = pz_m
+            frame_idx += 1
+
         # ── Distances ─────────────────────────────────────────────────────
         dx = px_m - px_p; dy = py_m - py_p; dz = pz_m - pz_p
         mpd_sq = dx*dx + dy*dy + dz*dz
@@ -229,14 +257,14 @@ def _leapfrog_3body_kernel(
         cur_escaped       = mpd_sq > esc_sq
         cur_uninhabitable = (msd < a_inner) or (msd > a_outer)
 
-        # Accumulate post-warmup stability history (mirrors max/min over stored frames)
+        # Accumulate post-warmup stability history
         if step >= n_warmup:
             if cur_escaped:
                 ever_escaped = True
             if cur_uninhabitable:
                 ever_uninhabitable = True
 
-        # Early stop: instantaneous both-conditions — same done_t logic as batch_leapfrog.py
+        # Early stop: instantaneous both-conditions
         if cur_escaped and cur_uninhabitable:
             break
 
@@ -251,33 +279,32 @@ def batch_leapfrog_numba_trajectories(
     em:              float           = 0.0,
     mm_resolution:   int             = 50,
     am_resolution:   int             = 50,
-    n_steps:         int             = 1000,    # kept for interface compat; not used (no traj storage)
+    n_steps:         int             = 5000,   # output frames stored per cell
     escape_factor:   float           = 1.0,
-    device:          str             = "cuda",  # accepted but ignored; kernel always runs on GPU
+    device:          str             = "cuda",
     n_orbits: "int | None"           = None,
     eligible_mask: "np.ndarray | None" = None,
 ) -> dict:
     """
     Run the 3-body leapfrog integrator via Numba CUDA over a (mm_earth × am_hill)
-    grid, returning stability and habitability maps.
+    grid, returning stability/habitability maps AND full trajectory arrays.
 
     Drop-in replacement for batch_leapfrog_trajectories() with identical physics
     parameters, grid construction, dt formula, warmup, and stopping criterion.
 
-    The only differences from the non-Numba version:
-      1. Integration loop runs on-device (zero Python iterations, zero GPU→CPU sync)
-      2. No trajectory arrays stored — only map outputs produced
-      3. Requires a CUDA-capable GPU and numba[cuda] installed
-
     Parameters
     ----------
-    (same as batch_leapfrog_trajectories — see that function for full docs)
+    n_steps : int
+        Number of output trajectory frames to store per cell (default 5000).
+        The physics integration runs for max(ceil(t_sim/dt), n_steps) steps;
+        positions are stored at stride = n_phys // n_steps intervals so exactly
+        n_steps frames are written across the full simulation duration.
 
     Returns
     -------
-    dict with same keys as batch_leapfrog_trajectories, except:
-      traj_planet / traj_star / traj_moon / moon_planet_dist / moon_star_dist
-      are all None (not stored by the Numba kernel).
+    dict with same keys as batch_leapfrog_trajectories, including:
+      traj_planet / traj_star / traj_moon : np.ndarray shape (N, n_steps, 3)
+      t_grid                              : np.ndarray shape (n_steps,)
     """
     t0 = time.perf_counter()
 
@@ -306,7 +333,7 @@ def batch_leapfrog_numba_trajectories(
 
     a_inner_au, a_outer_au = hz_bounds_au(Ts, rs_solar * _rsun)
 
-    # ── Vectorised initial states (reuse batch_leapfrog.py helper) ─────────
+    # ── Vectorised initial states ──────────────────────────────────────────
     (pos_mp0, pos_ms0, pos_mm0, vel_mp0, vel_ms0, vel_mm0,
      mu_ms, mu_mp, mu_mm_arr, rhill) = _build_initial_states(
         ms_solar=ms_solar, mp_earth=mp_earth,
@@ -317,7 +344,7 @@ def batch_leapfrog_numba_trajectories(
 
     N = mm_resolution * am_resolution
 
-    # ── Shared physics timestep — identical formula to batch_leapfrog.py ───
+    # ── Shared physics timestep ────────────────────────────────────────────
     am_ref_AU  = float(am_grid[am_resolution // 2]) * rhill_AU
     mm_mid     = float(mm_grid[mm_resolution // 2])
     mu_mm_ref  = mm_mid * (merth / msun) * FOUR_PI2
@@ -327,8 +354,12 @@ def batch_leapfrog_numba_trajectories(
     dt_fixed = min(T_moon_ref / 100.0, 1.0 / 20_000.0)
     n_phys   = max(int(np.ceil(t_sim / dt_fixed)), n_steps)
 
-    print(f"  GT Numba CUDA leapfrog: dt={dt_fixed:.2e} yr  n_phys={n_phys:,}  N={N}  "
-          f"threads_per_block={_THREADS_PER_BLOCK}")
+    # stride: store one frame every `stride` physics steps → exactly n_steps frames
+    stride = max(n_phys // n_steps, 1)
+    n_out  = n_steps  # number of output frames (frame 0 = t=0, stored before loop)
+
+    print(f"  GT Numba CUDA leapfrog: dt={dt_fixed:.2e} yr  n_phys={n_phys:,}  "
+          f"N={N}  n_out={n_out}  stride={stride}  threads_per_block={_THREADS_PER_BLOCK}")
 
     # ── Transfer initial states to GPU ─────────────────────────────────────
     d_pos_mp = cuda.to_device(np.ascontiguousarray(pos_mp0, dtype=np.float64))
@@ -342,6 +373,11 @@ def batch_leapfrog_numba_trajectories(
     d_out_stable    = cuda.device_array(N, dtype=np.uint8)
     d_out_habitable = cuda.device_array(N, dtype=np.uint8)
 
+    # Trajectory output buffers on device: (N, n_out, 3) float64
+    d_traj_p = cuda.device_array((N, n_out, 3), dtype=np.float64)
+    d_traj_s = cuda.device_array((N, n_out, 3), dtype=np.float64)
+    d_traj_m = cuda.device_array((N, n_out, 3), dtype=np.float64)
+
     # ── CUDA kernel launch ─────────────────────────────────────────────────
     blocks = (N + _THREADS_PER_BLOCK - 1) // _THREADS_PER_BLOCK
 
@@ -354,28 +390,31 @@ def batch_leapfrog_numba_trajectories(
         float(rhill_AU), float(escape_factor),
         float(a_inner_au), float(a_outer_au),
         int(_WARMUP_STEPS), int(n_phys),
+        int(stride), int(n_out),
         d_out_stable, d_out_habitable,
+        d_traj_p, d_traj_s, d_traj_m,
     )
 
-    # Synchronise before timing — ensures kernel completion is included in elapsed_s
     cuda.synchronize()
 
     # ── Retrieve results ───────────────────────────────────────────────────
     out_stable    = d_out_stable.copy_to_host().astype(bool)
     out_habitable = d_out_habitable.copy_to_host().astype(bool)
+    traj_planet   = d_traj_p.copy_to_host()   # (N, n_out, 3)
+    traj_star     = d_traj_s.copy_to_host()   # (N, n_out, 3)
+    traj_moon     = d_traj_m.copy_to_host()   # (N, n_out, 3)
 
     map_stable    = out_stable.reshape(mm_resolution, am_resolution)
     map_habitable = out_habitable.reshape(mm_resolution, am_resolution)
     map_both      = map_stable & map_habitable
 
-    # Force ineligible cells to False (mirrors batch_leapfrog_trajectories)
     if eligible_mask is not None:
         em_2d = np.asarray(eligible_mask, dtype=bool).reshape(mm_resolution, am_resolution)
         map_stable    &= em_2d
         map_habitable &= em_2d
         map_both      &= em_2d
 
-    # ── Valid ranges (mirrors batch_leapfrog_trajectories) ─────────────────
+    # ── Valid ranges ───────────────────────────────────────────────────────
     valid_mm_range  = None
     valid_am_per_mm = []
     valid_rows = np.where(map_both.any(axis=1))[0]
@@ -388,16 +427,16 @@ def batch_leapfrog_numba_trajectories(
             [float(am_grid[cols[0]]), float(am_grid[cols[-1]])] if len(cols) else None
         )
 
+    t_grid = np.linspace(0.0, t_sim, n_out)
     elapsed = time.perf_counter() - t0
 
     return {
         "ok":              True,
-        # Trajectory arrays not stored by Numba kernel — set to None
-        "traj_planet":     None,
-        "traj_star":       None,
-        "traj_moon":       None,
-        "t_grid":          np.linspace(0.0, t_sim, 2),
-        "moon_planet_dist": None,
+        "traj_planet":     traj_planet,   # (N, n_out, 3) numpy array
+        "traj_star":       traj_star,
+        "traj_moon":       traj_moon,
+        "t_grid":          t_grid,
+        "moon_planet_dist": None,         # not computed; use traj arrays directly
         "moon_star_dist":  None,
         # Maps
         "map_stable":      map_stable.tolist(),
@@ -413,6 +452,6 @@ def batch_leapfrog_numba_trajectories(
         "a_outer_au":      float(a_outer_au),
         "n_phys":          n_phys,
         "dt_phys":         dt_fixed,
-        "n_out":           0,
+        "n_out":           n_out,
         "elapsed_s":       elapsed,
     }

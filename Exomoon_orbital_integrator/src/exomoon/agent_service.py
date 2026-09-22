@@ -721,8 +721,8 @@ def _tool_specs() -> list[dict]:
                 "Load a trajectory sweep over a moon mass × semi-major axis grid. "
                 "This is NOT the MLP classifier — it runs actual physics or a neural model per cell. "
                 "mode='gt_leapfrog': Ground Truth Physics Integrator — exact physics for every cell. "
-                "First run ~3–5 minutes for a 30×30 grid (cached after that, instant on repeat). "
-                "S3/RAM cache checked first — if hit, returns immediately. "
+                "~14–15 seconds for a 30×30 grid (EC2 Numba CUDA kernel). "
+                "RAM cache checked first — if hit, returns immediately. "
                 "mode='hnn_hinge4': HNN Physics ML Model — neural trajectory approximation. "
                 "If the result is cached it returns instantly; if not cached, returns a message "
                 "telling the user to run it from the ML panel (8–10 min first run, cannot run inline in chat). "
@@ -1292,6 +1292,24 @@ def _execute_tool(tool_name: str, tool_input: Dict[str, Any], req: ChatRequest) 
                     mode            = mode,
                 )
 
+                # Auto-populate Layer 1 MLP if not yet set in this session.
+                # The frontend's Layer 2 trajectory UI is gated on mlPrediction being non-null —
+                # without it, the panel shows "Run Layer 1 first" and the trajectory grid is hidden.
+                # We run it silently here so both layers populate in a single chatbot response.
+                if not _session.last_ml_prediction:
+                    print("[TOOL] trajectory_preview: auto-running MLP to unlock Layer 1 gate", flush=True)
+                    _mlp = _predict_stability_map_mlp(
+                        system_params   = system_params,
+                        t_sim           = t_sim,
+                        moon_retrograde = moon_retro,
+                        em              = em,
+                        mm_resolution   = mm_res,
+                        am_resolution   = am_res,
+                    )
+                    if _mlp.get("ok"):
+                        _session.last_ml_prediction = _mlp
+                        _session._ml_fresh = True
+
                 # GT (Numba CUDA): 2.3s server-side — call GPU directly, no caching needed.
                 # HNN (hinge4, ~470s first run): check S3 cache first; if miss, guide to ML panel.
                 if mode == "hnn_hinge4":
@@ -1348,8 +1366,9 @@ def _execute_tool(tool_name: str, tool_input: Dict[str, Any], req: ChatRequest) 
                     "valid_mm_range":  valid_mm,
                     "valid_am_per_mm": valid_am,
                     "wall_s":        wall_s,
-                    "from_cache":    True,
+                    "from_cache":    result.get("from_cache", False),
                     "cache_key":     _session.last_traj_key,
+                    "mode":          mode,
                 }
                 _session._traj_preview_fresh = True
 
@@ -2202,8 +2221,8 @@ def _chat_with_claude(req: ChatRequest) -> Dict[str, Any]:
         "- **Trajectory preview** (`trajectory_preview`): if engine mode or grid size have not been stated "
         "  yet in this conversation, ask about them. Use the exact option names as shown in the web app:\n"
         "  - *Ground Truth Physics Integrator* — exact physics simulation for every cell. "
-        "    First run ~3–5 minutes for a 30×30 grid; instant on repeat (S3/RAM cached). "
-        "    Cache is checked before calling the GPU — if cached, returns immediately. "
+        "    ~14–15 seconds for a 30×30 grid (EC2 Numba CUDA kernel, every run). "
+        "    RAM cache checked first — if cached in this session, returns immediately. "
         "    This is the recommended default mode for definitive results.\n"
         "  - *HNN Physics ML Model* — neural trajectory approximation with HIGH/LOW confidence labels. "
         "    First run takes ~8–10 minutes and CANNOT run inline in chat — must be triggered from the ML panel. "
@@ -3627,8 +3646,8 @@ def _store_traj_ram_cache(key: str, result: Dict, mm_resolution: int, am_resolut
         ts = result["traj_star"]
         tm = result["traj_moon"]
         tg = result["t_grid"]
-        print(f"[TRAJ_RAM] Converting arrays: traj_planet N={len(tp) if tp else 0}, "
-              f"n_out={len(tp[0]) if tp and tp[0] else 0}", flush=True)
+        tp_shape = tp.shape if hasattr(tp, 'shape') else (len(tp),)
+        print(f"[TRAJ_RAM] Converting arrays: traj_planet shape={tp_shape}", flush=True)
         entry = {
             "traj_planet":   np.array(tp, dtype=np.float32),  # (N, n_out, 3)
             "traj_star":     np.array(ts, dtype=np.float32),
@@ -3652,9 +3671,28 @@ def _store_traj_ram_cache(key: str, result: Dict, mm_resolution: int, am_resolut
         print(f"[TRAJ_RAM] Store FAILED: {type(e).__name__}: {e}", flush=True)
 
 
+def _decompress_gt_traj(result: Dict) -> Dict:
+    """Decompress float32 zlib trajectory arrays from /gt/predict_numba response.
+
+    EC2 sends trajectory data as base64(zlib(float32 binary)) to reduce transfer size
+    from ~486MB JSON to ~15-30MB. This function restores numpy arrays in-place.
+    """
+    import numpy as np
+    import zlib as _zlib
+    import base64 as _b64
+    for name in ("traj_planet", "traj_star", "traj_moon", "t_grid"):
+        b64_key   = f"{name}_zlib_f32"
+        shape_key = f"{name}_shape"
+        if b64_key in result and shape_key in result:
+            arr_bytes    = _zlib.decompress(_b64.b64decode(result.pop(b64_key)))
+            arr_shape    = result.pop(shape_key)
+            result[name] = np.frombuffer(arr_bytes, dtype=np.float32).reshape(arr_shape)
+    return result
+
+
 def _forward_to_gpu(mode: str, req: TrajectoryPreviewRequest) -> Dict:
     """Forward batch request to EC2 hnn_gpu_service.py and return parsed JSON result."""
-    endpoint = "/hnn/predict" if mode == "hnn_hinge4" else "/gt/predict"
+    endpoint = "/hnn/predict" if mode == "hnn_hinge4" else "/gt/predict_numba"
     url = GPU_SERVICE_URL.rstrip("/") + endpoint
     body = {
         "system_params":   req.system_params,
@@ -3676,12 +3714,11 @@ def trajectory_preview(req: TrajectoryPreviewRequest):
     """
     GPU trajectory preview with S3 read-through cache.
 
-    mode="hnn_hinge4"  → EC2 /hnn/predict  (HNN hinge4 on T4 GPU, ~470s first run)
-    mode="gt_leapfrog" → EC2 /gt/predict   (GT batch leapfrog, full trajectory arrays, ~193s first run)
+    mode="hnn_hinge4"  → EC2 /hnn/predict      (HNN hinge4 on T4 GPU, ~470s first run; S3 cached)
+    mode="gt_leapfrog" → EC2 /gt/predict_numba (Numba CUDA kernel, ~2.3s; NO S3 cache)
 
-    Both modes: S3 read-through cache — cache HIT returns in ~10ms, MISS triggers EC2 call.
-    RAM cache populated from full trajectory arrays so all cell clicks are instant after batch completes.
-    /gt/predict_numba (2.3s, maps only, no trajectories) is NOT used here — it cannot populate RAM cache.
+    HNN: S3 read-through cache — cache HIT returns in ~10ms, MISS triggers EC2 call.
+    GT:  No S3 caching — always calls EC2 directly (~2.3s). RAM cache populated for instant cell clicks.
     """
     try:
         return _trajectory_preview_inner(req)
@@ -3700,26 +3737,24 @@ def _trajectory_preview_inner(req: TrajectoryPreviewRequest):
     key = _inference_cache_key(req)
     print(f"[TRAJECTORY] mode={mode} key={key} mm={req.mm_resolution}x{req.am_resolution} force_refresh={req.force_refresh}", flush=True)
 
-    # ── Cache read (skipped when force_refresh=True) ───────────────────────────
-    if not req.force_refresh:
+    # ── S3 cache read — HNN only (GT uses Numba at ~2.3s, no S3 caching) ─────────
+    if mode == "hnn_hinge4" and not req.force_refresh:
         cached = _read_cache(mode, key)
         if cached is not None:
             with _traj_ram_lock:
                 ram_hit = key in _traj_ram_cache
             if ram_hit:
-                # S3 hit + RAM hit: everything ready, return instantly
                 print(f"[TRAJECTORY] S3+RAM cache HIT for {mode}/{key}", flush=True)
             else:
-                # S3 HIT but RAM empty (agent restarted). Populate RAM directly from
-                # S3 data — full trajectory arrays are stored in S3 so no EC2 call needed.
+                # S3 HIT but RAM empty (agent restarted). Populate RAM from S3 data.
                 print(f"[TRAJECTORY] S3 HIT, RAM empty — populating RAM from S3 data", flush=True)
                 _store_traj_ram_cache(key, cached, req.mm_resolution, req.am_resolution)
             r = _strip_heavy(cached)
             r["cache_key"] = key
             return r
 
-    # ── Cache miss → GPU inference ─────────────────────────────────────────────
-    print(f"[TRAJECTORY] Cache MISS — forwarding to GPU service at {GPU_SERVICE_URL}", flush=True)
+    # ── GPU inference ──────────────────────────────────────────────────────────
+    print(f"[TRAJECTORY] Forwarding to GPU service at {GPU_SERVICE_URL} (mode={mode})", flush=True)
     try:
         result = _forward_to_gpu(mode, req)
     except _requests.exceptions.Timeout:
@@ -3735,21 +3770,25 @@ def _trajectory_preview_inner(req: TrajectoryPreviewRequest):
         raise HTTPException(status_code=502,
                             detail=f"GPU service unexpected error: {type(e).__name__}: {e}")
 
-    # Store full trajectory arrays in RAM — cell clicks read from here
+    # GT: decompress zlib-encoded trajectory arrays before storing in RAM
+    if mode == "gt_leapfrog":
+        result = _decompress_gt_traj(result)
+
+    # Store trajectory arrays in RAM — cell clicks read from here (both modes)
     _store_traj_ram_cache(key, result, req.mm_resolution, req.am_resolution)
 
-    # Write FULL result (with trajectory arrays) to S3 so subsequent runs after
-    # agent restarts can populate RAM directly from S3, with no EC2 call needed.
-    full_for_s3 = dict(result)
-    full_for_s3["mode"]          = mode
-    full_for_s3["model_version"] = req.model_version
-    full_for_s3["from_cache"]    = False
-    full_for_s3["cache_key"]     = key
-    threading.Thread(
-        target=_write_cache, args=(mode, key, full_for_s3), daemon=True
-    ).start()
+    # Write to S3 for HNN only — GT is fast enough (~2.3s) to re-run on restart
+    if mode == "hnn_hinge4":
+        full_for_s3 = dict(result)
+        full_for_s3["mode"]          = mode
+        full_for_s3["model_version"] = req.model_version
+        full_for_s3["from_cache"]    = False
+        full_for_s3["cache_key"]     = key
+        threading.Thread(
+            target=_write_cache, args=(mode, key, full_for_s3), daemon=True
+        ).start()
 
-    # Strip heavy arrays for the HTTP response — frontend only needs the maps/grids
+    # Strip heavy arrays for the HTTP response — frontend only needs maps/grids
     result = _strip_heavy(result)
     result["mode"]          = mode
     result["model_version"] = req.model_version
@@ -4068,47 +4107,11 @@ def trajectory_cell_preview(req: CellPreviewRequest):
         entry = _traj_ram_cache.get(key)
 
     if entry is None:
-        if req.mode == "gt_leapfrog":
-            # GT Numba bulk run returns only stability maps (null trajectories) — no RAM cache entry.
-            # Call /gt/predict_cell on the GPU service for this single cell (~1-2s, exact physics).
-            print(f"[CELL_PREVIEW] GT RAM empty — calling /gt/predict_cell for mm={req.mm_earth:.4f} am={req.am_hill:.3f}", flush=True)
-            try:
-                cell_resp = _requests.post(
-                    GPU_SERVICE_URL.rstrip("/") + "/gt/predict_cell",
-                    json={
-                        "system_params":   req.system_params,
-                        "mm_earth":        req.mm_earth,
-                        "am_hill":         req.am_hill,
-                        "t_sim":           req.t_sim,
-                        "moon_retrograde": req.moon_retrograde,
-                        "em":              req.em,
-                        "escape_factor":   req.escape_factor,
-                        "n_steps":         5000,
-                    },
-                    timeout=60,
-                )
-                cell_resp.raise_for_status()
-                cell_result = cell_resp.json()
-            except Exception as e:
-                raise HTTPException(status_code=502, detail=f"GT cell prediction failed: {e}")
-
-            tp = cell_result.get("traj_planet")
-            ts = cell_result.get("traj_star")
-            tm = cell_result.get("traj_moon")
-            tg = cell_result.get("t_grid")
-            if not tp or not ts or not tm or not tg:
-                raise HTTPException(status_code=502, detail="GT cell prediction returned no trajectory arrays")
-
-            frames = _traj_to_frames(tp[0], ts[0], tm[0], tg)
-            print(f"[CELL_PREVIEW] GT direct cell mm={req.mm_earth:.4f} am={req.am_hill:.3f} n_frames={len(frames)}", flush=True)
-            return {"ok": True, "frames": frames, "n_frames": len(frames),
-                    "from_ram_cache": False, "mode": req.mode}
-        else:
-            print(f"[CELL_PREVIEW] RAM empty for key={key} — batch not yet complete or agent restarted without a cache hit", flush=True)
-            raise HTTPException(
-                status_code=503,
-                detail="Trajectory batch not yet loaded. Run 'Run Trajectory Previews' first and wait for it to complete."
-            )
+        print(f"[CELL_PREVIEW] RAM empty for key={key} mode={req.mode} — batch not yet complete or agent restarted", flush=True)
+        raise HTTPException(
+            status_code=503,
+            detail="Trajectory batch not yet loaded. Run 'Run Trajectory Previews' first and wait for it to complete."
+        )
 
     mm_resolution = entry.get("mm_resolution", req.mm_resolution)
     am_resolution = entry.get("am_resolution", req.am_resolution)

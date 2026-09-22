@@ -57,7 +57,7 @@ from exomoon.exoplanet_archive import fetch_system_by_planet, estimate_density_g
 from exomoon.eda import pack_sim, unpack_sim, traj_to_frame, to_csv_bytes, var_info
 
 app = Dash(__name__, suppress_callback_exceptions=True,
-    title="Exomoon Orbital Integrator (Interactive)"
+    title="Planetary Orbital Dynamics Lab"
 )
 
 # Allow duplicate outputs/callbacks to fire on initial render safely
@@ -270,7 +270,7 @@ def _initial_figure():
         )],
         margin=dict(l=20, r=20, t=40, b=20),
         height=700,
-        title="Exomoon Orbital Integrator"
+        title="Planetary Orbital Dynamics Lab"
     )
     return fig
 

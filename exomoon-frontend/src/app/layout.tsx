@@ -2,8 +2,8 @@ import type { Metadata } from 'next';
 import './globals.css';
 
 export const metadata: Metadata = {
-  title: 'Exomoon Orbital Integrator',
-  description: '3-body leapfrog integrator for exomoon stability analysis',
+  title: 'Planetary Orbital Dynamics Lab',
+  description: '3-body orbital dynamics simulator with ML stability prediction and AI chatbot',
 };
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {

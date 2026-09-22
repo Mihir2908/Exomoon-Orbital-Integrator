@@ -1,4 +1,4 @@
-# Exomoon Orbital Integrator
+# Planetary Orbital Dynamics Lab
 
 Simulation Framework hosting codebase for a Leapfrog Algorithm-based Python integrator to numerically simulate the orbital evolution of any characterized 3 body (Star-Planet-Moon) system, analyzed and orbitally animated via a Dash Plotly UI. Supports automated parameterization from the NASA Exoplanet Archive and tools accessible to Claude (LLM), via an MCP Server. 
 

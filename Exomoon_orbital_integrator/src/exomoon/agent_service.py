@@ -720,9 +720,9 @@ def _tool_specs() -> list[dict]:
             "description": (
                 "Load a trajectory sweep over a moon mass × semi-major axis grid. "
                 "This is NOT the MLP classifier — it runs actual physics or a neural model per cell. "
-                "mode='gt_leapfrog': Ground Truth Physics Integrator — Numba CUDA leapfrog, "
-                "2–3 seconds for a full 30×30 grid. CALL THIS DIRECTLY — results always returned inline, "
-                "no caching needed. "
+                "mode='gt_leapfrog': Ground Truth Physics Integrator — exact physics for every cell. "
+                "First run ~3–5 minutes for a 30×30 grid (cached after that, instant on repeat). "
+                "S3/RAM cache checked first — if hit, returns immediately. "
                 "mode='hnn_hinge4': HNN Physics ML Model — neural trajectory approximation. "
                 "If the result is cached it returns instantly; if not cached, returns a message "
                 "telling the user to run it from the ML panel (8–10 min first run, cannot run inline in chat). "
@@ -2201,9 +2201,10 @@ def _chat_with_claude(req: ChatRequest) -> Dict[str, Any]:
         "**Per-tool questions to ask** (in addition to system/configuration):\n"
         "- **Trajectory preview** (`trajectory_preview`): if engine mode or grid size have not been stated "
         "  yet in this conversation, ask about them. Use the exact option names as shown in the web app:\n"
-        "  - *Ground Truth Physics Integrator* — Numba CUDA leapfrog integrator, exact results. "
-        "    Runs in 2–3 seconds for a full 30×30 grid. YOU CAN CALL THIS DIRECTLY — it always completes "
-        "    inline in chat with no caching required. This is the recommended default mode.\n"
+        "  - *Ground Truth Physics Integrator* — exact physics simulation for every cell. "
+        "    First run ~3–5 minutes for a 30×30 grid; instant on repeat (S3/RAM cached). "
+        "    Cache is checked before calling the GPU — if cached, returns immediately. "
+        "    This is the recommended default mode for definitive results.\n"
         "  - *HNN Physics ML Model* — neural trajectory approximation with HIGH/LOW confidence labels. "
         "    First run takes ~8–10 minutes and CANNOT run inline in chat — must be triggered from the ML panel. "
         "    Instant on repeat requests (cached). "
@@ -3653,7 +3654,7 @@ def _store_traj_ram_cache(key: str, result: Dict, mm_resolution: int, am_resolut
 
 def _forward_to_gpu(mode: str, req: TrajectoryPreviewRequest) -> Dict:
     """Forward batch request to EC2 hnn_gpu_service.py and return parsed JSON result."""
-    endpoint = "/hnn/predict" if mode == "hnn_hinge4" else "/gt/predict_numba"
+    endpoint = "/hnn/predict" if mode == "hnn_hinge4" else "/gt/predict"
     url = GPU_SERVICE_URL.rstrip("/") + endpoint
     body = {
         "system_params":   req.system_params,
@@ -3675,11 +3676,12 @@ def trajectory_preview(req: TrajectoryPreviewRequest):
     """
     GPU trajectory preview with S3 read-through cache.
 
-    mode="hnn_hinge4"  → EC2 /hnn/predict      (HNN hinge4 on T4 GPU, ~470s first run)
-    mode="gt_leapfrog" → EC2 /gt/predict_numba (Numba CUDA kernel, ~2s per 30×30 grid)
+    mode="hnn_hinge4"  → EC2 /hnn/predict  (HNN hinge4 on T4 GPU, ~470s first run)
+    mode="gt_leapfrog" → EC2 /gt/predict   (GT batch leapfrog, full trajectory arrays, ~193s first run)
 
-    HNN: S3 read-through cache — cache HIT returns in ~10ms, MISS triggers EC2 call.
-    GT:  S3 caching also active — cache HIT returns instantly, MISS runs Numba (~2s).
+    Both modes: S3 read-through cache — cache HIT returns in ~10ms, MISS triggers EC2 call.
+    RAM cache populated from full trajectory arrays so all cell clicks are instant after batch completes.
+    /gt/predict_numba (2.3s, maps only, no trajectories) is NOT used here — it cannot populate RAM cache.
     """
     try:
         return _trajectory_preview_inner(req)

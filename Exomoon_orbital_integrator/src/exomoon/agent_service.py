@@ -4066,11 +4066,47 @@ def trajectory_cell_preview(req: CellPreviewRequest):
         entry = _traj_ram_cache.get(key)
 
     if entry is None:
-        print(f"[CELL_PREVIEW] RAM empty for key={key} — batch not yet complete or agent restarted without a cache hit", flush=True)
-        raise HTTPException(
-            status_code=503,
-            detail="Trajectory batch not yet loaded. Run 'Run Trajectory Previews' first and wait for it to complete."
-        )
+        if req.mode == "gt_leapfrog":
+            # GT Numba bulk run returns only stability maps (null trajectories) — no RAM cache entry.
+            # Call /gt/predict_cell on the GPU service for this single cell (~1-2s, exact physics).
+            print(f"[CELL_PREVIEW] GT RAM empty — calling /gt/predict_cell for mm={req.mm_earth:.4f} am={req.am_hill:.3f}", flush=True)
+            try:
+                cell_resp = _requests.post(
+                    GPU_SERVICE_URL.rstrip("/") + "/gt/predict_cell",
+                    json={
+                        "system_params":   req.system_params,
+                        "mm_earth":        req.mm_earth,
+                        "am_hill":         req.am_hill,
+                        "t_sim":           req.t_sim,
+                        "moon_retrograde": req.moon_retrograde,
+                        "em":              req.em,
+                        "escape_factor":   req.escape_factor,
+                        "n_steps":         5000,
+                    },
+                    timeout=60,
+                )
+                cell_resp.raise_for_status()
+                cell_result = cell_resp.json()
+            except Exception as e:
+                raise HTTPException(status_code=502, detail=f"GT cell prediction failed: {e}")
+
+            tp = cell_result.get("traj_planet")
+            ts = cell_result.get("traj_star")
+            tm = cell_result.get("traj_moon")
+            tg = cell_result.get("t_grid")
+            if not tp or not ts or not tm or not tg:
+                raise HTTPException(status_code=502, detail="GT cell prediction returned no trajectory arrays")
+
+            frames = _traj_to_frames(tp[0], ts[0], tm[0], tg)
+            print(f"[CELL_PREVIEW] GT direct cell mm={req.mm_earth:.4f} am={req.am_hill:.3f} n_frames={len(frames)}", flush=True)
+            return {"ok": True, "frames": frames, "n_frames": len(frames),
+                    "from_ram_cache": False, "mode": req.mode}
+        else:
+            print(f"[CELL_PREVIEW] RAM empty for key={key} — batch not yet complete or agent restarted without a cache hit", flush=True)
+            raise HTTPException(
+                status_code=503,
+                detail="Trajectory batch not yet loaded. Run 'Run Trajectory Previews' first and wait for it to complete."
+            )
 
     mm_resolution = entry.get("mm_resolution", req.mm_resolution)
     am_resolution = entry.get("am_resolution", req.am_resolution)

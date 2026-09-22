@@ -1330,7 +1330,7 @@ def _execute_tool(tool_name: str, tool_input: Dict[str, Any], req: ChatRequest) 
                 wall_s      = result.get("wall_s", 0)
 
                 # Cache batch metadata in session so trajectory_cell_query can look up cells
-                _session.last_traj_key     = result.get("cache_key", key)
+                _session.last_traj_key     = result.get("cache_key") or (key if mode == "hnn_hinge4" else None)
                 _session.last_traj_mm_grid = mm_grid
                 _session.last_traj_am_grid = am_grid
 

@@ -127,7 +127,7 @@ export function MlMapOverlay({ onClose, containerRef, onApplyAndRun }: MlMapOver
       const r    = await fetch(`${AGENT_URL}/ml/train/history?model_type=${mt}`);
       const data = await r.json();
       // ok === false means "file not found" — leave history null
-      if (data.ok !== false) setHistory(data as TrainingHistory);
+      if (data.ok !== false) setHistory(data as unknown as TrainingHistory);
       else setHistory(null);
     } catch { /* network error — silently ignore */ }
   }, []);

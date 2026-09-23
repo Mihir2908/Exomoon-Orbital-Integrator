@@ -308,7 +308,7 @@ export function MlMapOverlay({ onClose, containerRef, onApplyAndRun, frameIndex 
         setHistory(null);
         setHistError(data.message ?? 'History not found on server');
       } else if (Array.isArray(data.train_loss) && Array.isArray(data.val_loss)) {
-        setHistory(data as TrainingHistory);
+        setHistory(data as unknown as TrainingHistory);
       } else {
         setHistory(null);
         setHistError('Unexpected response format from server');
@@ -420,7 +420,7 @@ export function MlMapOverlay({ onClose, containerRef, onApplyAndRun, frameIndex 
         throw new Error(`Server error (HTTP ${res.status}): ${rawText.slice(0, 300)}`);
       }
       if (data.ok || data.map_both) {
-        const result = data as TrajResult;
+        const result = data as unknown as TrajResult;
         // Compute confidence_map client-side for HNN mode:
         // HIGH = MLP eligible AND HNN agrees (map_both true)
         // LOW  = MLP eligible AND HNN disagrees (map_both false)

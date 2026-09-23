@@ -217,7 +217,7 @@ export function MlMapOverlay({ onClose, containerRef, onApplyAndRun }: MlMapOver
         stopPolling();
         pollRef.current = setInterval(fetchTrainStatus, 3000);
       } else {
-        setTrainStatus({ status: 'error', error: data.detail ?? 'Train request failed' });
+        setTrainStatus({ status: 'error', error: (data.detail as string | undefined) ?? 'Train request failed' });
       }
     } catch (e: unknown) {
       setTrainStatus({ status: 'error', error: e instanceof Error ? e.message : 'Network error' });
@@ -272,7 +272,7 @@ export function MlMapOverlay({ onClose, containerRef, onApplyAndRun }: MlMapOver
         };
         setMlPrediction(pred);
       } else {
-        setPredError(data.message ?? data.error ?? 'Prediction failed');
+        setPredError((data.message as string | undefined) ?? (data.error as string | undefined) ?? 'Prediction failed');
       }
     } catch (e: unknown) {
       setPredError(e instanceof Error ? e.message : 'Network error');

@@ -306,7 +306,7 @@ export function MlMapOverlay({ onClose, containerRef, onApplyAndRun, frameIndex 
       const data = await r.json();
       if (data.ok === false) {
         setHistory(null);
-        setHistError(data.message ?? 'History not found on server');
+        setHistError((data.message as string | undefined) ?? 'History not found on server');
       } else if (Array.isArray(data.train_loss) && Array.isArray(data.val_loss)) {
         setHistory(data as unknown as TrainingHistory);
       } else {
@@ -361,7 +361,7 @@ export function MlMapOverlay({ onClose, containerRef, onApplyAndRun, frameIndex 
         setSelectedCellFrames(null);
         setPreviewCellFrames(null, null);
       } else {
-        setPredError(data.message ?? data.error ?? 'Prediction failed');
+        setPredError((data.message as string | undefined) ?? (data.error as string | undefined) ?? 'Prediction failed');
       }
     } catch (e: unknown) {
       setPredError(e instanceof Error ? e.message : 'Network error');
@@ -437,7 +437,7 @@ export function MlMapOverlay({ onClose, containerRef, onApplyAndRun, frameIndex 
         }
         setTrajResultByEngine(prev => ({ ...prev, [trajEngine]: result }));
       } else {
-        setTrajError(data.message ?? data.error ?? 'Trajectory batch failed');
+        setTrajError((data.message as string | undefined) ?? (data.error as string | undefined) ?? 'Trajectory batch failed');
       }
     } catch (e: unknown) {
       setTrajError(e instanceof Error ? e.message : 'Network error');

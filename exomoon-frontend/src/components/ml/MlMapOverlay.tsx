@@ -249,7 +249,7 @@ export function MlMapOverlay({ onClose, containerRef, onApplyAndRun, frameIndex 
     const result = { ...trajPreview } as unknown as TrajResult;
     // Use the engine mode the chatbot reported (added by Fix B in agent_service.py).
     // Falls back to 'gt_leapfrog' for payloads from before that fix.
-    const previewMode = (trajPreview as Record<string, unknown>).mode as string ?? 'gt_leapfrog';
+    const previewMode = ((trajPreview as unknown) as Record<string, unknown>).mode as string ?? 'gt_leapfrog';
     // Compute confidence_map client-side when the preview is from HNN and MLP prediction is available
     if (previewMode === 'hnn_hinge4' && mlPrediction) {
       const N_MM = result.mm_grid.length;

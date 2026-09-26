@@ -1349,23 +1349,21 @@ def _execute_tool(tool_name: str, tool_input: Dict[str, Any], req: ChatRequest, 
                     mode            = mode,
                 )
 
-                # Auto-populate Layer 1 MLP if not yet set in this session.
-                # The frontend's Layer 2 trajectory UI is gated on mlPrediction being non-null —
-                # without it, the panel shows "Run Layer 1 first" and the trajectory grid is hidden.
-                # We run it silently here so both layers populate in a single chatbot response.
-                if not session.last_ml_prediction:
-                    print("[TOOL] trajectory_preview: auto-running MLP to unlock Layer 1 gate", flush=True)
-                    _mlp = _predict_stability_map_mlp(
-                        system_params   = system_params,
-                        t_sim           = t_sim,
-                        moon_retrograde = moon_retro,
-                        em              = em,
-                        mm_resolution   = mm_res,
-                        am_resolution   = am_res,
-                    )
-                    if _mlp.get("ok"):
-                        session.last_ml_prediction = _mlp
-                        session._ml_fresh = True
+                # Always sync Layer 1 MLP with the current system when trajectory_preview runs.
+                # This ensures the MLP grid stays in sync even when the user switches systems
+                # (e.g. Kepler-1229b → Kepler-442b) without an explicit ml_predict call.
+                print("[TOOL] trajectory_preview: syncing MLP Layer 1 for current system", flush=True)
+                _mlp = _predict_stability_map_mlp(
+                    system_params   = system_params,
+                    t_sim           = t_sim,
+                    moon_retrograde = moon_retro,
+                    em              = em,
+                    mm_resolution   = mm_res,
+                    am_resolution   = am_res,
+                )
+                if _mlp.get("ok"):
+                    session.last_ml_prediction = _mlp
+                    session._ml_fresh = True
 
                 # GT (Numba CUDA): 2.3s server-side — call GPU directly, no caching needed.
                 # HNN (hinge4, ~470s first run): check S3 cache first; if miss, guide to ML panel.

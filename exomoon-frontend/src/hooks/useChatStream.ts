@@ -13,7 +13,7 @@ const AGENT_URL =
 export function useChatStream() {
   const {
     params, simYears, simdataB64, dmCgs,
-    mlPrediction, trajPreview,
+    mlPrediction, trajPreview, sessionId,
     addChatMessage, appendToLastAssistant, finalizeChatMessage,
     setSimdataB64, setMlPrediction, setTrajPreview, updateJobStatus, setJob, setParams,
     setPreviewCellFrames, setChatCellFrames,
@@ -57,6 +57,8 @@ export function useChatStream() {
         traj_preview_key: trajPreview?.cache_key ?? null,
         traj_mm_grid:     trajPreview?.mm_grid    ?? null,
         traj_am_grid:     trajPreview?.am_grid    ?? null,
+        // Per-browser-session UUID — ties this request to the server-side SessionCache.
+        session_id:       sessionId,
       };
 
       const response = await fetch(`${AGENT_URL}/chat/stream`, {

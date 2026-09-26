@@ -97,6 +97,12 @@ interface SimulationStore {
   finalizeChatMessage: (id: string, errorContent?: string) => void;
   finalizeLastAssistant: () => void;
   clearChat: () => void;
+
+  // ── Session identity ─────────────────────────────────────────────────────────
+  // UUID persisted in localStorage — isolates server-side session cache per browser tab.
+  sessionId: string;
+  // Generate a new session ID and clear all per-session client state (chat, simdata, ML layers).
+  clearSession: () => void;
 }
 
 export const useSimulationStore = create<SimulationStore>()(
@@ -249,10 +255,24 @@ export const useSimulationStore = create<SimulationStore>()(
         });
       },
       clearChat: () => set({ chatMessages: [] }),
+
+      // ── Session identity ──────────────────────────────────────────────────────
+      sessionId: typeof crypto !== 'undefined' ? crypto.randomUUID() : 'default',
+      clearSession: () => set({
+        sessionId: crypto.randomUUID(),
+        chatMessages: [],
+        simdataB64: null,
+        mlPrediction: null,
+        trajPreview: null,
+        previewCellFrames: null,
+        chatCellFrames: null,
+      }),
     }),
     {
       name: 'exomoon-sim-store',
-      // Only persist params and EDA prefs across page refreshes
+      // Only persist params, EDA prefs, and sessionId across page refreshes.
+      // sessionId is persisted so the same browser tab resumes the same server session
+      // after a reload; clearSession() generates a new UUID when the user wants a fresh start.
       partialize: (s) => ({
         params: s.params,
         simYears: s.simYears,
@@ -262,6 +282,7 @@ export const useSimulationStore = create<SimulationStore>()(
         showHzOverlay: s.showHzOverlay,
         showHillOverlay: s.showHillOverlay,
         dmCgs: s.dmCgs,
+        sessionId: s.sessionId,
       }),
     }
   )

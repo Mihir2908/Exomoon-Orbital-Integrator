@@ -6,7 +6,7 @@ import { ChatMessage } from './ChatMessage';
 import { ChatInput } from './ChatInput';
 
 export function ChatPanel() {
-  const { chatMessages } = useSimulationStore();
+  const { chatMessages, clearSession } = useSimulationStore();
   const { sendMessage } = useChatStream();
   const bottomRef = useRef<HTMLDivElement>(null);
   const isStreaming = chatMessages.some(m => m.streaming);
@@ -20,7 +20,17 @@ export function ChatPanel() {
       {/* Header */}
       <div className="flex items-center px-4 py-3 border-b border-gray-800 shrink-0">
         <h2 className="text-xs font-semibold text-gray-400 tracking-widest uppercase">Agent Chat</h2>
-        <div className={`ml-auto w-2 h-2 rounded-full ${isStreaming ? 'bg-blue-400 animate-pulse' : 'bg-gray-700'}`} />
+        <button
+          onClick={clearSession}
+          disabled={isStreaming}
+          title="Start a new session — clears chat history and cached simulation data"
+          className="ml-auto mr-2 px-2 py-0.5 rounded text-[10px] font-medium text-gray-500
+                     border border-gray-700 hover:border-gray-500 hover:text-gray-300
+                     disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
+        >
+          New Session
+        </button>
+        <div className={`w-2 h-2 rounded-full ${isStreaming ? 'bg-blue-400 animate-pulse' : 'bg-gray-700'}`} />
       </div>
 
       {/* Messages */}

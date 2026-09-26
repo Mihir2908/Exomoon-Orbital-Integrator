@@ -37,6 +37,13 @@ export const agentApi = {
     return r.json();
   },
 
+  // Fetch traj.csv proxied through the agent service — avoids direct S3 CORS fetch from browser
+  getJobCsv: async (jobId: string): Promise<string> => {
+    const r = await fetch(`${AGENT_URL}/job/${jobId}/traj.csv`, { method: 'GET' });
+    if (!r.ok) throw new Error(`CSV proxy fetch failed: ${r.status} ${r.statusText}`);
+    return r.text();
+  },
+
   fetchPlanet: async (name: string): Promise<{ ok: boolean; data: Record<string, unknown> | null }> => {
     const r = await fetch(`${AGENT_URL}/tool/fetch_exoplanet`, {
       method: 'POST',

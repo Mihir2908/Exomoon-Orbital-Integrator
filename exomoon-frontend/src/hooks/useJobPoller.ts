@@ -38,23 +38,17 @@ export function useJobPoller() {
           // meta comes directly from the agent service status response (no S3 fetch needed)
           const summaryJson: Record<string, unknown> = (data.meta ?? {}) as Record<string, unknown>;
 
-          // Fetch traj.csv → parse → update Three.js scene
-          const csvUrl = data.urls?.['traj.csv'];
-          console.log(`[JobPoller] SUCCEEDED — csvUrl=${csvUrl}`);
-
-          if (csvUrl) {
-            try {
-              const csvText = await fetch(csvUrl).then(r => r.text());
-              console.log(`[JobPoller] CSV fetched — ${csvText.length} chars, parsing...`);
-              const { frames, meta } = parseTrajectoryCsv(csvText, summaryJson);
-              console.log(`[JobPoller] parsed ${frames.length} frames, calling setTrajectoryData`);
-              setTrajectoryData(frames, meta);
-              console.log(`[JobPoller] setTrajectoryData done`);
-            } catch (e) {
-              console.error('[JobPoller] CSV parse error:', e);
-            }
-          } else {
-            console.warn('[JobPoller] SUCCEEDED but no traj.csv URL in response');
+          // Fetch traj.csv via agent proxy (avoids direct S3 CORS fetch from browser)
+          console.log(`[JobPoller] SUCCEEDED — fetching CSV via agent proxy for ${jobId}`);
+          try {
+            const csvText = await agentApi.getJobCsv(jobId);
+            console.log(`[JobPoller] CSV fetched — ${csvText.length} chars, parsing...`);
+            const { frames, meta } = parseTrajectoryCsv(csvText, summaryJson);
+            console.log(`[JobPoller] parsed ${frames.length} frames, calling setTrajectoryData`);
+            setTrajectoryData(frames, meta);
+            console.log(`[JobPoller] setTrajectoryData done`);
+          } catch (e) {
+            console.error('[JobPoller] CSV fetch/parse error:', e);
           }
 
           // Cache simdata in agent service session for follow-up chat queries
